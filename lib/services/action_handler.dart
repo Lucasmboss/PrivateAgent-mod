@@ -1,4 +1,4 @@
-import '../models/agent_action.dart';
+﻿import '../models/agent_action.dart';
 import '../models/chat_message.dart';
 import 'app_launcher_service.dart';
 import 'contacts_service.dart';
@@ -9,6 +9,7 @@ import 'shizuku_service.dart';
 import 'screen_automation_service.dart';
 import 'task_executor.dart';
 import 'ai_service.dart';
+import 'web_service.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -16,7 +17,7 @@ class ActionHandler {
   final CommunicationService _communication = CommunicationService();
   final AlarmService _alarm = AlarmService();
   final SystemControlService _systemControl = SystemControlService();
-  final ShizukuService _shizuku = ShizukuService();
+  final ShizukuService _shizuku = ShizukuService();final WebService _web = WebService();
   final ScreenAutomationService _screenAutomation = ScreenAutomationService();
 
   ShizukuService get shizuku => _shizuku;
@@ -99,6 +100,24 @@ class ActionHandler {
             action.params['command'] as String? ?? '',
           );
           break;
+
+        case 'web_request':
+  final method = action.params['method'] as String? ?? 'GET';
+  final url = action.params['url'] as String? ?? '';
+
+  final headers = action.params['headers'] is Map
+      ? Map<String, dynamic>.from(action.params['headers'] as Map)
+      : null;
+
+  final body = action.params['body'];
+
+  result = await _web.request(
+    method: method,
+    url: url,
+    headers: headers,
+    body: body,
+  );
+  break;
 
         case 'send_email':
           result = await _communication.sendEmail(

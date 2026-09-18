@@ -27,7 +27,7 @@ class AgentAction {
     'set_brightness',
     'read_notifications',
     'read_screen',
-    'run_adb_command',
+    'run_adb_command',    'web_request',
     'general_query',
   ];
 }
