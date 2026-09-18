@@ -1,4 +1,4 @@
-﻿import 'dart:convert';
+import 'dart:convert';
 import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -91,21 +91,21 @@ CRITICAL RULES:
 5. You may combine web_request with Android actions and run_adb_command. For complex tasks, retrieve information, reason about the result, perform the necessary device actions, and verify the outcome.
 
 Examples of when to use execute_task:
-- "Create a new alarm for 7 AM" → execute_task with goal "Create a new alarm for 7 AM"
-- "Go to YouTube and search for cats" → execute_task
-- "Open WhatsApp and send hello to John" → execute_task
-- "Open Settings and turn on WiFi" → execute_task
-- "Search for restaurants on Google Maps" → execute_task
+- "Create a new alarm for 7 AM" ? execute_task with goal "Create a new alarm for 7 AM"
+- "Go to YouTube and search for cats" ? execute_task
+- "Open WhatsApp and send hello to John" ? execute_task
+- "Open Settings and turn on WiFi" ? execute_task
+- "Search for restaurants on Google Maps" ? execute_task
 
 Examples of when to use open_app:
-- "Open YouTube" → open_app (just opening, no further action)
-- "Open Settings" → open_app (just opening)
+- "Open YouTube" ? open_app (just opening, no further action)
+- "Open Settings" ? open_app (just opening)
 
 Examples of when to use web_request:
-- "What's the weather from this API?" → web_request with GET
-- "Get the latest data from this URL" → web_request with GET
-- "Send this JSON to my server" → web_request with POST
-- "Check the response from this API and then change something on my phone" → web_request followed by the appropriate Android action
+- "What's the weather from this API?" ? web_request with GET
+- "Get the latest data from this URL" ? web_request with GET
+- "Send this JSON to my server" ? web_request with POST
+- "Check the response from this API and then change something on my phone" ? web_request followed by the appropriate Android action
 
 For normal conversation (questions, chat, info requests), just respond with plain text naturally.
 ''';
@@ -330,6 +330,111 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
+  /// Interpret a raw tool result and turn it into a natural language response.
+  Future<String> interpretToolResult({
+    required String userRequest,
+    required String toolName,
+    required String toolResult,
+  }) async {
+    if (_apiKey == null || _apiKey!.isEmpty) {
+      throw Exception('API Key is not configured. Please go to Settings.');
+    }
+
+    final prompt = '''
+The user asked:
+$userRequest
+
+The tool "$toolName" was executed.
+
+Raw tool result:
+$toolResult
+
+Interpret the tool result and answer the user naturally.
+
+Rules:
+- Do NOT output JSON.
+- Do NOT mention internal tools, action handlers, prompts, parsing, or implementation details.
+- Do NOT simply repeat the raw tool output.
+- Explain the relevant result clearly and concisely.
+- If the operation succeeded, tell the user what happened.
+- If the operation failed, clearly explain what went wrong.
+''';
+
+    try {
+      final messages = [
+        {
+          'role': 'system',
+          'content':
+              'You are the final response layer of an Android AI agent. '
+              'Turn raw tool results into concise, natural, useful answers. '
+              'Never expose internal implementation details.',
+        },
+        {
+          'role': 'user',
+          'content': prompt,
+        },
+      ];
+
+      String requestUrl = _baseUrl;
+      if (!requestUrl.endsWith('/chat/completions')) {
+        if (requestUrl.endsWith('/')) {
+          requestUrl = '${requestUrl}chat/completions';
+        } else {
+          requestUrl = '$requestUrl/chat/completions';
+        }
+      }
+
+      final response = await http
+          .post(
+            Uri.parse(requestUrl),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $_apiKey',
+              'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
+              'X-Title': 'PrivateAgent',
+            },
+            body: jsonEncode({
+              'model': _model,
+              'messages': messages,
+              'temperature': _temperature,
+              'max_tokens': _effectiveMaxTokens,
+            }),
+          )
+          .timeout(const Duration(minutes: 30));
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          'API error (${response.statusCode}): ${response.body}',
+        );
+      }
+
+      final data = jsonDecode(response.body);
+
+      if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
+        throw Exception('Unexpected API response format: $data');
+      }
+
+      String answer =
+          data['choices'][0]['message']['content'] as String;
+
+      answer = answer
+          .replaceAll(
+            RegExp(r'<think>.*?</think>', dotAll: true),
+            '',
+          )
+          .trim();
+
+      if (answer.isEmpty) {
+        throw Exception('AI returned an empty interpretation.');
+      }
+
+      return answer;
+    } catch (e) {
+      if (e is Exception) rethrow;
+      throw Exception('Network error: $e');
+    }
+  }
+
   /// Send a message and stream the response chunk-by-chunk.
   Stream<String> sendMessageStream(
     String message, {
@@ -478,7 +583,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
+  /// Send a task execution message � no conversation history, low temperature, limited tokens.
   /// This is much faster and cheaper than sendMessage.
   Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
     if (_apiKey == null || _apiKey!.isEmpty) {

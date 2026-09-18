@@ -174,31 +174,61 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           },
         );
 
-        setState(() {
-          _messages.add(
-            ChatMessage(
-              role: 'assistant',
-              content: result.success
-    ? (result.details ?? 'Done.')
-    : '? ${result.details}',
-              actionResult: result,
-            ),
-          );
-        });
+String finalResponse;
+
+developer.log(
+  'INTERPRETATION START: ${action.action}',
+  name: 'PrivateAgent',
+);
+
+try {
+  finalResponse = await _aiService.interpretToolResult(String finalResponse;
+
+developer.log(
+  'INTERPRETATION START: ${action.action}',
+  name: 'PrivateAgent',
+);
+
+try {
+  finalResponse = await _aiService.interpretToolResult(
+    userRequest: text.trim(),
+    toolName: action.action,
+    toolResult: result.details ?? 'Done.',
+  );
+} catch (e) {
+  developer.log(
+    'Tool result interpretation failed: $e',
+    name: 'PrivateAgent',
+  );
+
+  finalResponse = result.success
+      ? (result.details ?? 'Done.')
+      : '? ${result.details ?? 'Unknown error'}';
+}
+
+developer.log(
+  'INTERPRETATION END: $finalResponse',
+  name: 'PrivateAgent',
+);
+
+setState(() {
+  _messages.add(
+    ChatMessage(
+      role: 'assistant',
+      content: finalResponse,
+      actionResult: result,
+    ),
+  );
+});
         _sendOverlayEvent(
-          'OVERLAY_TASK_FINISHED',
-          result.success
-              ? (result.details ?? 'Task complete.')
-              : 'Task failed: ${result.details ?? 'Unknown error'}',
-        );
+  'OVERLAY_TASK_FINISHED',
+  finalResponse,
+);
         if (action.action != 'execute_task') {
           await _notificationService.showTaskCompleteNotification(
-            result.success ? 'Task Completed' : 'Task Failed',
-            result.details ??
-                (result.success
-                    ? 'Agent finished its goal.'
-                    : 'Agent could not complete the task.'),
-          );
+  result.success ? 'Task Completed' : 'Task Failed',
+  finalResponse,
+);
         }
         await _saveSession();
       } else {
