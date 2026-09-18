@@ -174,42 +174,34 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           },
         );
 
-String finalResponse;
+        String finalResponse;
 
-developer.log(
-  'INTERPRETATION START: ${action.action}',
-  name: 'PrivateAgent',
-);
+        developer.log(
+          'INTERPRETATION START: ${action.action}',
+          name: 'PrivateAgent',
+        );
 
-try {
-  finalResponse = await _aiService.interpretToolResult(String finalResponse;
+        try {
+          finalResponse = await _aiService.interpretToolResult(
+            userRequest: text.trim(),
+            toolName: action.action,
+            toolResult: result.details ?? 'Done.',
+          );
+        } catch (e) {
+          developer.log(
+            'Tool result interpretation failed: $e',
+            name: 'PrivateAgent',
+          );
 
-developer.log(
-  'INTERPRETATION START: ${action.action}',
-  name: 'PrivateAgent',
-);
+          finalResponse = result.success
+              ? (result.details ?? 'Done.')
+              : '? ${result.details ?? 'Unknown error'}';
+        }
 
-try {
-  finalResponse = await _aiService.interpretToolResult(
-    userRequest: text.trim(),
-    toolName: action.action,
-    toolResult: result.details ?? 'Done.',
-  );
-} catch (e) {
-  developer.log(
-    'Tool result interpretation failed: $e',
-    name: 'PrivateAgent',
-  );
-
-  finalResponse = result.success
-      ? (result.details ?? 'Done.')
-      : '? ${result.details ?? 'Unknown error'}';
-}
-
-developer.log(
-  'INTERPRETATION END: $finalResponse',
-  name: 'PrivateAgent',
-);
+        developer.log(
+          'INTERPRETATION END: $finalResponse',
+          name: 'PrivateAgent',
+        );
 
 setState(() {
   _messages.add(
