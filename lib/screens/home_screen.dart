@@ -179,12 +179,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ChatMessage(
               role: 'assistant',
               content: result.success
-                  ? (action.response.isNotEmpty
-                        ? action.response
-                        : (result.details ?? 'Done.'))
-                  : (action.response.isNotEmpty
-                        ? '${action.response}\n\n⚠️ ${result.details}'
-                        : '⚠️ ${result.details}'),
+    ? (result.details ?? 'Done.')
+    : '? ${result.details}',
               actionResult: result,
             ),
           );
