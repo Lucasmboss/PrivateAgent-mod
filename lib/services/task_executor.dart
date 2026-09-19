@@ -446,6 +446,8 @@ GENERAL RULES:
 
     String lastFailedAction = '';
 
+    final List<String> failedStrategies = [];
+
     int totalTokens = 0;
 
     final List<ActionStep> executedSteps = [];
@@ -639,6 +641,9 @@ ${recentResults.isEmpty ? 'None' : recentResults.join('\n\n')}
 CONSECUTIVE FAILURES:
 $consecutiveFailures
 
+FAILED STRATEGIES:
+${failedStrategies.isEmpty ? 'None' : failedStrategies.join('\n')}
+
 $failureHint
 
 Choose the single best next action.
@@ -646,7 +651,14 @@ Choose the single best next action.
 Remember:
 - Prefer direct HTTP/API when possible.
 - Do NOT open Chrome merely to obtain web information.
+- web_search is for discovering information and sources.
+- web_request is for retrieving a specific URL or calling a known API.
+- Do NOT use web_request as a substitute for web_search.
 - If HTTP/API is blocked, change strategy.
+- NEVER repeat a strategy listed under FAILED STRATEGIES.
+- If a domain has failed because of CAPTCHA, anti-bot, access denial,
+  or automated-request blocking, do NOT keep requesting that domain.
+- Use web_search or another source instead.
 - If UI is necessary and CURRENT SCREEN is "Not read yet.",
   use read_screen first.
 - Do not claim completion without actually completing the task.
@@ -1183,26 +1195,71 @@ Remember:
         if (failed) {
           consecutiveFailures++;
 
+          String domain = '';
+
+          try {
+            domain = Uri.parse(url).host;
+          } catch (_) {
+            domain = '';
+          }
+
+          String failureType =
+              'HTTP/request failure';
+
+          final lowerResult =
+              webResult.toLowerCase();
+
+          if (lowerResult.contains('captcha') ||
+              lowerResult.contains('robot') ||
+              lowerResult.contains('bot detection') ||
+              lowerResult.contains('access denied') ||
+              lowerResult.contains('automated')) {
+            failureType =
+                'CAPTCHA/anti-bot';
+          } else if (status != null &&
+              status >= 400) {
+            failureType =
+                'HTTP $status';
+          }
+
+          final strategy =
+              'web_request'
+              '${domain.isEmpty ? '' : ' $domain'}'
+              ' [$failureType]';
+
+          if (!failedStrategies.contains(
+            strategy,
+          )) {
+            failedStrategies.add(
+              strategy,
+            );
+          }
+
+          previousResult =
+              '$webResult\n\n'
+              'STRATEGY FAILURE:\n'
+              '$strategy\n'
+              'Do NOT repeat this strategy for this domain. '
+              'Choose another method.';
+
           _report(
-            '?? Web request failed. '
-            'Agent must choose another strategy.',
+            '?? Web request failed: $strategy',
           );
 
           developer.log(
-            'WEB REQUEST FAILED: '
-            'HTTP ${status ?? "unknown"}',
+            'WEB REQUEST FAILED: $strategy',
             name: 'PrivateAgent',
           );
 
-          // VERY IMPORTANT:
+          // IMPORTANT:
           //
           // Do NOT call RecoveryEngine here.
           //
           // This is a web strategy failure, not a UI failure.
-          // The actual HTTP result goes back to Kimi.
+          // The failure memory is passed to Kimi so it can
+          // choose another strategy.
         } else {
-          consecutiveFailures =
-              0;
+          consecutiveFailures = 0;
 
           _report(
             '?? Web response received.',
@@ -1212,9 +1269,9 @@ Remember:
         continue;
       }
 
-      // -----------------------------------------------------------------------
+      // ----------------------------------------------------------------------
       // OPEN URL
-      // -----------------------------------------------------------------------
+      // ----------------------------------------------------------------------
 
       if (action ==
           'open_url') {
