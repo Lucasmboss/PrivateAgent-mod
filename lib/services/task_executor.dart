@@ -816,15 +816,75 @@ Remember:
         }
       }
 
-      final action =
-          actionJson['action']
-                  as String? ??
-              'done';
+      // ----------------------------------------------------------------------
+      // NORMALIZE TOOL CALL
+      // ----------------------------------------------------------------------
 
-      final params =
-          actionJson['params']
-                  as Map<String, dynamic>? ??
-              {};
+      String action = '';
+
+      Map<String, dynamic> params = {};
+
+      // Preferred format:
+      // {
+      //   "action": "web_request",
+      //   "params": {...}
+      // }
+      final rawAction =
+          actionJson['action'];
+
+      final rawParams =
+          actionJson['params'];
+
+      if (rawAction is String &&
+          rawAction.trim().isNotEmpty) {
+        action =
+            rawAction.trim();
+
+        if (rawParams is Map) {
+          params =
+              Map<String, dynamic>.from(
+            rawParams,
+          );
+        }
+      }
+
+      // Alternative tool-call format:
+      // {
+      //   "tool": "web_request",
+      //   "url": "...",
+      //   "method": "GET",
+      //   "headers": {...}
+      // }
+      if (action.isEmpty) {
+        final rawTool =
+            actionJson['tool'];
+
+        if (rawTool is String &&
+            rawTool.trim().isNotEmpty) {
+          action =
+              rawTool.trim();
+
+          final toolParams =
+              <String, dynamic>{};
+
+          for (final entry
+              in actionJson.entries) {
+            if (entry.key == 'tool') {
+              continue;
+            }
+
+            toolParams[entry.key] =
+                entry.value;
+          }
+
+          params = toolParams;
+        }
+      }
+
+      // Safety fallback.
+      if (action.isEmpty) {
+        action = 'done';
+      }
 
       final reasoning =
           actionJson['reasoning']
@@ -834,7 +894,6 @@ Remember:
       final isComplete =
           actionJson['is_complete'] ==
               true;
-
       developer.log(
         '=== PARSED ACTION ===\n'
         'Action: $action\n'
