@@ -11,6 +11,7 @@ import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
 import 'recovery_engine.dart';
 import 'web_service.dart';
+import 'web_search_service.dart';
 import '../models/saved_skill.dart';
 
 /// Executes autonomous multi-step tasks using multiple strategies.
@@ -42,6 +43,9 @@ class TaskExecutor {
   /// Kept internal for this first architectural iteration so we do not
   /// need to modify ActionHandler yet.
   final WebService _webService = WebService();
+
+  final WebSearchService _webSearchService =
+    WebSearchService();
 
   /// Callback to report progress messages to the UI.
   final void Function(String message)? onProgress;
@@ -88,15 +92,19 @@ You have several possible strategies. Choose the most appropriate one.
 
 STRATEGY PRIORITY:
 
-1. Direct HTTP/API/web access
-2. Android app/API access
-3. Shizuku / shell commands
-4. Screen automation as fallback
+1. Web search for discovering information and relevant sources
+2. Direct HTTP/API/web access
+3. Android app/API access
+4. Shizuku / shell commands
+5. Screen automation as fallback
 
 IMPORTANT:
 - Do NOT open Chrome merely because the task involves the Internet.
-- If information can be retrieved directly with HTTP, prefer web_request.
-- Use open_url only when opening an actual webpage externally is useful.
+- Use web_search when the task requires discovering information, finding current information, locating webpages, news, documentation, products, services, or other online sources.
+- After web_search, use web_request to retrieve the actual contents of relevant webpages when necessary.
+- If information can be retrieved directly with HTTP/API, prefer web_request.
+- Use open_url only when opening an actual webpage externally is useful or when direct HTTP access cannot provide the required functionality.
+- If a webpage requires JavaScript, browser interaction, authentication, or another capability that HTTP cannot provide, consider open_url followed by Screen Automation.
 - Use Android UI only when direct/API methods are insufficient.
 - If one strategy fails, analyze the result and consider another strategy.
 - Do not blindly repeat failed actions.
@@ -107,7 +115,22 @@ IMPORTANT:
 
 AVAILABLE ACTIONS:
 
-1. web_request
+1. web_search
+
+Search the Internet for information or relevant webpages.
+
+Parameters:
+{
+  "query": "search query"
+}
+
+Use this when the task requires discovering information, finding current information, locating webpages, news, documentation, products, services, or other online sources.
+
+Do NOT open Chrome merely to perform a web search.
+
+After searching, use web_request to retrieve the contents of relevant webpages when necessary.
+
+2. web_request
 
 Direct HTTP/API request.
 
@@ -121,7 +144,7 @@ Parameters:
 
 Use this whenever direct web/API access is appropriate.
 
-2. open_url
+3. open_url
 
 Open a URL externally.
 
@@ -130,7 +153,9 @@ Parameters:
   "url": "https://..."
 }
 
-3. open_app
+Use this when a webpage requires browser interaction, JavaScript rendering, authentication, or another capability that web_request cannot provide.
+
+4. open_app
 
 Open an Android application.
 
@@ -139,7 +164,7 @@ Parameters:
   "app_name": "Chrome"
 }
 
-4. run_adb_command
+5. run_adb_command
 
 Execute an Android shell command through the available Shizuku mechanism.
 
@@ -148,14 +173,14 @@ Parameters:
   "command": "..."
 }
 
-5. read_screen
+6. read_screen
 
 Read the current Android accessibility screen.
 
 Parameters:
 {}
 
-6. click_text
+7. click_text
 
 Click a visible UI element by text.
 
@@ -164,7 +189,7 @@ Parameters:
   "text": "exact visible text"
 }
 
-7. click_at
+8. click_at
 
 Click screen coordinates.
 
@@ -174,7 +199,7 @@ Parameters:
   "y": 960
 }
 
-8. type_text
+9. type_text
 
 Type text into the currently focused field.
 
@@ -184,14 +209,14 @@ Parameters:
   "field_hint": "optional"
 }
 
-9. press_enter
+10. press_enter
 
 Press the Enter/Search key.
 
 Parameters:
 {}
 
-10. scroll
+11. scroll
 
 Scroll the current UI.
 
@@ -200,7 +225,7 @@ Parameters:
   "direction": "up|down"
 }
 
-11. swipe
+12. swipe
 
 Perform a swipe.
 
@@ -212,21 +237,21 @@ Parameters:
   "endY": 500
 }
 
-12. press_back
+13. press_back
 
 Press Android Back.
 
 Parameters:
 {}
 
-13. press_home
+14. press_home
 
 Press Android Home.
 
 Parameters:
 {}
 
-14. wait
+15. wait
 
 Wait for an application or webpage to load.
 
@@ -235,7 +260,7 @@ Parameters:
   "milliseconds": 1000
 }
 
-15. done
+16. done
 
 Finish the task.
 
@@ -247,7 +272,7 @@ RESPONSE FORMAT:
 Return ONLY valid JSON.
 
 {
-  "action": "web_request",
+  "action": "web_search",
   "params": {},
   "reasoning": "Brief reason for choosing this action.",
   "is_complete": false
@@ -258,12 +283,15 @@ GENERAL RULES:
 - Choose exactly ONE action at a time.
 - Never invent tool results.
 - Base decisions on actual previous results.
+- If web_search returns no useful results, analyze the failure and consider another search query or another strategy.
 - If web_request returns HTTP 4xx, HTTP 5xx, CAPTCHA,
   bot protection or unusable content, do not blindly repeat it.
   Consider another strategy.
 - HTTP failure is a strategy failure, NOT a UI failure.
 - If a webpage requires JavaScript or interaction that HTTP cannot provide,
   consider open_url followed by Screen Automation.
+- If a task can be completed entirely using web_search and web_request,
+  do not use UI.
 - If a task can be completed entirely using web_request, do not use UI.
 - If a task can be completed entirely using Android APIs or shell,
   do not use UI.
@@ -971,6 +999,48 @@ Remember:
               'ERROR reading screen: $e';
 
           consecutiveFailures++;
+        }
+
+        continue;
+      }
+
+      // ----------------------------------------------------------------------
+      // WEB SEARCH
+      // ----------------------------------------------------------------------
+
+      if (action ==
+          'web_search') {
+        final query =
+            params['query']
+                    as String? ??
+                '';
+
+        if (query.trim().isEmpty) {
+          previousResult =
+              'ERROR: web_search requires a query.';
+
+          consecutiveFailures++;
+          continue;
+        }
+
+        final searchResult =
+            await _webSearchService.search(
+          query.trim(),
+        );
+
+        previousResult =
+            'web_search "$query"\n$searchResult';
+
+        if (searchResult.startsWith(
+          'Web search error:',
+        )) {
+          consecutiveFailures++;
+        } else if (searchResult.startsWith(
+          'Web search returned no results',
+        )) {
+          consecutiveFailures++;
+        } else {
+          consecutiveFailures = 0;
         }
 
         continue;
