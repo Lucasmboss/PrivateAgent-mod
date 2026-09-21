@@ -1,4 +1,4 @@
-﻿import '../models/agent_action.dart';
+import '../models/agent_action.dart';
 import '../models/chat_message.dart';
 import 'app_launcher_service.dart';
 import 'contacts_service.dart';
@@ -10,6 +10,7 @@ import 'screen_automation_service.dart';
 import 'task_executor.dart';
 import 'ai_service.dart';
 import 'web_service.dart';
+import 'web_search_service.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -17,7 +18,9 @@ class ActionHandler {
   final CommunicationService _communication = CommunicationService();
   final AlarmService _alarm = AlarmService();
   final SystemControlService _systemControl = SystemControlService();
-  final ShizukuService _shizuku = ShizukuService();final WebService _web = WebService();
+  final ShizukuService _shizuku = ShizukuService();
+  final WebService _web = WebService();
+  final WebSearchService _webSearch = WebSearchService();
   final ScreenAutomationService _screenAutomation = ScreenAutomationService();
 
   ShizukuService get shizuku => _shizuku;
@@ -101,6 +104,17 @@ class ActionHandler {
           );
           break;
 
+        case 'web_search':
+  final query = action.params['query'] as String? ?? '';
+
+  if (query.trim().isEmpty) {
+    result = 'Web search error: empty query.';
+    break;
+  }
+
+  result = await _webSearch.search(query);
+  break;
+
         case 'web_request':
   final method = action.params['method'] as String? ?? 'GET';
   final url = action.params['url'] as String? ?? '';
@@ -133,7 +147,7 @@ class ActionHandler {
           );
           break;
 
-        // ─── Screen Automation Actions ────────────────────────
+        // ??? Screen Automation Actions ????????????????????????
 
         case 'read_screen':
           result = await _screenAutomation.getScreenDescription();
@@ -163,7 +177,7 @@ class ActionHandler {
           result = success ? 'Pressed back' : 'Could not press back';
           break;
 
-        // ─── Multi-Step Task Execution ────────────────────────
+        // ??? Multi-Step Task Execution ????????????????????????
 
         case 'execute_task':
           final goal = action.params['goal'] as String? ?? action.response;
