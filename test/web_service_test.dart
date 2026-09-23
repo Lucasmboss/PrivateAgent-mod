@@ -110,10 +110,13 @@ void main() {
   });
 
   test('truncates oversized response bodies', () async {
+    final largeBody =
+        List.filled(WebService.maxResponseLength + 10, 'x').join();
+
     final service = WebService(
       client: MockClient(
         (request) async => http.Response(
-          'x' * (WebService.maxResponseLength + 10),
+          largeBody,
           200,
         ),
       ),
@@ -124,7 +127,10 @@ void main() {
       url: 'https://api.example.test/large',
     );
 
-    expect(result, startsWith('HTTP 200\n${'x' * WebService.maxResponseLength}'));
+    final truncatedBody =
+        List.filled(WebService.maxResponseLength, 'x').join();
+
+    expect(result, startsWith('HTTP 200\n$truncatedBody'));
     expect(result, endsWith('[Response truncated]'));
   });
 }
