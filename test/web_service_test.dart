@@ -82,7 +82,7 @@ void main() {
     final service = WebService(
       client: MockClient((request) async {
         sendCount++;
-        return http.Response.ok('');
+        return http.Response('', 200);
       }),
     );
 
