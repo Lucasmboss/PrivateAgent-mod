@@ -81,7 +81,7 @@ SIMPLE ACTIONS (single step only):
 
 INTERNET ACTIONS:
 - web_search: {"query": "search terms"} - Search the Internet for information, current events, websites, documentation, products, services, prices, or other information. Use this when you need to DISCOVER information or find relevant sources. Do NOT use web_request as a substitute for web_search when you do not already know the specific URL.
-- web_request: {"method": "GET", "url": "https://example.com", "headers": {}, "body": null} - Make an HTTP request to a specific URL or API and return its response. Use this when you already know the relevant URL/API or after web_search has identified a useful source.
+- web_request: {"method": "GET|POST|PUT|PATCH|DELETE", "url": "https://example.com/api", "headers": {}, "body": null} - Make an HTTP request to a specific HTTP(S) URL or API and return its response. Use GET for reading, and POST/PUT/PATCH/DELETE for writing or modifying data. Headers are a JSON object of string values. Body may be a JSON object/array or a raw string. Use this when you already know the relevant URL/API or after web_search has identified a useful source.
 
 MULTI-STEP TASK:
 - execute_task: {"goal": "description of the full task"} - Automatically plans and executes a complex task using the available tools, including web_search, web_request, Android actions, Shizuku/shell, and screen automation.
@@ -120,6 +120,8 @@ Examples of when to use web_request:
 - "Get the data from https://example.com/api" ? web_request with GET
 - "Call this API and show me the response" ? web_request with GET
 - "Send this JSON to my server" ? web_request with POST
+- "Update the device record in this API" ? web_request with PATCH and a JSON body
+- "Delete this resource from the API" ? web_request with DELETE
 - After web_search identifies a useful page/API, use web_request to retrieve it directly when appropriate.
 
 For normal conversation (questions, chat, info requests), just respond with plain text naturally.
@@ -598,7 +600,7 @@ Rules:
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
+  /// Send a task execution message ï¿½ no conversation history, low temperature, limited tokens.
   /// This is much faster and cheaper than sendMessage.
   Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
