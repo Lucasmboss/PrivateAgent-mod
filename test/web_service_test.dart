@@ -33,9 +33,14 @@ void main() {
   test('encodes map bodies as JSON for write requests', () async {
     final service = WebService(
       client: MockClient((request) async {
-        expect(request.method, 'POST');
-        expect(request.headers['Content-Type'], 'application/json');
-        expect(request.body, '{"name":"PrivateAgent","enabled":true}');
+        final typedRequest = request as http.Request;
+
+        expect(typedRequest.method, 'POST');
+        expect(typedRequest.headers['Content-Type'], 'application/json');
+        expect(
+          typedRequest.body,
+          '{"name":"PrivateAgent","enabled":true}',
+        );
 
         return http.Response('{"created":true}', 201);
       }),
