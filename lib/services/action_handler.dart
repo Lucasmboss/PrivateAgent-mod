@@ -105,33 +105,33 @@ class ActionHandler {
           break;
 
         case 'web_search':
-  final query = action.params['query'] as String? ?? '';
+          final query = action.params['query'] as String? ?? '';
 
-  if (query.trim().isEmpty) {
-    result = 'Web search error: empty query.';
-    break;
-  }
+          if (query.trim().isEmpty) {
+            result = 'Web search error: empty query.';
+            break;
+          }
 
-  result = await _webSearch.search(query);
-  break;
+          result = await _webSearch.search(query);
+          break;
 
         case 'web_request':
-  final method = action.params['method'] as String? ?? 'GET';
-  final url = action.params['url'] as String? ?? '';
+          final method = action.params['method'] as String? ?? 'GET';
+          final url = action.params['url'] as String? ?? '';
 
-  final headers = action.params['headers'] is Map
-      ? Map<String, dynamic>.from(action.params['headers'] as Map)
-      : null;
+          final headers = action.params['headers'] is Map
+              ? Map<String, dynamic>.from(action.params['headers'] as Map)
+              : null;
 
-  final body = action.params['body'];
+          final body = action.params['body'];
 
-  result = await _web.request(
-    method: method,
-    url: url,
-    headers: headers,
-    body: body,
-  );
-  break;
+          result = await _web.request(
+            method: method,
+            url: url,
+            headers: headers,
+            body: body,
+          );
+          break;
 
         case 'send_email':
           result = await _communication.sendEmail(
@@ -200,9 +200,13 @@ class ActionHandler {
           result = action.response;
       }
 
+      final requestSucceeded = action.action == 'web_request'
+          ? WebService.isSuccessfulResponse(result)
+          : true;
+
       return AgentActionResult(
         actionType: action.action,
-        success: true,
+        success: requestSucceeded,
         details: result,
       );
     } catch (e) {
