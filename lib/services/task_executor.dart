@@ -12,6 +12,9 @@ import 'skill_memory_service.dart';
 import 'recovery_engine.dart';
 import 'web_service.dart';
 import 'web_search_service.dart';
+import 'file_service.dart';
+import 'task_store.dart';
+import '../models/task_record.dart';
 import '../models/saved_skill.dart';
 
 /// Executes autonomous multi-step tasks using multiple strategies.
@@ -43,6 +46,9 @@ class TaskExecutor {
   /// Kept internal for this first architectural iteration so we do not
   /// need to modify ActionHandler yet.
   final WebService _webService = WebService();
+  final FileService _files = FileService();
+  final TaskStore _taskStore = TaskStore();
+  String? _activeTaskId;
 
   final WebSearchService _webSearchService =
     WebSearchService();
@@ -267,6 +273,13 @@ Finish the task.
 Parameters:
 {}
 
+FILE ACTIONS (only in the application's private agent_files directory):
+- list_files: {}
+- read_file: {"path": "notes.txt"}
+- write_file: {"path": "notes.txt", "content": "text"}
+- delete_file: {"path": "notes.txt"} (only when explicitly requested by the user)
+Do not claim these tools can access arbitrary Android storage.
+
 RESPONSE FORMAT:
 
 Return ONLY valid JSON.
@@ -337,19 +350,37 @@ GENERAL RULES:
   // EXECUTE TASK
   // ===========================================================================
 
-  Future<String> executeTask(String userGoal) async {
+  Future<String> executeTask(String userGoal, {String? resumeTaskId}) async {
     await ScreenAutomationService.logToNative(
       '[TaskExecutor] executeTask() CALLED with goal: $userGoal',
     );
 
     _cancelled = false;
     _cancelCompleter = null;
+    final previousTask =
+        resumeTaskId == null ? null : await _taskStore.get(resumeTaskId);
+    if (resumeTaskId != null &&
+        (previousTask == null || previousTask.status == TaskStatus.running ||
+            previousTask.status == TaskStatus.completed)) {
+      return 'Cannot resume this task: it is missing or already active/completed.';
+    }
+    final task = previousTask == null
+        ? await _taskStore.create(goal: userGoal)
+        : await _taskStore.update(resumeTaskId!,
+            status: TaskStatus.running, goal: userGoal);
+    _activeTaskId = task.identifier;
 
     final results = <String>[];
 
     results.add(
       'Starting task: $userGoal',
     );
+    if (previousTask != null) {
+      results.insertAll(0, [
+        'Resuming task. Previous results: ${previousTask.results}',
+        'Previously failed strategies: ${previousTask.failedStrategies.join(', ')}',
+      ]);
+    }
 
     _report(
       'Starting task: $userGoal',
@@ -405,6 +436,8 @@ GENERAL RULES:
             savedSkill.steps.length,
             results,
           );
+          await _finishTask(TaskStatus.completed, savedSkill.steps.length, 0,
+              results, const []);
 
           await _screenService.showToast(
             'Task Complete! (Memory)',
@@ -446,7 +479,8 @@ GENERAL RULES:
 
     String lastFailedAction = '';
 
-    final List<String> failedStrategies = [];
+    final List<String> failedStrategies =
+        List<String>.from(previousTask?.failedStrategies ?? const []);
 
     int totalTokens = 0;
 
@@ -557,6 +591,16 @@ GENERAL RULES:
           results,
         );
       }
+
+      await _taskStore.update(
+        _activeTaskId!,
+        progress: step / _aiService.maxSteps,
+        tokens: totalTokens,
+        results: results.length <= 20
+            ? results
+            : results.sublist(results.length - 20),
+        failedStrategies: failedStrategies,
+      );
 
       // -----------------------------------------------------------------------
       // Adaptive delay
@@ -749,6 +793,8 @@ Remember:
           step,
           results,
         );
+        await _finishTask(TaskStatus.failed, step, totalTokens,
+            results, failedStrategies);
 
         return 'I could not complete the task because the AI service failed.';
       }
@@ -823,6 +869,8 @@ Remember:
             step,
             results,
           );
+          await _finishTask(TaskStatus.failed, step, totalTokens,
+              results, failedStrategies);
 
           return 'I could not understand the AI response. Please try again.';
         }
@@ -1001,6 +1049,8 @@ Remember:
           step,
           results,
         );
+        await _finishTask(TaskStatus.completed, step, totalTokens,
+            results, failedStrategies);
 
         // Only save UI-based skills.
         //
@@ -1266,6 +1316,46 @@ Remember:
           );
         }
 
+        continue;
+      }
+
+      if (action == 'list_files' ||
+          action == 'read_file' ||
+          action == 'write_file' ||
+          action == 'delete_file') {
+        try {
+          final path = params['path'] as String? ?? '';
+          switch (action) {
+            case 'list_files':
+              final files = await _files.listFiles(recursive: true);
+              previousResult = files.isEmpty
+                  ? 'No files in agent_files.'
+                  : files.join('\n');
+              break;
+            case 'read_file':
+              final text = await _files.readText(path);
+              previousResult = text.length > 12000
+                  ? '${text.substring(0, 12000)}\n[File content truncated]'
+                  : text;
+              break;
+            case 'write_file':
+              await _files.writeText(
+                  path, params['content'] as String? ?? '');
+              previousResult = 'File written to agent_files: $path';
+              break;
+            case 'delete_file':
+              await _files.delete(path);
+              previousResult = 'File deleted from agent_files: $path';
+              break;
+          }
+          results.add('$action: $previousResult');
+          consecutiveFailures = 0;
+        } catch (error) {
+          previousResult = '$action failed: $error';
+          results.add(previousResult);
+          consecutiveFailures++;
+          failedStrategies.add('$action: $error');
+        }
         continue;
       }
 
@@ -1830,7 +1920,7 @@ Remember:
         );
 
         _report(
-          'Agent stuck — changing strategy.',
+          'Agent stuck ï¿½ changing strategy.',
         );
 
         // IMPORTANT:
@@ -1933,6 +2023,8 @@ Remember:
       _aiService.maxSteps,
       results,
     );
+    await _finishTask(TaskStatus.needsRevision, _aiService.maxSteps,
+        totalTokens, results, failedStrategies);
 
     if (await _screenService.isServiceRunning()) {
       await _screenService.showToast(
@@ -1974,6 +2066,8 @@ Remember:
       step,
       results,
     );
+    await _finishTask(TaskStatus.cancelled, step, totalTokens,
+        results, const []);
 
     if (await _screenService.isServiceRunning()) {
       await _screenService.showToast(
@@ -1990,6 +2084,21 @@ Remember:
 
   void _report(String message) {
     onProgress?.call(message);
+  }
+
+  Future<void> _finishTask(TaskStatus status, int steps, int tokens,
+      List<String> results, List<String> failedStrategies) async {
+    final id = _activeTaskId;
+    if (id == null) return;
+    await _taskStore.update(id,
+        status: status,
+        progress: status == TaskStatus.completed ? 1 : null,
+        tokens: tokens,
+        results: results.length <= 20
+            ? results
+            : results.sublist(results.length - 20),
+        failedStrategies: failedStrategies);
+    _activeTaskId = null;
   }
 
   int? _extractHttpStatus(
