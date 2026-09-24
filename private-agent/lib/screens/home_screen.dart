@@ -43,6 +43,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isListening = false;
+  bool _servicesReady = false;
+  bool _assistantInvocationQueued = false;
+  StreamSubscription<dynamic>? _assistantInvocationSubscription;
   String _taskStateLabel = 'Thinking...';
   int _approvalGeneration = 0;
   BuildContext? _approvalDialogContext;
@@ -132,6 +135,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _telegramService = TelegramService(_actionHandler, _aiService);
+    _assistantInvocationSubscription = AssistantPlatformService
+        .assistantInvocations
+        .listen((_) {
+          unawaited(_handleAssistantInvocation());
+        });
     _initServices();
     _startOverlayHistorySync();
     // Register as the handler for overlay bubble tasks
@@ -146,25 +154,48 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _telegramService.init();
     await _actionHandler.shizuku.checkAvailability();
 
-    if (mounted) {
-      final prefs = await SharedPreferences.getInstance();
-      final assistantInvocation =
-          await AssistantPlatformService.consumeAssistantInvocation();
-      setState(() {});
-      if (!assistantInvocation) {
-        final savedMode = prefs.getString('interaction_mode');
-        if (savedMode == 'chat' || savedMode == 'agent') {
-          setState(() => _mode = savedMode!);
-        }
-      } else {
-        setState(() => _mode = 'agent');
-        // Android's default-assistant entry point opens the audited Agent UI
-        // and starts the same native Google voice path as the microphone button.
-        await Future<void>.delayed(const Duration(milliseconds: 350));
-        if (mounted && !_isLoading && !_isListening) {
-          await _toggleVoice();
-        }
-      }
+    _servicesReady = true;
+    if (!mounted) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final assistantInvocation =
+        await AssistantPlatformService.consumeAssistantInvocation();
+    final shouldActivateAssistant =
+        assistantInvocation || _assistantInvocationQueued;
+    _assistantInvocationQueued = false;
+
+    if (shouldActivateAssistant) {
+      await _activateAssistantInvocation();
+      return;
+    }
+
+    final savedMode = prefs.getString('interaction_mode');
+    if (savedMode == 'chat' || savedMode == 'agent') {
+      setState(() => _mode = savedMode!);
+    }
+  }
+
+  Future<void> _handleAssistantInvocation() async {
+    if (!_servicesReady) {
+      _assistantInvocationQueued = true;
+      return;
+    }
+
+    final invoked = await AssistantPlatformService.consumeAssistantInvocation();
+    if (invoked) await _activateAssistantInvocation();
+  }
+
+  Future<void> _activateAssistantInvocation() async {
+    if (!mounted) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('interaction_mode', 'agent');
+    if (mounted) setState(() => _mode = 'agent');
+
+    // Android's default-assistant entry point opens the audited Agent UI and
+    // starts the same native Google voice path as the microphone button.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (mounted && !_isLoading && !_isListening) {
+      await _toggleVoice();
     }
   }
 
@@ -531,6 +562,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _actionHandler.cancelTask();
     WidgetsBinding.instance.removeObserver(this);
     _overlayHistoryTimer?.cancel();
+    _assistantInvocationSubscription?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _voiceService.dispose();

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -13,6 +14,14 @@ class AssistantPlatformService {
   static const MethodChannel _voiceChannel = MethodChannel(
     'com.privateagent/native_voice',
   );
+  static const EventChannel _assistantEvents = EventChannel(
+    'com.privateagent/assistant_events',
+  );
+
+  static Stream<dynamic> get assistantInvocations {
+    if (!_isAndroid) return const Stream<dynamic>.empty();
+    return _assistantEvents.receiveBroadcastStream();
+  }
 
   static Future<bool> isDefaultAssistant() async {
     if (!_isAndroid) return false;

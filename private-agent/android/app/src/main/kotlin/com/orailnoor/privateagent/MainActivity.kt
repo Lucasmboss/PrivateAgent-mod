@@ -23,8 +23,10 @@ class MainActivity : FlutterActivity() {
     private val EVENT_CHANNEL = "com.privateagent/accessibility_events"
     private val VOICE_CHANNEL = "com.privateagent/native_voice"
     private val VOICE_EVENT_CHANNEL = "com.privateagent/native_voice_events"
+    private val ASSISTANT_EVENT_CHANNEL = "com.privateagent/assistant_events"
     private var eventSink: EventChannel.EventSink? = null
     private var voiceEventSink: EventChannel.EventSink? = null
+    private var assistantEventSink: EventChannel.EventSink? = null
     private var overlayView: View? = null
     private lateinit var googleVoiceEngine: GoogleVoiceEngine
     private var assistantInvocationPending = false
@@ -38,8 +40,14 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(newIntent: Intent) {
         super.onNewIntent(newIntent)
         setIntent(newIntent)
-        assistantInvocationPending =
+        val isAssistantInvocation =
             newIntent.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false)
+        assistantInvocationPending = isAssistantInvocation
+        if (isAssistantInvocation) {
+            runOnUiThread {
+                assistantEventSink?.success(mapOf("type" to "invocation"))
+            }
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -113,6 +121,24 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            ASSISTANT_EVENT_CHANNEL
+        ).setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(
+                    arguments: Any?,
+                    events: EventChannel.EventSink?
+                ) {
+                    assistantEventSink = events
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    assistantEventSink = null
+                }
+            }
+        )
+
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -135,6 +161,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        assistantEventSink = null
         if (::googleVoiceEngine.isInitialized) {
             googleVoiceEngine.dispose()
         }
