@@ -1,1 +1,6 @@
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+    - local_plugins/**
 include: package:flutter_lints/flutter.yaml

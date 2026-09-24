@@ -275,6 +275,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     required String userRequest,
     required String toolName,
     required String toolResult,
+    RemoteCancellationToken? cancellationToken,
   }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw const RemoteProviderException(RemoteErrorKind.authentication);
@@ -314,7 +315,10 @@ Rules:
         },
       ];
 
-    return (await _complete(messages)).content;
+    return (await _complete(
+      messages,
+      cancellationToken: cancellationToken,
+    )).content;
   }
 
   /// Uses SSE transport, buffering before emission so fragmented reasoning
@@ -322,6 +326,7 @@ Rules:
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
+    RemoteCancellationToken? cancellationToken,
   }) async* {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw const RemoteProviderException(RemoteErrorKind.authentication);
@@ -332,7 +337,7 @@ Rules:
       if (_useSystemPrompt)
         {'role': 'system', 'content': isAgentMode ? _systemPrompt : _chatSystemPrompt},
       ..._conversationHistory,
-    ], stream: true);
+    ], stream: true, cancellationToken: cancellationToken);
     addHistoryMessage('assistant', result.content);
     yield result.content;
   }

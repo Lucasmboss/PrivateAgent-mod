@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/chat_message.dart';
 import '../models/agent_action.dart';
 import '../models/task_record.dart';
@@ -12,6 +13,7 @@ import '../services/tool_policy.dart';
 import '../privacy_sanitizer.dart';
 import '../services/task_store.dart';
 import '../services/voice_service.dart';
+import '../services/assistant_platform_service.dart';
 import '../widgets/message_bubble.dart';
 import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
@@ -41,19 +43,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isListening = false;
+  bool _servicesReady = false;
+  bool _assistantInvocationQueued = false;
+  bool _isTaskExecutorActive = false;
+  bool _stopRequested = false;
+  bool _lastStopWasPause = false;
+  RemoteCancellationToken? _activeResponseCancellation;
+  StreamSubscription<dynamic>? _assistantInvocationSubscription;
   String _taskStateLabel = 'Thinking...';
   int _approvalGeneration = 0;
   BuildContext? _approvalDialogContext;
 
   void _stopActiveTask({required bool pause}) {
+    if (_stopRequested) return;
+    final canPause = pause && _isTaskExecutorActive;
     _approvalGeneration++;
-    if (pause) {
+    _stopRequested = true;
+    _lastStopWasPause = canPause;
+    _activeResponseCancellation?.cancel();
+    if (canPause) {
       _actionHandler.pauseTask();
     } else {
       _actionHandler.cancelTask();
     }
     _dismissApproval();
-    if (mounted) setState(() => _taskStateLabel = pause ? 'Paused' : 'Cancelled');
+    if (mounted) {
+      setState(() {
+        _taskStateLabel = canPause
+            ? (_actionHandler.isActionInFlight
+                  ? 'Pausing after the current action…'
+                  : 'Pausing task…')
+            : (_actionHandler.isActionInFlight
+                  ? 'Stopping after the current action…'
+                  : 'Stopping…');
+      });
+    }
   }
 
   void _dismissApproval() {
@@ -63,7 +87,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
-    if (!mounted || _appLifecycleState != AppLifecycleState.resumed) return false;
+    if (!mounted || _appLifecycleState != AppLifecycleState.resumed)
+      return false;
     final generation = _approvalGeneration;
     setState(() => _taskStateLabel = 'Waiting for approval');
     final approved = await showDialog<bool>(
@@ -73,9 +98,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _approvalDialogContext = dialogContext;
         return AlertDialog(
           title: const Text('Approve this action?'),
-          content: SingleChildScrollView(child: Text(
+          content: SingleChildScrollView(
+            child: Text(
               '${request.summary}\n\n${request.preview}\n\n'
-              'Approval applies only to this action. When unsure, deny.')),
+              'Approval applies only to this action. When unsure, deny.',
+            ),
+          ),
           actions: [
             TextButton(
               autofocus: true,
@@ -83,8 +111,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: const Text('Deny'),
             ),
             TextButton(
-              onPressed: () => _stopActiveTask(pause: true),
-              child: const Text('Pause task'),
+              onPressed: () => _stopActiveTask(
+                pause: _isTaskExecutorActive,
+              ),
+              child: Text(
+                _isTaskExecutorActive ? 'Pause task' : 'Stop request',
+              ),
             ),
             FilledButton(
               onPressed: () => Navigator.of(dialogContext).pop(true),
@@ -95,17 +127,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       },
     );
     _approvalDialogContext = null;
-    final allowed = approved == true && mounted &&
+    final allowed =
+        approved == true &&
+        mounted &&
         generation == _approvalGeneration &&
         _appLifecycleState == AppLifecycleState.resumed;
     if (mounted && generation == _approvalGeneration) {
-      setState(() => _taskStateLabel = allowed ? 'Running approved action' : 'Approval denied');
+      setState(
+        () => _taskStateLabel = allowed
+            ? 'Running approved action'
+            : 'Approval denied',
+      );
     }
     return allowed;
   }
 
-  // Custom switch state: 'chat' or 'agent'
-  String _mode = 'chat';
+  // Custom switch state: 'chat' or 'agent'. Agent is the safe product default.
+  String _mode = 'agent';
 
   // Chat Session state tracking
   String _sessionId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -119,6 +157,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _telegramService = TelegramService(_actionHandler, _aiService);
+    _assistantInvocationSubscription = AssistantPlatformService
+        .assistantInvocations
+        .listen((_) {
+          unawaited(_handleAssistantInvocation());
+        });
     _initServices();
     _startOverlayHistorySync();
     // Register as the handler for overlay bubble tasks
@@ -133,8 +176,48 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _telegramService.init();
     await _actionHandler.shizuku.checkAvailability();
 
-    if (mounted) {
-      setState(() {});
+    _servicesReady = true;
+    if (!mounted) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final assistantInvocation =
+        await AssistantPlatformService.consumeAssistantInvocation();
+    final shouldActivateAssistant =
+        assistantInvocation || _assistantInvocationQueued;
+    _assistantInvocationQueued = false;
+
+    if (shouldActivateAssistant) {
+      await _activateAssistantInvocation();
+      return;
+    }
+
+    final savedMode = prefs.getString('interaction_mode');
+    if (savedMode == 'chat' || savedMode == 'agent') {
+      setState(() => _mode = savedMode!);
+    }
+  }
+
+  Future<void> _handleAssistantInvocation() async {
+    if (!_servicesReady) {
+      _assistantInvocationQueued = true;
+      return;
+    }
+
+    final invoked = await AssistantPlatformService.consumeAssistantInvocation();
+    if (invoked) await _activateAssistantInvocation();
+  }
+
+  Future<void> _activateAssistantInvocation() async {
+    if (!mounted) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('interaction_mode', 'agent');
+    if (mounted) setState(() => _mode = 'agent');
+
+    // Android's default-assistant entry point opens the audited Agent UI and
+    // starts the same native Google voice path as the microphone button.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (mounted && !_isLoading && !_isListening) {
+      await _toggleVoice();
     }
   }
 
@@ -162,9 +245,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await ChatHistoryService.saveSession(session);
   }
 
-  Future<void> _sendMessage(String text) async {
+  Future<void> _sendMessage(
+    String text, {
+    bool speakActionResponse = false,
+  }) async {
     if (!mounted || _isLoading || text.trim().isEmpty) return;
     final generation = _approvalGeneration;
+    final responseCancellation = RemoteCancellationToken();
+    _activeResponseCancellation = responseCancellation;
+    _stopRequested = false;
+    _lastStopWasPause = false;
+    _isTaskExecutorActive = false;
 
     final userMessage = ChatMessage(role: 'user', content: text.trim());
     setState(() {
@@ -183,11 +274,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _messages.add(assistantMessage);
     });
     final assistantIndex = _messages.length - 1;
+    var assistantBubbleVisible = true;
+    void showStoppedMessage() {
+      final message = _lastStopWasPause
+          ? 'Paused before a resumable Agent task started. Send the request again to continue.'
+          : 'Stopped before another action was started.';
+      setState(() {
+        if (assistantBubbleVisible && assistantIndex < _messages.length) {
+          _messages.removeAt(assistantIndex);
+        }
+        assistantBubbleVisible = false;
+        _messages.add(ChatMessage(role: 'assistant', content: message));
+      });
+    }
 
     try {
       final isAgent = _mode == 'agent';
       final stream = _aiService
-          .sendMessageStream(text.trim(), isAgentMode: isAgent)
+          .sendMessageStream(
+            text.trim(),
+            isAgentMode: isAgent,
+            cancellationToken: responseCancellation,
+          )
           .timeout(
             const Duration(seconds: 90),
             onTimeout: (sink) {
@@ -217,16 +325,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       // Check if it's an action
       final action = _aiService.parseAction(accumulated);
-      if (!mounted || generation != _approvalGeneration) return;
+      if (!mounted) return;
+      if (generation != _approvalGeneration) {
+        if (_stopRequested) showStoppedMessage();
+        return;
+      }
 
       if (action != null) {
         // If it's an action, we remove the raw JSON message from display
         setState(() {
           _messages.removeAt(assistantIndex);
         });
+        assistantBubbleVisible = false;
 
         await _showTaskProgressOverlay('Starting: ${text.trim()}');
-        if (!mounted || generation != _approvalGeneration) return;
+        if (!mounted) return;
+        if (generation != _approvalGeneration) {
+          if (_stopRequested) showStoppedMessage();
+          return;
+        }
+        _isTaskExecutorActive = action.action == 'execute_task';
+        if (_isTaskExecutorActive) {
+          setState(() => _taskStateLabel = 'Starting task…');
+        }
 
         // Execute the action (pass aiService for multi-step tasks)
         final result = await _actionHandler.execute(
@@ -235,14 +356,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           onApproval: _requestToolApproval,
           userRequest: text.trim(),
           onProgress: (msg) {
-            if (msg.contains('budget exhausted') || msg.startsWith('Task paused') ||
-                msg.startsWith('Task cancelled') || msg.startsWith('Action denied')) {
+            if (msg.contains('budget exhausted') ||
+                msg.startsWith('Task paused') ||
+                msg.startsWith('Task cancelled') ||
+                msg.startsWith('Action denied')) {
               _dismissApproval();
             }
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
             if (mounted) {
               setState(() {
+                if (msg.startsWith('Task paused')) {
+                  _taskStateLabel = 'Paused';
+                } else if (msg.startsWith('Task cancelled')) {
+                  _taskStateLabel = 'Cancelled';
+                } else if (!_stopRequested) {
+                  _taskStateLabel = msg;
+                }
                 _messages.add(
                   ChatMessage(role: 'assistant', content: '⏳ $msg'),
                 );
@@ -251,6 +381,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             }
           },
         );
+        _isTaskExecutorActive = false;
         _dismissApproval();
         if (!mounted) return;
 
@@ -265,11 +396,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           if (!result.success) {
             finalResponse = result.details ?? 'Task did not complete.';
           } else {
-          finalResponse = await _aiService.interpretToolResult(
-            userRequest: text.trim(),
-            toolName: action.action,
-            toolResult: result.details ?? 'Done.',
-          );
+            finalResponse = await _aiService.interpretToolResult(
+              userRequest: text.trim(),
+              toolName: action.action,
+              toolResult: result.details ?? 'Done.',
+              cancellationToken: responseCancellation,
+            );
           }
         } catch (e) {
           developer.log(
@@ -282,59 +414,73 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               : '? ${result.details ?? 'Unknown error'}';
         }
 
-setState(() {
-  _messages.add(
-    ChatMessage(
-      role: 'assistant',
-      content: finalResponse,
-      actionResult: result,
-    ),
-  );
-});
-        _sendOverlayEvent(
-  'OVERLAY_TASK_FINISHED',
-  finalResponse,
-);
+        setState(() {
+          _messages.add(
+            ChatMessage(
+              role: 'assistant',
+              content: finalResponse,
+              actionResult: result,
+            ),
+          );
+        });
+        _sendOverlayEvent('OVERLAY_TASK_FINISHED', finalResponse);
+        if (speakActionResponse) {
+          unawaited(_speakVoiceResponse(finalResponse));
+        }
         if (action.action != 'execute_task') {
           await _notificationService.showTaskCompleteNotification(
-  result.success ? 'Task Completed' : 'Task Failed',
-  finalResponse,
-);
+            result.success ? 'Task Completed' : 'Task Failed',
+            finalResponse,
+          );
         }
         await _saveSession();
       } else {
         // Plain text response, we already rendered it, just speak it
-        _voiceService.speak(accumulated);
+        unawaited(_speakVoiceResponse(accumulated));
       }
     } catch (e) {
       if (mounted) {
-        setState(() {
-          if (_messages.isNotEmpty && _messages.length > assistantIndex) {
-            _messages.removeAt(assistantIndex);
-          }
-          _messages.add(
-            ChatMessage(
-              role: 'assistant',
-              content: 'Error: ${e.toString().replaceFirst('Exception: ', '')}',
-            ),
-          );
-        });
+        if (_stopRequested) {
+          showStoppedMessage();
+        } else {
+          setState(() {
+            if (assistantBubbleVisible && assistantIndex < _messages.length) {
+              _messages.removeAt(assistantIndex);
+            }
+            assistantBubbleVisible = false;
+            _messages.add(
+              ChatMessage(
+                role: 'assistant',
+                content: 'Error: ${e.toString().replaceFirst('Exception: ', '')}',
+              ),
+            );
+          });
+        }
       }
     } finally {
       if (mounted) {
         setState(() {
           _isLoading = false;
+          _isTaskExecutorActive = false;
+          _stopRequested = false;
+          _lastStopWasPause = false;
         });
         _scrollToBottom();
         _updateOverlayState();
+      }
+      if (identical(_activeResponseCancellation, responseCancellation)) {
+        _activeResponseCancellation = null;
       }
     }
   }
 
   Future<void> _resumeTask(TaskRecord task) async {
     if (_isLoading) return;
+    _stopRequested = false;
+    _lastStopWasPause = false;
     setState(() {
       _isLoading = true;
+      _isTaskExecutorActive = true;
       _taskStateLabel = 'Resuming task...';
     });
     try {
@@ -347,28 +493,53 @@ setState(() {
         aiService: _aiService,
         onApproval: _requestToolApproval,
         onProgress: (message) {
-          if (message.contains('budget exhausted') || message.startsWith('Task paused') ||
-              message.startsWith('Task cancelled') || message.startsWith('Action denied')) {
+          if (message.contains('budget exhausted') ||
+              message.startsWith('Task paused') ||
+              message.startsWith('Task cancelled') ||
+              message.startsWith('Action denied')) {
             _dismissApproval();
           }
           if (mounted) {
-            setState(() => _messages.add(
-                ChatMessage(role: 'assistant', content: '⏳ $message')));
+            setState(
+              () {
+                if (message.startsWith('Task paused')) {
+                  _taskStateLabel = 'Paused';
+                } else if (message.startsWith('Task cancelled')) {
+                  _taskStateLabel = 'Cancelled';
+                } else if (!_stopRequested) {
+                  _taskStateLabel = message;
+                }
+                _messages.add(
+                  ChatMessage(role: 'assistant', content: '⏳ $message'),
+                );
+              },
+            );
             _scrollToBottom();
           }
         },
       );
       _dismissApproval();
       if (mounted) {
-        setState(() => _messages.add(ChatMessage(
-          role: 'assistant',
-          content: result.details ?? 'Task stopped.',
-          actionResult: result,
-        )));
+        setState(
+          () => _messages.add(
+            ChatMessage(
+              role: 'assistant',
+              content: result.details ?? 'Task stopped.',
+              actionResult: result,
+            ),
+          ),
+        );
         await _saveSession();
       }
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isTaskExecutorActive = false;
+          _stopRequested = false;
+          _lastStopWasPause = false;
+        });
+      }
     }
   }
 
@@ -403,7 +574,9 @@ setState(() {
 
   void _sendOverlayEvent(String type, String message) {
     if (!FeatureFlags.floatingOverlayEnabled) return;
-    final safeMessage = PrivacySanitizer.sanitizeTaskTrace(message).replaceAll('|', ' ');
+    final safeMessage = PrivacySanitizer.sanitizeTaskTrace(
+      message,
+    ).replaceAll('|', ' ');
     unawaited(
       FlutterOverlayWindow.shareData(
         '$type|$safeMessage',
@@ -437,6 +610,18 @@ setState(() {
     });
   }
 
+  Future<void> _speakVoiceResponse(String text) async {
+    try {
+      await _voiceService.speak(text);
+    } catch (error) {
+      developer.log('Voice output failed: $error', name: 'PrivateAgent');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Voice output could not be played.')),
+      );
+    }
+  }
+
   Future<void> _toggleVoice() async {
     if (_isListening) {
       await _voiceService.stopListening();
@@ -446,16 +631,26 @@ setState(() {
 
     setState(() => _isListening = true);
 
-    await _voiceService.startListening(
+    final started = await _voiceService.startListening(
       onResult: (text) {
-        _sendMessage(text);
+        unawaited(_sendMessage(text, speakActionResponse: true));
       },
       onDone: () {
         if (mounted) {
           setState(() => _isListening = false);
         }
       },
+      onError: (message) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        }
+      },
     );
+    if (!started && mounted && _isListening) {
+      setState(() => _isListening = false);
+    }
   }
 
   void _startNewChat() {
@@ -491,6 +686,7 @@ setState(() {
     _actionHandler.cancelTask();
     WidgetsBinding.instance.removeObserver(this);
     _overlayHistoryTimer?.cancel();
+    _assistantInvocationSubscription?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _voiceService.dispose();
@@ -801,34 +997,44 @@ setState(() {
                         ),
                       ),
                       const SizedBox(width: 10),
-                      Text(
-                        _taskStateLabel,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: isDark
-                              ? const Color(0xFF9E9BAC)
-                              : const Color(0xFF6C6A7C),
-                          fontWeight: FontWeight.w500,
+                      Flexible(
+                        child: Text(
+                          _taskStateLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: isDark
+                                ? const Color(0xFF9E9BAC)
+                                : const Color(0xFF6C6A7C),
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
                       const SizedBox(width: 8),
+                      if (_isTaskExecutorActive)
+                        TextButton.icon(
+                          onPressed: _stopRequested
+                              ? null
+                              : () => _stopActiveTask(pause: true),
+                          icon: const Icon(
+                            Icons.pause_circle_outline,
+                            size: 16,
+                          ),
+                          label: const Text('Pause'),
+                        ),
                       TextButton.icon(
-                        onPressed: () => _stopActiveTask(pause: true),
-                        icon: const Icon(Icons.pause_circle_outline, size: 16),
-                        label: const Text('Pause'),
-                      ),
-                      TextButton.icon(
-                        onPressed: () {
-                          _stopActiveTask(pause: false);
-                        },
+                        onPressed: _stopRequested
+                            ? null
+                            : () => _stopActiveTask(pause: false),
                         icon: const Icon(
                           Icons.stop_circle_rounded,
                           size: 16,
                           color: Colors.redAccent,
                         ),
-                        label: const Text(
-                          'Stop',
-                          style: TextStyle(
+                        label: Text(
+                          _stopRequested ? 'Stopping…' : 'Stop',
+                          style: const TextStyle(
                             color: Colors.redAccent,
                             fontSize: 12,
                             fontWeight: FontWeight.bold,
@@ -1213,6 +1419,9 @@ setState(() {
         setState(() {
           _mode = modeId;
         });
+        SharedPreferences.getInstance().then(
+          (prefs) => prefs.setString('interaction_mode', modeId),
+        );
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 300),

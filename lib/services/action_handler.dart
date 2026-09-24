@@ -34,7 +34,10 @@ class ActionHandler {
 
   /// The currently running task executor, if any
   TaskExecutor? _currentExecutor;
+  bool _directActionInFlight = false;
   int _stopGeneration = 0;
+  bool get isActionInFlight =>
+      _currentExecutor?.isActionInFlight ?? _directActionInFlight;
 
   /// Execute an action and return the result
   Future<AgentActionResult> execute(
@@ -65,6 +68,7 @@ class ActionHandler {
       String result;
       bool taskSucceeded = false;
 
+      _directActionInFlight = true;
       switch (action.action) {
         case 'open_app':
           result = await _appLauncher.openApp(
@@ -290,6 +294,7 @@ class ActionHandler {
         default:
           throw StateError('Tool is not supported by this router.');
       }
+      _directActionInFlight = false;
 
       final requestSucceeded = action.action == 'execute_task'
           ? taskSucceeded
@@ -307,6 +312,7 @@ class ActionHandler {
         details: result,
       );
     } catch (e) {
+      _directActionInFlight = false;
       return AgentActionResult(
         actionType: action.action,
         success: false,

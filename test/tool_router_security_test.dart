@@ -141,6 +141,22 @@ void main() {
       expect((await store.list()).single.status, TaskStatus.paused);
     });
 
+    test('cancel cancels in-flight provider request and persists cancelled', () async {
+      final started = Completer<RemoteCancellationToken>();
+      final engine = executor(_Planner((token, _) {
+        started.complete(token!);
+        final stopped = Completer<AiResponse>();
+        token.onCancel(() => stopped.completeError(StateError('cancelled')));
+        return stopped.future;
+      }));
+      final running = engine.executeTask('Read');
+      final token = await started.future;
+      engine.cancel();
+      expect(await running, contains('Task cancelled'));
+      expect(token.isCancelled, isTrue);
+      expect((await store.list()).single.status, TaskStatus.cancelled);
+    });
+
     test('retry receives same cancellable token and remaining output budget', () async {
       var calls = 0;
       RemoteCancellationToken? firstToken;

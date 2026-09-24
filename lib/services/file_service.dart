@@ -37,13 +37,14 @@ class FileService {
         assert(maxWriteBytes > 0),
         assert(rootDirectory == null || directoryProvider == null),
         _directoryProvider = directoryProvider ??
-            (rootDirectory == null
-                ? _defaultDirectoryProvider
-                : () async => rootDirectory!);
+            _providerForRoot(rootDirectory);
 
   final int maxReadBytes;
   final int maxWriteBytes;
   final FileServiceDirectoryProvider _directoryProvider;
+
+  static FileServiceDirectoryProvider _providerForRoot(Directory? root) =>
+      root == null ? _defaultDirectoryProvider : () async => root;
 
   static Future<Directory> _defaultDirectoryProvider() async {
     final documents = await getApplicationDocumentsDirectory();

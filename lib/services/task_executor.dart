@@ -65,8 +65,10 @@ class TaskExecutor {
   /// Set to true to cancel the running task.
   bool _cancelled = false;
   bool _paused = false;
+  bool _actionInFlight = false;
 
   Completer<void>? _cancelCompleter;
+  bool get isActionInFlight => _actionInFlight;
 
   TaskExecutor({
     required AiService aiService,
@@ -1075,6 +1077,7 @@ Remember:
 
       await _taskStore.beginAction(_activeTaskId!, action,
           mutation: call.mutation != ToolMutation.readOnly);
+      _actionInFlight = true;
       bool toolSucceeded = false;
       bool toolThrew = false;
       try {
@@ -1951,9 +1954,13 @@ Remember:
             succeeded: toolSucceeded &&
                 !ToolRegistry.isFailureResult(previousResult),
             threw: toolThrew);
-        await _taskStore.endAction(_activeTaskId!,
-            technicalSuccess: classification == ToolResultClassification.succeeded,
-            uncertain: toolThrew);
+        try {
+          await _taskStore.endAction(_activeTaskId!,
+              technicalSuccess: classification == ToolResultClassification.succeeded,
+              uncertain: toolThrew);
+        } finally {
+          _actionInFlight = false;
+        }
         if (toolThrew) {
           throw StateError('Tool outcome is uncertain; review required before continuing');
         }

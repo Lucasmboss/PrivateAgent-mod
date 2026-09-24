@@ -1,7 +1,11 @@
 package com.orailnoor.privateagent
 
 import android.content.Intent
+import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
+import android.app.role.RoleManager
+import android.content.ComponentName
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -17,11 +21,126 @@ import android.net.Uri
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.privateagent/accessibility"
     private val EVENT_CHANNEL = "com.privateagent/accessibility_events"
+    private val VOICE_CHANNEL = "com.privateagent/native_voice"
+    private val VOICE_EVENT_CHANNEL = "com.privateagent/native_voice_events"
+    private val ASSISTANT_EVENT_CHANNEL = "com.privateagent/assistant_events"
     private var eventSink: EventChannel.EventSink? = null
+    private var voiceEventSink: EventChannel.EventSink? = null
+    private var assistantEventSink: EventChannel.EventSink? = null
     private var overlayView: View? = null
+    private lateinit var googleVoiceEngine: GoogleVoiceEngine
+    private var assistantInvocationPending = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        assistantInvocationPending =
+            intent?.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false) == true
+    }
+
+    override fun onNewIntent(newIntent: Intent) {
+        super.onNewIntent(newIntent)
+        setIntent(newIntent)
+        val isAssistantInvocation =
+            newIntent.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false)
+        assistantInvocationPending = isAssistantInvocation
+        if (isAssistantInvocation) {
+            runOnUiThread {
+                assistantEventSink?.success(mapOf("type" to "invocation"))
+            }
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        googleVoiceEngine = GoogleVoiceEngine(this) { event ->
+            runOnUiThread { voiceEventSink?.success(event) }
+        }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, VOICE_EVENT_CHANNEL)
+            .setStreamHandler(
+                object : EventChannel.StreamHandler {
+                    override fun onListen(
+                        arguments: Any?,
+                        events: EventChannel.EventSink?
+                    ) {
+                        voiceEventSink = events
+                    }
+
+                    override fun onCancel(arguments: Any?) {
+                        voiceEventSink = null
+                    }
+                }
+            )
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, VOICE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "initialize" -> result.success(googleVoiceEngine.initialize())
+                    "startListening" -> result.success(
+                        googleVoiceEngine.startListening(
+                            call.argument<String>("language")
+                        )
+                    )
+                    "stopListening" -> {
+                        googleVoiceEngine.stopListening()
+                        result.success(true)
+                    }
+                    "speak" -> result.success(
+                        googleVoiceEngine.speak(
+                            call.argument<String>("text").orEmpty(),
+                            call.argument<String>("language")
+                        )
+                    )
+                    "stopSpeaking" -> {
+                        googleVoiceEngine.stopSpeaking()
+                        result.success(true)
+                    }
+                    "isGoogleVoiceAvailable" -> result.success(
+                        googleVoiceEngine.isGoogleVoiceAvailable()
+                    )
+                    "getGoogleVoiceStatus" -> result.success(
+                        googleVoiceEngine.getAvailability()
+                    )
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.privateagent/assistant")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "consumeAssistantInvocation" -> {
+                        val invoked = assistantInvocationPending ||
+                            intent?.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false) == true
+                        assistantInvocationPending = false
+                        intent?.removeExtra(EXTRA_ASSISTANT_INVOCATION)
+                        intent?.removeExtra(EXTRA_FORCE_AGENT_MODE)
+                        result.success(invoked)
+                    }
+                    "isDefaultAssistant" -> result.success(isDefaultAssistant())
+                    "requestDefaultAssistant" -> result.success(requestDefaultAssistant())
+                    "openAssistantSettings" -> result.success(openAssistantSettings())
+                    else -> result.notImplemented()
+                }
+            }
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            ASSISTANT_EVENT_CHANNEL
+        ).setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(
+                    arguments: Any?,
+                    events: EventChannel.EventSink?
+                ) {
+                    assistantEventSink = events
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    assistantEventSink = null
+                }
+            }
+        )
 
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
             object : EventChannel.StreamHandler {
@@ -44,7 +163,58 @@ class MainActivity : FlutterActivity() {
         registerAccessibilityChannel(flutterEngine, this)
     }
 
+    override fun onDestroy() {
+        assistantEventSink = null
+        if (::googleVoiceEngine.isInitialized) {
+            googleVoiceEngine.dispose()
+        }
+        super.onDestroy()
+    }
+
+    private fun isDefaultAssistant(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = getSystemService(RoleManager::class.java)
+            return roleManager?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true
+        }
+        val configured = Settings.Secure.getString(
+            contentResolver,
+            "voice_interaction_service"
+        )
+        return configured == ComponentName(this, PrivateAgentVoiceInteractionService::class.java)
+            .flattenToString()
+    }
+
+    private fun requestDefaultAssistant(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val roleManager = getSystemService(RoleManager::class.java)
+                if (roleManager?.isRoleAvailable(RoleManager.ROLE_ASSISTANT) == true) {
+                    startActivity(roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT))
+                    true
+                } else {
+                    openAssistantSettings()
+                }
+            } else {
+                openAssistantSettings()
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun openAssistantSettings(): Boolean {
+        return try {
+            startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     companion object {
+        const val EXTRA_ASSISTANT_INVOCATION = "privateagent_assistant_invocation"
+        const val EXTRA_FORCE_AGENT_MODE = "privateagent_force_agent_mode"
+
         fun registerAccessibilityChannel(flutterEngine: FlutterEngine, context: android.content.Context) {
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.privateagent/accessibility")
                 .setMethodCallHandler { call, result ->

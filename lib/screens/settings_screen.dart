@@ -9,6 +9,7 @@ import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
 import '../services/task_history_logger.dart';
 import '../services/task_store.dart';
+import '../services/assistant_platform_service.dart';
 import '../privacy_sanitizer.dart';
 import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -54,6 +55,9 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _useSystemPrompt = true;
   bool _floatingIconEnabled = false;
   bool _isOverlayPermissionGranted = false;
+  bool _isDefaultAssistant = false;
+  bool _googleSpeechAvailable = false;
+  bool _googleTtsAvailable = false;
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -87,6 +91,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     _maxTokensController.addListener(_autoSave);
 
     _checkPermissions();
+    _checkAssistantStatus();
     _loadPrivacySettings();
     if (FeatureFlags.floatingOverlayEnabled) {
       _checkOverlayStatus();
@@ -191,9 +196,33 @@ class _SettingsScreenState extends State<SettingsScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _checkPermissions();
+      _checkAssistantStatus();
       if (FeatureFlags.floatingOverlayEnabled) {
         _checkOverlayStatus();
       }
+    }
+  }
+
+  Future<void> _checkAssistantStatus() async {
+    final isDefault = await AssistantPlatformService.isDefaultAssistant();
+    final googleVoice = await AssistantPlatformService.googleVoiceStatus();
+    if (!mounted) return;
+    setState(() {
+      _isDefaultAssistant = isDefault;
+      _googleSpeechAvailable = googleVoice.speechAvailable;
+      _googleTtsAvailable = googleVoice.ttsAvailable;
+    });
+  }
+
+  Future<void> _requestDefaultAssistant() async {
+    final opened = await AssistantPlatformService.requestDefaultAssistant();
+    if (!mounted) return;
+    if (!opened) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Android no pudo abrir la selección de asistente.'),
+        ),
+      );
     }
   }
 
@@ -523,7 +552,97 @@ class _SettingsScreenState extends State<SettingsScreen>
             ],
           ),
 
-          // 2. AI Engine Config Card
+          // 2. Android assistant and native Google voice
+          _buildSettingsCard(
+            icon: Icons.record_voice_over_outlined,
+            title: 'Android Assistant & Google Voice',
+            subtitle: 'Use PrivateAgent with the system assistant gesture',
+            isDark: isDark,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    _isDefaultAssistant
+                        ? Icons.check_circle_rounded
+                        : Icons.info_outline_rounded,
+                    color: _isDefaultAssistant
+                        ? Colors.green
+                        : Theme.of(context).colorScheme.primary,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      _isDefaultAssistant
+                          ? 'PrivateAgent is the default Android assistant.'
+                          : 'Android still uses another default assistant.',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _googleSpeechAvailable
+                        ? 'Voice input: Google Speech Services detected.'
+                        : 'Voice input: Google Speech Services not found; the compatibility recognizer will be tried.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _googleSpeechAvailable
+                          ? Colors.green[700]
+                          : Colors.orange[800],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _googleTtsAvailable
+                        ? 'Voice output: Google Text-to-Speech detected.'
+                        : 'Voice output: Google TTS not found; the compatibility voice will be used.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _googleTtsAvailable
+                          ? Colors.green[700]
+                          : Colors.orange[800],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Microphone access is requested when voice starts. Google voice processing follows the installed services’ privacy settings.',
+                    style: TextStyle(fontSize: 11),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              if (!_isDefaultAssistant)
+                FilledButton.icon(
+                  onPressed: _requestDefaultAssistant,
+                  icon: const Icon(Icons.assistant, size: 18),
+                  label: const Text('Set as default assistant'),
+                ),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  await AssistantPlatformService.openAssistantSettings();
+                },
+                icon: const Icon(Icons.settings_outlined, size: 18),
+                label: const Text('Open Android assistant settings'),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Android always asks for your confirmation. The assistant opens Agent mode and keeps the existing per-action approval rules.',
+                style: TextStyle(fontSize: 11),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'The system-assistant gesture opens PrivateAgent; it does not replace Google’s “Hey Google” hotword.',
+                style: TextStyle(fontSize: 11),
+              ),
+            ],
+          ),
+
+          // 3. AI Engine Config Card
           _buildSettingsCard(
             icon: Icons.psychology_outlined,
             title: 'AI Engine Configuration',
