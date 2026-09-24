@@ -148,7 +148,7 @@ class FileService {
   void _ensureContained(String root, String candidate) {
     final rootPath = _normalise(root);
     final candidatePath = _normalise(candidate);
-    if (candidatePath == rootPath ||
+    if (candidatePath != rootPath &&
         !candidatePath.startsWith('$rootPath/')) {
       throw FileServiceException('Path is outside the private directory.');
     }
