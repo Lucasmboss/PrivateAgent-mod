@@ -1,6 +1,7 @@
 package com.orailnoor.privateagent
 
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -17,6 +18,10 @@ import android.view.WindowManager
 import android.view.View
 import android.widget.Button
 import android.net.Uri
+import java.io.ByteArrayOutputStream
+import java.util.Collections
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuRemoteProcess
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.privateagent/accessibility"
@@ -24,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private val VOICE_CHANNEL = "com.privateagent/native_voice"
     private val VOICE_EVENT_CHANNEL = "com.privateagent/native_voice_events"
     private val ASSISTANT_EVENT_CHANNEL = "com.privateagent/assistant_events"
+    private val SHIZUKU_COMMAND_CHANNEL = "com.privateagent/shizuku_commands"
     private var eventSink: EventChannel.EventSink? = null
     private var voiceEventSink: EventChannel.EventSink? = null
     private var assistantEventSink: EventChannel.EventSink? = null
@@ -62,6 +68,23 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            SHIZUKU_COMMAND_CHANNEL
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "runCommandWithStatus" -> {
+                    val command = call.argument<String>("command")
+                    if (command.isNullOrBlank()) {
+                        result.error("INVALID_COMMAND", "Command is empty.", null)
+                    } else {
+                        executeShizukuCommand(command, result)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         googleVoiceEngine = GoogleVoiceEngine(this) { event ->
             runOnUiThread { voiceEventSink?.success(event) }
@@ -461,6 +484,75 @@ class MainActivity : FlutterActivity() {
                     }
                 }
         }
+    }
+
+    private fun executeShizukuCommand(command: String, result: MethodChannel.Result) {
+        Thread {
+            var process: ShizukuRemoteProcess? = null
+            var wasDispatched = false
+            var stdout = ""
+            var stderr = ""
+            var exitCode: Int? = null
+            var errorMessage: String? = null
+
+            try {
+                if (!Shizuku.pingBinder()) {
+                    errorMessage = "Shizuku is not running."
+                } else if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                    errorMessage = "Shizuku permission was not granted."
+                } else {
+                    val activeProcess =
+                        Shizuku.newProcess(arrayOf("sh", "-c", command), null, "/")
+                    process = activeProcess
+                    wasDispatched = true
+
+                    val stdoutBuffer = ByteArrayOutputStream()
+                    val stderrBuffer = ByteArrayOutputStream()
+                    val streamErrors = Collections.synchronizedList(mutableListOf<String>())
+                    val stdoutReader = Thread {
+                        try {
+                            activeProcess.inputStream.use { it.copyTo(stdoutBuffer) }
+                        } catch (error: Exception) {
+                            streamErrors.add(
+                                "stdout: ${error.message ?: error.javaClass.simpleName}"
+                            )
+                        }
+                    }
+                    val stderrReader = Thread {
+                        try {
+                            activeProcess.errorStream.use { it.copyTo(stderrBuffer) }
+                        } catch (error: Exception) {
+                            streamErrors.add(
+                                "stderr: ${error.message ?: error.javaClass.simpleName}"
+                            )
+                        }
+                    }
+                    stdoutReader.start()
+                    stderrReader.start()
+                    exitCode = activeProcess.waitFor()
+                    stdoutReader.join()
+                    stderrReader.join()
+                    stdout = stdoutBuffer.toString(Charsets.UTF_8.name())
+                    stderr = stderrBuffer.toString(Charsets.UTF_8.name())
+                    if (streamErrors.isNotEmpty()) {
+                        errorMessage = streamErrors.joinToString("; ")
+                    }
+                }
+            } catch (error: Exception) {
+                errorMessage = error.message ?: error.javaClass.simpleName
+            } finally {
+                process?.destroy()
+            }
+
+            val response = mapOf(
+                "stdout" to stdout,
+                "stderr" to stderr,
+                "exitCode" to exitCode,
+                "wasDispatched" to wasDispatched,
+                "error" to errorMessage
+            )
+            runOnUiThread { result.success(response) }
+        }.start()
     }
 }
 

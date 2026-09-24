@@ -31,6 +31,19 @@ class _NoopNotificationService extends NotificationService {
   Future<void> showTaskCompleteNotification(String title, String body) async {}
 }
 
+class _FakeShizukuService extends ShizukuService {
+  _FakeShizukuService(this.result);
+
+  final ShizukuCommandResult result;
+  String? lastCommand;
+
+  @override
+  Future<ShizukuCommandResult> runCommandWithStatus(String command) async {
+    lastCommand = command;
+    return result;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -98,13 +111,23 @@ void main() {
       await directory.delete(recursive: true);
     });
 
-    TaskExecutor executor(AiService ai, {ToolApprovalCallback? approve,
-        int tokens = 100, Duration duration = const Duration(minutes: 1)}) =>
-        TaskExecutor(aiService: ai, screenService: ScreenAutomationService(),
-          appLauncher: AppLauncherService(), shizukuService: ShizukuService(),
-          notificationService: _NoopNotificationService(),
-          taskStore: store, onApproval: approve, maxTaskTokens: tokens,
-          maxTaskDuration: duration);
+    TaskExecutor executor(
+      AiService ai, {
+      ToolApprovalCallback? approve,
+      ShizukuService? shizuku,
+      int tokens = 100,
+      Duration duration = const Duration(minutes: 1),
+    }) => TaskExecutor(
+      aiService: ai,
+      screenService: ScreenAutomationService(),
+      appLauncher: AppLauncherService(),
+      shizukuService: shizuku ?? ShizukuService(),
+      notificationService: _NoopNotificationService(),
+      taskStore: store,
+      onApproval: approve,
+      maxTaskTokens: tokens,
+      maxTaskDuration: duration,
+    );
 
     test('explicit host veto never creates success evidence or action checkpoint', () async {
       final engine = executor(
@@ -216,6 +239,95 @@ void main() {
       expect(record.status, TaskStatus.paused);
       expect(record.tokens, 3);
       expect(record.execution.audit, isEmpty);
+    });
+
+    test(
+      'successful shell exit records technical success without aborting',
+      () async {
+        final shizuku = _FakeShizukuService(
+          const ShizukuCommandResult(
+            stdout: 'uptime output\nuid=2000(shell)',
+            stderr: '',
+            exitCode: 0,
+            wasDispatched: true,
+          ),
+        );
+        final engine = executor(
+          _Planner(
+            (_, __) async => AiResponse(
+              '{"action":"run_adb_command","command":"uptime; id",'
+              '"reasoning":"Read device status"}',
+              1,
+            ),
+          ),
+          shizuku: shizuku,
+          tokens: 2,
+        );
+
+        await engine.executeTask('Read device status');
+
+        final record = (await store.list()).single;
+        expect(shizuku.lastCommand, 'uptime; id');
+        expect(record.execution.audit.last.phase, 'success');
+        expect(record.execution.audit.last.technicalSuccess, isTrue);
+        expect(record.execution.inFlight, isNull);
+      },
+    );
+
+    test('unknown shell result stays pending and cannot be replayed', () async {
+      final shizuku = _FakeShizukuService(
+        const ShizukuCommandResult(
+          stdout: 'partial output',
+          stderr: '',
+          exitCode: null,
+          wasDispatched: true,
+        ),
+      );
+      final engine = executor(
+        _Planner(
+          (_, __) async => AiResponse(
+            '{"tool":"run_adb_command","command":"change-device-state",'
+            '"reasoning":"Run the command","is_complete":false}',
+            1,
+          ),
+        ),
+        shizuku: shizuku,
+      );
+
+      await expectLater(
+        engine.executeTask('Change device state'),
+        throwsA(isA<ToolOutcomeUncertainException>()),
+      );
+
+      final record = (await store.list()).single;
+      expect(record.status, TaskStatus.needsRevision);
+      expect(record.execution.audit.last.phase, 'uncertain');
+      expect(record.execution.inFlight, isNotNull);
+      expect(record.execution.inFlight!.action, 'run_adb_command');
+    });
+
+    test('direct shell routing reports exit-code success', () async {
+      final shizuku = _FakeShizukuService(
+        const ShizukuCommandResult(
+          stdout: 'uptime output',
+          stderr: '',
+          exitCode: 0,
+          wasDispatched: true,
+        ),
+      );
+      final handler = ActionHandler(shizukuService: shizuku);
+
+      final result = await handler.execute(
+        AgentAction(
+          action: 'run_adb_command',
+          params: {'command': 'uptime'},
+          response: '',
+        ),
+      );
+
+      expect(shizuku.lastCommand, 'uptime');
+      expect(result.success, isTrue);
+      expect(result.details, contains('Exit code: 0'));
     });
 
     test('resumed task keeps cumulative usage budget', () async {

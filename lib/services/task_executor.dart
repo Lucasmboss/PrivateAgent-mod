@@ -31,6 +31,19 @@ typedef TaskUserQuestionCallback = Future<String?> Function(String question);
 /// 4. Screen automation fallback
 ///
 /// The LLM decides which strategy is appropriate for each step.
+class ToolOutcomeUncertainException implements Exception {
+  const ToolOutcomeUncertainException(this.toolName);
+
+  final String toolName;
+
+  String get userMessage =>
+      'The outcome of $toolName is uncertain. The task is paused for review; '
+      'confirm the device state before resuming or retrying.';
+
+  @override
+  String toString() => userMessage;
+}
+
 class TaskExecutor {
   final AiService _aiService;
   final ScreenAutomationService _screenService;
@@ -382,26 +395,6 @@ GENERAL RULES:
   // ===========================================================================
   // JSON EXTRACTION
   // ===========================================================================
-
-  String _extractJson(String text) {
-    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
-
-    final match = codeBlockRegex.firstMatch(text);
-
-    if (match != null) {
-      return match.group(1)!;
-    }
-
-    final startIndex = text.indexOf('{');
-
-    final endIndex = text.lastIndexOf('}');
-
-    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-      return text.substring(startIndex, endIndex + 1);
-    }
-
-    return text.trim();
-  }
 
   // ===========================================================================
   // EXECUTE TASK
@@ -786,7 +779,7 @@ Remember:
       // Parse action
       // -----------------------------------------------------------------------
 
-      Map<String, dynamic>? actionJson;
+      ParsedActionResponse? parsedResponse;
       if (_budgetExpired || totalTokens >= maxTaskTokens) {
         return await _stopForBudget(
           totalTokens,
@@ -797,9 +790,10 @@ Remember:
       }
 
       try {
-        final jsonStr = _extractJson(response);
-
-        actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
+        parsedResponse = _aiService.parseActionResponse(response);
+        if (parsedResponse == null) {
+          throw const FormatException('No action object in AI response.');
+        }
       } catch (firstError) {
         developer.log(
           'AI response was not valid JSON: $firstError',
@@ -843,9 +837,12 @@ Remember:
 
           totalTokens += retryResponse.totalTokens;
 
-          final jsonStr = _extractJson(retryResponse.content);
-
-          actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
+          parsedResponse = _aiService.parseActionResponse(
+            retryResponse.content,
+          );
+          if (parsedResponse == null) {
+            throw const FormatException('No action object in AI response.');
+          }
         } catch (e) {
           if (_budgetExpired)
             return await _stopForBudget(
@@ -901,63 +898,18 @@ Remember:
       // NORMALIZE TOOL CALL
       // ----------------------------------------------------------------------
 
-      String action = '';
-
-      Map<String, dynamic> params = {};
-
-      // Preferred format:
-      // {
-      //   "action": "web_request",
-      //   "params": {...}
-      // }
-      final rawAction = actionJson['action'];
-
-      final rawParams = actionJson['params'];
-
-      if (rawAction is String && rawAction.trim().isNotEmpty) {
-        action = rawAction.trim();
-
-        if (rawParams is Map) {
-          params = Map<String, dynamic>.from(rawParams);
-        }
+      final toolResponse = parsedResponse;
+      if (toolResponse == null) {
+        previousResult = 'Tool rejected: invalid or missing action.';
+        results.add(previousResult);
+        consecutiveFailures++;
+        continue;
       }
 
-      // Alternative tool-call format:
-      // {
-      //   "tool": "web_request",
-      //   "url": "...",
-      //   "method": "GET",
-      //   "headers": {...}
-      // }
-      if (action.isEmpty) {
-        final rawTool = actionJson['tool'];
-
-        if (rawTool is String && rawTool.trim().isNotEmpty) {
-          action = rawTool.trim();
-
-          final toolParams = <String, dynamic>{};
-
-          for (final entry in actionJson.entries) {
-            if (const [
-              'tool',
-              'reasoning',
-              'is_complete',
-            ].contains(entry.key)) {
-              continue;
-            }
-
-            toolParams[entry.key] = entry.value;
-          }
-
-          params = toolParams;
-        }
-      }
-
-      // Missing actions are invalid, never implicit completion.
-
-      final reasoning = actionJson['reasoning'] as String? ?? '';
-
-      final isComplete = actionJson['is_complete'] == true;
+      var action = toolResponse.action.action;
+      var params = toolResponse.action.params;
+      final reasoning = toolResponse.reasoning;
+      final isComplete = toolResponse.isComplete;
       developer.log('Selected action: $action', name: 'PrivateAgent');
 
       _report('Step ${step + 1}: $reasoning');
@@ -1626,27 +1578,18 @@ Remember:
           _report('?? Running command...');
 
           try {
-            final commandResult = await _shizukuService.runCommand(command);
+            final commandResult = await _shizukuService.runCommandWithStatus(
+              command,
+            );
+            previousResult = commandResult.displayText;
+            results.add('run_adb_command\n$previousResult');
 
-            previousResult = commandResult;
-
-            results.add('run_adb_command $command ?\n$commandResult');
-
-            final normalized = commandResult.toLowerCase();
-
-            final failed =
-                normalized.contains('not running') ||
-                normalized.contains('permission denied') ||
-                normalized.startsWith('error');
-            // Shell strings do not provide a trustworthy exit status.
-            toolSucceeded = false;
-            toolThrew =
-                true; // Preserve uncertain mutation for explicit review.
-
-            if (failed) {
-              consecutiveFailures++;
-            } else {
+            toolSucceeded = commandResult.succeeded;
+            toolThrew = commandResult.uncertain;
+            if (commandResult.succeeded) {
               consecutiveFailures = 0;
+            } else {
+              consecutiveFailures++;
             }
           } catch (e) {
             previousResult = 'ERROR executing command: $e';
@@ -1909,8 +1852,14 @@ Remember:
         screenContent = '';
         continue;
       } catch (_) {
-        toolThrew = true;
-        rethrow;
+        if (call.mutation == ToolMutation.readOnly) {
+          previousResult = 'ERROR: $action failed before returning a result.';
+          results.add('$action: $previousResult');
+          consecutiveFailures++;
+        } else {
+          toolThrew = true;
+          rethrow;
+        }
       } finally {
         // Dart runs finally on every continue and return in the dispatch.
         final classification = ToolRegistry.classifyResult(
@@ -1929,9 +1878,7 @@ Remember:
           _actionInFlight = false;
         }
         if (toolThrew) {
-          throw StateError(
-            'Tool outcome is uncertain; review required before continuing',
-          );
+          throw ToolOutcomeUncertainException(action);
         }
       }
     }

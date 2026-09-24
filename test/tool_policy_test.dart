@@ -74,17 +74,13 @@ void main() {
     }
   });
 
-  test('all validated HTTP methods are authorized without a host veto', () async {
+  test('supported HTTP methods are authorized without a host veto', () async {
     for (final method in [
       'GET',
-      'HEAD',
       'POST',
       'PUT',
       'PATCH',
       'DELETE',
-      'OPTIONS',
-      'TRACE',
-      'CUSTOM',
     ]) {
       final call = registry.validate('web_request', {
         'url': 'https://example.com',
@@ -156,6 +152,13 @@ void main() {
         throwsA(isA<ToolValidationException>()),
       );
     }
+    expect(
+      () => registry.validate('web_request', {
+        'url': 'https://example.com',
+        'method': 'TRACE',
+      }),
+      throwsA(isA<ToolValidationException>()),
+    );
   });
 
   test('approval snapshot cannot be changed after validation', () {

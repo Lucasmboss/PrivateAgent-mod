@@ -424,7 +424,9 @@ class ToolRegistry {
       final method = (snapshot['method'] as String? ?? 'GET')
           .trim()
           .toUpperCase();
-      if (!RegExp(r'^[A-Z]+$').hasMatch(method)) invalid();
+      if (!const {'GET', 'POST', 'PUT', 'PATCH', 'DELETE'}.contains(method)) {
+        invalid();
+      }
       snapshot['method'] = method;
       final uri = Uri.tryParse(snapshot['url'] as String);
       if (uri == null ||

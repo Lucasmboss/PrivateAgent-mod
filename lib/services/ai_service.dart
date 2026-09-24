@@ -12,6 +12,18 @@ class AiResponse {
   AiResponse(this.content, this.totalTokens);
 }
 
+class ParsedActionResponse {
+  const ParsedActionResponse({
+    required this.action,
+    required this.reasoning,
+    required this.isComplete,
+  });
+
+  final AgentAction action;
+  final String reasoning;
+  final bool isComplete;
+}
+
 class AiService {
   final RemoteProviderAdapter _remote;
   AiService({RemoteProviderAdapter? remoteProvider})
@@ -372,7 +384,10 @@ Rules:
   );
 
   /// Parse the AI response to check if it's an action or plain text
-  AgentAction? parseAction(String response) {
+  AgentAction? parseAction(String response) =>
+      parseActionResponse(response)?.action;
+
+  ParsedActionResponse? parseActionResponse(String response) {
     var candidate = response.trim();
     if (candidate.startsWith('```')) {
       final firstLineBreak = candidate.indexOf('\n');
@@ -397,37 +412,53 @@ Rules:
     actionJson ??= _findFirstActionObject(candidate);
     if (actionJson == null) return null;
 
-    final actionName = actionJson['action'] ?? actionJson['tool'];
+    return parseActionObject(actionJson);
+  }
+
+  ParsedActionResponse? parseActionObject(Map<String, dynamic> actionJson) {
+    final rawAction = actionJson['action'];
+    final actionName = rawAction is String && rawAction.trim().isNotEmpty
+        ? rawAction
+        : actionJson['tool'];
     if (actionName is! String || actionName.trim().isEmpty) return null;
 
     final params = <String, dynamic>{};
     final rawParams = actionJson['params'];
     if (rawParams is Map) {
       params.addAll(Map<String, dynamic>.from(rawParams));
-    } else {
-      const metadataKeys = {
-        'action',
-        'tool',
-        'params',
-        'response',
-        'reasoning',
-        'is_complete',
-        'isComplete',
-        'complete',
-      };
-      for (final entry in actionJson.entries) {
-        if (!metadataKeys.contains(entry.key)) {
-          params[entry.key] = entry.value;
-        }
+    }
+    const metadataKeys = {
+      'action',
+      'tool',
+      'params',
+      'response',
+      'reasoning',
+      'is_complete',
+      'isComplete',
+      'complete',
+    };
+    for (final entry in actionJson.entries) {
+      if (!metadataKeys.contains(entry.key) &&
+          !params.containsKey(entry.key)) {
+        params[entry.key] = entry.value;
       }
     }
 
-    return AgentAction(
-      action: actionName.trim(),
-      params: params,
-      response: actionJson['response'] is String
-          ? actionJson['response'] as String
+    return ParsedActionResponse(
+      action: AgentAction(
+        action: actionName.trim(),
+        params: params,
+        response: actionJson['response'] is String
+            ? actionJson['response'] as String
+            : '',
+      ),
+      reasoning: actionJson['reasoning'] is String
+          ? actionJson['reasoning'] as String
           : '',
+      isComplete:
+          actionJson['is_complete'] == true ||
+          actionJson['isComplete'] == true ||
+          actionJson['complete'] == true,
     );
   }
 

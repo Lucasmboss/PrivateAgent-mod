@@ -23,11 +23,14 @@ class ActionHandler {
   final CommunicationService _communication = CommunicationService();
   final AlarmService _alarm = AlarmService();
   final SystemControlService _systemControl = SystemControlService();
-  final ShizukuService _shizuku = ShizukuService();
+  final ShizukuService _shizuku;
   final WebService _web = WebService();
   final WebSearchService _webSearch = WebSearchService();
   final FileService _files = FileService();
   final ScreenAutomationService _screenAutomation = ScreenAutomationService();
+
+  ActionHandler({ShizukuService? shizukuService})
+    : _shizuku = shizukuService ?? ShizukuService();
 
   ShizukuService get shizuku => _shizuku;
   ScreenAutomationService get screenAutomation => _screenAutomation;
@@ -79,6 +82,7 @@ class ActionHandler {
       );
       String result;
       bool taskSucceeded = false;
+      ShizukuCommandResult? adbCommandOutcome;
 
       _directActionInFlight = true;
       switch (action.action) {
@@ -142,9 +146,11 @@ class ActionHandler {
           break;
 
         case 'run_adb_command':
-          result = await _shizuku.runCommand(
+          final commandOutcome = await _shizuku.runCommandWithStatus(
             action.params['command'] as String? ?? '',
           );
+          adbCommandOutcome = commandOutcome;
+          result = commandOutcome.displayText;
           break;
 
         case 'web_search':
@@ -314,6 +320,9 @@ class ActionHandler {
             );
             taskSucceeded =
                 _currentExecutor!.lastStatus == TaskStatus.completed;
+          } on ToolOutcomeUncertainException catch (error) {
+            result = error.userMessage;
+            taskSucceeded = false;
           } catch (error) {
             await _currentExecutor!.failUnexpected(error);
             rethrow;
@@ -332,7 +341,7 @@ class ActionHandler {
           : action.action == 'web_request'
           ? WebService.isSuccessfulResponse(result)
           : action.action == 'run_adb_command'
-          ? false // No exit-code evidence is available from this adapter.
+          ? adbCommandOutcome?.succeeded == true
           : !ToolRegistry.isFailureResult(result) &&
                 !RegExp(
                   r'^(error|could not|cannot|no phone|shizuku |web search error:|ai service not available)',

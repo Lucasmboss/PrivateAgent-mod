@@ -25,7 +25,6 @@ class AgentAction {
     'set_alarm',
     'set_volume',
     'set_brightness',
-    'read_notifications',
     'read_screen',
     'run_adb_command',
     'web_request',
