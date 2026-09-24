@@ -1,0 +1,3 @@
+- [Verification and consent](verification-consent.md) — model evidence is supporting material, not semantic proof; consent and outcome review are separate.
+- [Android verification path](android-verification.md) — local Flutter tests run without Android tooling; release APK validation uses the repository's GitHub Actions workflow.
+- [Assistant voice boundary](assistant-voice-integration.md) — Android assistant invocations must enter the audited Agent UI; native Google voice never bypasses per-action approval.
