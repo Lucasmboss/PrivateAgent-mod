@@ -58,6 +58,7 @@ class TaskExecutor {
 
   /// Set to true to cancel the running task.
   bool _cancelled = false;
+  bool _paused = false;
 
   Completer<void>? _cancelCompleter;
 
@@ -81,6 +82,13 @@ class TaskExecutor {
 
     if (_cancelCompleter != null &&
         !_cancelCompleter!.isCompleted) {
+      _cancelCompleter!.complete();
+    }
+  }
+
+  void pause() {
+    _paused = true;
+    if (_cancelCompleter != null && !_cancelCompleter!.isCompleted) {
       _cancelCompleter!.complete();
     }
   }
@@ -352,22 +360,19 @@ GENERAL RULES:
 
   Future<String> executeTask(String userGoal, {String? resumeTaskId}) async {
     await ScreenAutomationService.logToNative(
-      '[TaskExecutor] executeTask() CALLED with goal: $userGoal',
+      '[TaskExecutor] executeTask() started',
     );
 
     _cancelled = false;
+    _paused = false;
     _cancelCompleter = null;
     final previousTask =
         resumeTaskId == null ? null : await _taskStore.get(resumeTaskId);
-    if (resumeTaskId != null &&
-        (previousTask == null || previousTask.status == TaskStatus.running ||
-            previousTask.status == TaskStatus.completed)) {
-      return 'Cannot resume this task: it is missing or already active/completed.';
-    }
     final task = previousTask == null
-        ? await _taskStore.create(goal: userGoal)
-        : await _taskStore.update(resumeTaskId!,
-            status: TaskStatus.running, goal: userGoal);
+        ? resumeTaskId == null
+            ? await _taskStore.create(goal: userGoal)
+            : throw StateError('Task not found')
+        : await _taskStore.claim(resumeTaskId!, userGoal);
     _activeTaskId = task.identifier;
 
     final results = <String>[];
@@ -397,7 +402,7 @@ GENERAL RULES:
     final savedSkill =
         await _skillMemory.findSkill(userGoal);
 
-    if (savedSkill != null &&
+    if (savedSkill != null && !_paused &&
         savedSkill.isReliable) {
       final accessibilityAvailable =
           await _screenService.isServiceRunning();
@@ -414,7 +419,11 @@ GENERAL RULES:
           results,
         );
 
-        if (replaySuccess) {
+        if (_paused) {
+          return await _handlePause(
+              userGoal, 0, 0, results, const []);
+        }
+        if (replaySuccess && !_cancelled) {
           results.add(
             'Task complete via skill memory.',
           );
@@ -482,7 +491,7 @@ GENERAL RULES:
     final List<String> failedStrategies =
         List<String>.from(previousTask?.failedStrategies ?? const []);
 
-    int totalTokens = 0;
+    int totalTokens = previousTask?.tokens ?? 0;
 
     final List<ActionStep> executedSteps = [];
 
@@ -502,7 +511,7 @@ GENERAL RULES:
         );
 
         for (final stepAction in shortcut) {
-          if (_cancelled) {
+          if (_cancelled || _paused) {
             break;
           }
 
@@ -591,10 +600,16 @@ GENERAL RULES:
           results,
         );
       }
+      if (_paused) {
+        return await _handlePause(
+            userGoal, totalTokens, step, results, failedStrategies);
+      }
 
       await _taskStore.update(
         _activeTaskId!,
-        progress: step / _aiService.maxSteps,
+        progress: (previousTask?.progress ?? 0) > step / _aiService.maxSteps
+            ? previousTask!.progress
+            : step / _aiService.maxSteps,
         tokens: totalTokens,
         results: results.length <= 20
             ? results
@@ -708,10 +723,6 @@ Remember:
 - Do not claim completion without actually completing the task.
 ''';
 
-      developer.log(
-        '=== AI PROMPT ===\n$prompt',
-        name: 'PrivateAgent',
-      );
 
       // -----------------------------------------------------------------------
       // AI
@@ -739,8 +750,11 @@ Remember:
           ),
         ]);
 
-        if (result == null ||
-            _cancelled) {
+        if (_paused) {
+          return await _handlePause(
+              userGoal, totalTokens, step, results, failedStrategies);
+        }
+        if (result == null || _cancelled) {
           return await _handleCancellation(
             userGoal,
             totalTokens,
@@ -758,11 +772,11 @@ Remember:
         totalTokens +=
             aiResponse.totalTokens;
 
-        developer.log(
-          '=== RAW AI RESPONSE ===\n$response',
-          name: 'PrivateAgent',
-        );
       } catch (e) {
+        if (_paused) {
+          return await _handlePause(
+              userGoal, totalTokens, step, results, failedStrategies);
+        }
         if (_cancelled) {
           return await _handleCancellation(
             userGoal,
@@ -813,12 +827,8 @@ Remember:
             jsonDecode(jsonStr)
                 as Map<String, dynamic>;
       } catch (firstError) {
-        developer.log(
-          '=== JSON PARSE FAILED, RETRYING ===\n'
-          'Error: $firstError\n'
-          'Raw: $response',
-          name: 'PrivateAgent',
-        );
+        developer.log('AI response was not valid JSON: $firstError',
+            name: 'PrivateAgent');
 
         _report(
           'Retrying step ${step + 1}...',
@@ -954,18 +964,19 @@ Remember:
       final isComplete =
           actionJson['is_complete'] ==
               true;
-      developer.log(
-        '=== PARSED ACTION ===\n'
-        'Action: $action\n'
-        'Params: $params\n'
-        'Reasoning: $reasoning\n'
-        'Is Complete: $isComplete',
-        name: 'PrivateAgent',
-      );
+      developer.log('Selected action: $action', name: 'PrivateAgent');
 
       _report(
         'Step ${step + 1}: $reasoning',
       );
+      if (_paused) {
+        return await _handlePause(
+            userGoal, totalTokens, step, results, failedStrategies);
+      }
+      if (_cancelled) {
+        return await _handleCancellation(
+            userGoal, totalTokens, step, results);
+      }
 
       // -----------------------------------------------------------------------
       // Repeat protection
@@ -1344,11 +1355,19 @@ Remember:
               previousResult = 'File written to agent_files: $path';
               break;
             case 'delete_file':
+              if (!RegExp(r'\b(delete|remove|borrar|eliminar)\b',
+                      caseSensitive: false)
+                  .hasMatch(userGoal)) {
+                throw StateError(
+                    'Deleting a file requires an explicit user request.');
+              }
               await _files.delete(path);
               previousResult = 'File deleted from agent_files: $path';
               break;
           }
-          results.add('$action: $previousResult');
+          results.add(action == 'read_file'
+              ? 'read_file: content returned to planner (not saved in task history).'
+              : '$action: $previousResult');
           consecutiveFailures = 0;
         } catch (error) {
           previousResult = '$action failed: $error';
@@ -2078,6 +2097,15 @@ Remember:
     return 'Task cancelled.';
   }
 
+  Future<String> _handlePause(String userGoal, int totalTokens, int step,
+      List<String> results, List<String> failedStrategies) async {
+    results.add('Task paused by user.');
+    _report('Task paused. You can resume it from Task History.');
+    await _finishTask(
+        TaskStatus.paused, step, totalTokens, results, failedStrategies);
+    return 'Task paused. You can resume it from Task History.';
+  }
+
   // ===========================================================================
   // HELPERS
   // ===========================================================================
@@ -2098,6 +2126,15 @@ Remember:
             ? results
             : results.sublist(results.length - 20),
         failedStrategies: failedStrategies);
+    _activeTaskId = null;
+  }
+
+  Future<void> failUnexpected(Object error) async {
+    final id = _activeTaskId;
+    if (id == null) return;
+    await _taskStore.update(id,
+        status: TaskStatus.failed,
+        results: ['Task stopped unexpectedly: $error']);
     _activeTaskId = null;
   }
 
@@ -2241,7 +2278,7 @@ Remember:
       i < skill.steps.length;
       i++
     ) {
-      if (_cancelled) {
+      if (_cancelled || _paused) {
         return false;
       }
 
@@ -2280,6 +2317,7 @@ Remember:
           milliseconds: delay,
         ),
       );
+      if (_cancelled || _paused) return false;
 
       bool success = false;
 
