@@ -4,8 +4,11 @@ import 'dart:developer' as developer;
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../models/chat_message.dart';
+import '../models/agent_action.dart';
+import '../models/task_record.dart';
 import '../services/ai_service.dart';
 import '../services/action_handler.dart';
+import '../services/task_store.dart';
 import '../services/voice_service.dart';
 import '../widgets/message_bubble.dart';
 import '../services/telegram_service.dart';
@@ -59,6 +62,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initServices() async {
+    await TaskStore().recoverInterrupted();
     await _aiService.init();
     await _notificationService.requestPermission();
     await _voiceService.init();
@@ -249,6 +253,38 @@ setState(() {
         _scrollToBottom();
         _updateOverlayState();
       }
+    }
+  }
+
+  Future<void> _resumeTask(TaskRecord task) async {
+    if (_isLoading) return;
+    setState(() => _isLoading = true);
+    try {
+      final result = await _actionHandler.execute(
+        AgentAction(
+          action: 'execute_task',
+          params: {'goal': task.goal, 'resume_task_id': task.identifier},
+          response: '',
+        ),
+        aiService: _aiService,
+        onProgress: (message) {
+          if (mounted) {
+            setState(() => _messages.add(
+                ChatMessage(role: 'assistant', content: '⏳ $message')));
+            _scrollToBottom();
+          }
+        },
+      );
+      if (mounted) {
+        setState(() => _messages.add(ChatMessage(
+          role: 'assistant',
+          content: result.details ?? 'Task stopped.',
+          actionResult: result,
+        )));
+        await _saveSession();
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -948,12 +984,13 @@ setState(() {
               size: 20,
             ),
             title: Text('Task History', style: textStyle),
-            onTap: () {
+            onTap: () async {
               Navigator.pop(context);
-              Navigator.push(
+              final task = await Navigator.push<TaskRecord>(
                 context,
                 MaterialPageRoute(builder: (_) => const TaskHistoryScreen()),
               );
+              if (task != null && mounted) await _resumeTask(task);
             },
           ),
           ListTile(
