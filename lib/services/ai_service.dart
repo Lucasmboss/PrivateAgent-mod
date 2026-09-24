@@ -82,6 +82,10 @@ SIMPLE ACTIONS (single step only):
 INTERNET ACTIONS:
 - web_search: {"query": "search terms"} - Search the Internet for information, current events, websites, documentation, products, services, prices, or other information. Use this when you need to DISCOVER information or find relevant sources. Do NOT use web_request as a substitute for web_search when you do not already know the specific URL.
 - web_request: {"method": "GET|POST|PUT|PATCH|DELETE", "url": "https://example.com/api", "headers": {}, "body": null} - Make an HTTP request to a specific HTTP(S) URL or API and return its response. Use GET for reading, and POST/PUT/PATCH/DELETE for writing or modifying data. Headers are a JSON object of string values. Body may be a JSON object/array or a raw string. Use this when you already know the relevant URL/API or after web_search has identified a useful source.
+- list_files: {} - List files in the agent's private agent_files directory only.
+- read_file: {"path": "notes.txt"} - Read a UTF-8 file from agent_files.
+- write_file: {"path": "notes.txt", "content": "text"} - Create or replace a text file in agent_files.
+- delete_file: {"path": "notes.txt"} - Delete one file in agent_files. Never delete a file unless the user requested it.
 
 MULTI-STEP TASK:
 - execute_task: {"goal": "description of the full task"} - Automatically plans and executes a complex task using the available tools, including web_search, web_request, Android actions, Shizuku/shell, and screen automation.
