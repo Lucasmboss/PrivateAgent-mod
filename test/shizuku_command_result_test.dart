@@ -57,6 +57,6 @@ void main() {
 
     expect(result.succeeded, isTrue);
     expect(result.uncertain, isFalse);
-    expect(result.displayText, contains('exit code 0'));
+    expect(result.displayText, contains('Exit code: 0'));
   });
 }
