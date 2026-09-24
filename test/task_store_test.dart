@@ -18,6 +18,12 @@ void main() {
   test('persists and updates records', () async {
     final created = await store.create(goal: 'Do something', identifier: 'one');
     expect((await store.get('one'))?.goal, 'Do something');
+    await store.beginAction('one', 'read_screen', mutation: false);
+    await store.endAction('one', technicalSuccess: true);
+    await store.verifyCompletion('one', {'goal': {'Do something': ['action-1']}});
+    await store.update('one', status: TaskStatus.needsRevision);
+    await store.confirmCriterion('one', expectedRevision: 0,
+        subtaskId: 'goal', criterion: 'Do something', confirmed: true);
     final updated = await store.update(created.identifier,
         status: TaskStatus.completed, tokens: 12, progress: 1);
     expect(updated.status, TaskStatus.completed);
@@ -32,14 +38,15 @@ void main() {
     expect((await freshStore.get('one'))?.status, TaskStatus.paused);
   });
 
-  test('persists results when updating', () async {
+  test('drops raw results when updating', () async {
     await store.create(goal: 'Keep result', identifier: 'one');
     await store.update('one', results: {'answer': 'done'});
-    expect((await store.get('one'))?.results, {'answer': 'done'});
+    expect((await store.get('one'))?.results['format'], 'metadata-only');
+    expect((await store.get('one'))?.results['answer'], isNull);
   });
 
   test('clears records', () async {
-    await store.create(goal: 'Temporary');
+    await store.create(goal: 'Temporary', status: TaskStatus.paused);
     await store.clear();
     expect(await store.list(), isEmpty);
   });

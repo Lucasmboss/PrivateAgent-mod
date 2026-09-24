@@ -8,6 +8,8 @@ import '../models/agent_action.dart';
 import '../models/task_record.dart';
 import '../services/ai_service.dart';
 import '../services/action_handler.dart';
+import '../services/tool_policy.dart';
+import '../privacy_sanitizer.dart';
 import '../services/task_store.dart';
 import '../services/voice_service.dart';
 import '../widgets/message_bubble.dart';
@@ -39,6 +41,68 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isListening = false;
+  String _taskStateLabel = 'Thinking...';
+  int _approvalGeneration = 0;
+  BuildContext? _approvalDialogContext;
+
+  void _stopActiveTask({required bool pause}) {
+    _approvalGeneration++;
+    if (pause) {
+      _actionHandler.pauseTask();
+    } else {
+      _actionHandler.cancelTask();
+    }
+    _dismissApproval();
+    if (mounted) setState(() => _taskStateLabel = pause ? 'Paused' : 'Cancelled');
+  }
+
+  void _dismissApproval() {
+    final dialog = _approvalDialogContext;
+    _approvalDialogContext = null;
+    if (dialog != null && dialog.mounted) Navigator.of(dialog).pop(false);
+  }
+
+  Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
+    if (!mounted || _appLifecycleState != AppLifecycleState.resumed) return false;
+    final generation = _approvalGeneration;
+    setState(() => _taskStateLabel = 'Waiting for approval');
+    final approved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        _approvalDialogContext = dialogContext;
+        return AlertDialog(
+          title: const Text('Approve this action?'),
+          content: SingleChildScrollView(child: Text(
+              '${request.summary}\n\n${request.preview}\n\n'
+              'Approval applies only to this action. When unsure, deny.')),
+          actions: [
+            TextButton(
+              autofocus: true,
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Deny'),
+            ),
+            TextButton(
+              onPressed: () => _stopActiveTask(pause: true),
+              child: const Text('Pause task'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Approve once'),
+            ),
+          ],
+        );
+      },
+    );
+    _approvalDialogContext = null;
+    final allowed = approved == true && mounted &&
+        generation == _approvalGeneration &&
+        _appLifecycleState == AppLifecycleState.resumed;
+    if (mounted && generation == _approvalGeneration) {
+      setState(() => _taskStateLabel = allowed ? 'Running approved action' : 'Approval denied');
+    }
+    return allowed;
+  }
 
   // Custom switch state: 'chat' or 'agent'
   String _mode = 'chat';
@@ -99,12 +163,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _sendMessage(String text) async {
-    if (text.trim().isEmpty) return;
+    if (!mounted || _isLoading || text.trim().isEmpty) return;
+    final generation = _approvalGeneration;
 
     final userMessage = ChatMessage(role: 'user', content: text.trim());
     setState(() {
       _messages.add(userMessage);
       _isLoading = true;
+      _taskStateLabel = 'Thinking...';
     });
     _updateOverlayState();
     _textController.clear();
@@ -151,6 +217,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       // Check if it's an action
       final action = _aiService.parseAction(accumulated);
+      if (!mounted || generation != _approvalGeneration) return;
 
       if (action != null) {
         // If it's an action, we remove the raw JSON message from display
@@ -159,13 +226,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         });
 
         await _showTaskProgressOverlay('Starting: ${text.trim()}');
+        if (!mounted || generation != _approvalGeneration) return;
 
         // Execute the action (pass aiService for multi-step tasks)
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
+          onApproval: _requestToolApproval,
           userRequest: text.trim(),
           onProgress: (msg) {
+            if (msg.contains('budget exhausted') || msg.startsWith('Task paused') ||
+                msg.startsWith('Task cancelled') || msg.startsWith('Action denied')) {
+              _dismissApproval();
+            }
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
             if (mounted) {
@@ -178,6 +251,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             }
           },
         );
+        _dismissApproval();
+        if (!mounted) return;
 
         String finalResponse;
 
@@ -258,7 +333,10 @@ setState(() {
 
   Future<void> _resumeTask(TaskRecord task) async {
     if (_isLoading) return;
-    setState(() => _isLoading = true);
+    setState(() {
+      _isLoading = true;
+      _taskStateLabel = 'Resuming task...';
+    });
     try {
       final result = await _actionHandler.execute(
         AgentAction(
@@ -267,7 +345,12 @@ setState(() {
           response: '',
         ),
         aiService: _aiService,
+        onApproval: _requestToolApproval,
         onProgress: (message) {
+          if (message.contains('budget exhausted') || message.startsWith('Task paused') ||
+              message.startsWith('Task cancelled') || message.startsWith('Action denied')) {
+            _dismissApproval();
+          }
           if (mounted) {
             setState(() => _messages.add(
                 ChatMessage(role: 'assistant', content: '⏳ $message')));
@@ -275,6 +358,7 @@ setState(() {
           }
         },
       );
+      _dismissApproval();
       if (mounted) {
         setState(() => _messages.add(ChatMessage(
           role: 'assistant',
@@ -319,7 +403,7 @@ setState(() {
 
   void _sendOverlayEvent(String type, String message) {
     if (!FeatureFlags.floatingOverlayEnabled) return;
-    final safeMessage = message.replaceAll('|', ' ');
+    final safeMessage = PrivacySanitizer.sanitizeTaskTrace(message).replaceAll('|', ' ');
     unawaited(
       FlutterOverlayWindow.shareData(
         '$type|$safeMessage',
@@ -403,6 +487,8 @@ setState(() {
 
   @override
   void dispose() {
+    _approvalGeneration++;
+    _actionHandler.cancelTask();
     WidgetsBinding.instance.removeObserver(this);
     _overlayHistoryTimer?.cancel();
     _textController.dispose();
@@ -414,6 +500,10 @@ setState(() {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed && _approvalDialogContext != null) {
+      _approvalGeneration++;
+      _dismissApproval();
+    }
     setState(() {
       _appLifecycleState = state;
     });
@@ -712,7 +802,7 @@ setState(() {
                       ),
                       const SizedBox(width: 10),
                       Text(
-                        'Thinking...',
+                        _taskStateLabel,
                         style: TextStyle(
                           fontSize: 12,
                           color: isDark
@@ -723,13 +813,13 @@ setState(() {
                       ),
                       const SizedBox(width: 8),
                       TextButton.icon(
-                        onPressed: () => _actionHandler.pauseTask(),
+                        onPressed: () => _stopActiveTask(pause: true),
                         icon: const Icon(Icons.pause_circle_outline, size: 16),
                         label: const Text('Pause'),
                       ),
                       TextButton.icon(
                         onPressed: () {
-                          _actionHandler.cancelTask();
+                          _stopActiveTask(pause: false);
                         },
                         icon: const Icon(
                           Icons.stop_circle_rounded,

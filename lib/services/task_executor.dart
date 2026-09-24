@@ -9,10 +9,12 @@ import 'notification_service.dart';
 import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
-import 'recovery_engine.dart';
 import 'web_service.dart';
 import 'web_search_service.dart';
 import 'file_service.dart';
+import 'tool_registry.dart';
+import 'tool_policy.dart';
+import '../privacy_sanitizer.dart';
 import 'task_store.dart';
 import '../models/task_record.dart';
 import '../models/saved_skill.dart';
@@ -38,16 +40,13 @@ class TaskExecutor {
   final SkillMemoryService _skillMemory =
       SkillMemoryService();
 
-  final RecoveryEngine _recoveryEngine =
-      RecoveryEngine();
-
   /// Direct Internet / HTTP access.
   ///
   /// Kept internal for this first architectural iteration so we do not
   /// need to modify ActionHandler yet.
   final WebService _webService = WebService();
   final FileService _files = FileService();
-  final TaskStore _taskStore = TaskStore();
+  final TaskStore _taskStore;
   String? _activeTaskId;
   TaskStatus? lastStatus;
 
@@ -56,6 +55,12 @@ class TaskExecutor {
 
   /// Callback to report progress messages to the UI.
   final void Function(String message)? onProgress;
+  final ToolApprovalCallback? onApproval;
+  final int maxTaskTokens;
+  final Duration maxTaskDuration;
+  RemoteCancellationToken _remoteCancellation = RemoteCancellationToken();
+  Timer? _budgetTimer;
+  bool _budgetExpired = false;
 
   /// Set to true to cancel the running task.
   bool _cancelled = false;
@@ -69,7 +74,12 @@ class TaskExecutor {
     required AppLauncherService appLauncher,
     required ShizukuService shizukuService,
     this.onProgress,
+    this.onApproval,
+    this.maxTaskTokens = 100000,
+    this.maxTaskDuration = const Duration(minutes: 30),
+    TaskStore? taskStore,
   })  : _aiService = aiService,
+        _taskStore = taskStore ?? TaskStore(),
         _screenService = screenService,
         _appLauncher = appLauncher,
         _shizukuService = shizukuService;
@@ -80,6 +90,7 @@ class TaskExecutor {
 
   void cancel() {
     _cancelled = true;
+    _remoteCancellation.cancel();
 
     if (_cancelCompleter != null &&
         !_cancelCompleter!.isCompleted) {
@@ -89,6 +100,7 @@ class TaskExecutor {
 
   void pause() {
     _paused = true;
+    _remoteCancellation.cancel();
     if (_cancelCompleter != null && !_cancelCompleter!.isCompleted) {
       _cancelCompleter!.complete();
     }
@@ -302,6 +314,13 @@ Return ONLY valid JSON.
 
 GENERAL RULES:
 
+- Before starting tools, you may use action "plan" with params.subtasks: an
+  ordered array of {id, objective, dependencies: [earlier IDs], criteria: [text]}.
+  Changing a plan invalidates prior evidence. Do not re-plan merely to finish.
+- Completion requires action "done" and params.evidence:
+  {subtaskId: {criterionText: ["action-N"]}} using persisted successful evidence.
+  A bare done/is_complete is not proof. Mutations require trusted outcome review.
+
 - Choose exactly ONE action at a time.
 - Never invent tool results.
 - Base decisions on actual previous results.
@@ -360,14 +379,28 @@ GENERAL RULES:
   // ===========================================================================
 
   Future<String> executeTask(String userGoal, {String? resumeTaskId}) async {
+    if (_activeTaskId != null) throw StateError('Executor already running');
+    try {
+      return await _executeTask(userGoal, resumeTaskId: resumeTaskId);
+    } catch (error) {
+      await failUnexpected(error);
+      rethrow;
+    } finally {
+      _cancelCompleter = null;
+      _budgetTimer?.cancel();
+    }
+  }
+
+  Future<String> _executeTask(String userGoal, {String? resumeTaskId}) async {
+    _cancelled = false;
+    _paused = false;
+    _budgetExpired = false;
+    _remoteCancellation = RemoteCancellationToken();
+    _cancelCompleter = null;
+    lastStatus = null;
     await ScreenAutomationService.logToNative(
       '[TaskExecutor] executeTask() started',
     );
-
-    _cancelled = false;
-    _paused = false;
-    _cancelCompleter = null;
-    lastStatus = null;
     final previousTask =
         resumeTaskId == null ? null : await _taskStore.get(resumeTaskId);
     final task = previousTask == null
@@ -376,6 +409,19 @@ GENERAL RULES:
             : throw StateError('Task not found')
         : await _taskStore.claim(resumeTaskId!, userGoal);
     _activeTaskId = task.identifier;
+    // Wall-clock lifetime is cumulative across resumes, including time paused.
+    final remainingTime = maxTaskDuration - DateTime.now().difference(task.createdAt);
+    if (remainingTime <= Duration.zero) {
+      _budgetExpired = true;
+    } else {
+      _budgetTimer = Timer(remainingTime, () {
+        _budgetExpired = true;
+        _remoteCancellation.cancel();
+        if (_cancelCompleter != null && !_cancelCompleter!.isCompleted) {
+          _cancelCompleter!.complete();
+        }
+      });
+    }
 
     final results = <String>[];
 
@@ -393,95 +439,7 @@ GENERAL RULES:
       'Starting task: $userGoal',
     );
 
-    // -------------------------------------------------------------------------
-    // Skill memory
-    //
-    // Important change:
-    // Accessibility is checked only if we actually have a UI skill to replay.
-    // Pure web/API tasks do not require Accessibility.
-    // -------------------------------------------------------------------------
-
-    final savedSkill =
-        await _skillMemory.findSkill(userGoal);
-
-    if (savedSkill != null && !_paused &&
-        savedSkill.isReliable) {
-      final accessibilityAvailable =
-          await _screenService.isServiceRunning();
-
-      if (accessibilityAvailable) {
-        _report(
-          'Found saved skill! Replaying '
-          '${savedSkill.steps.length} steps...',
-        );
-
-        final replaySuccess =
-            await _replaySkill(
-          savedSkill,
-          results,
-        );
-
-        if (_paused) {
-          return await _handlePause(
-              userGoal, 0, 0, results, const []);
-        }
-        if (replaySuccess && !_cancelled) {
-          results.add(
-            'Task complete via skill memory.',
-          );
-
-          _report(
-            'Task complete (via skill memory).',
-          );
-
-          await _notificationService
-              .showTaskCompleteNotification(
-            'Task Completed',
-            'Agent finished its goal using memory.',
-          );
-
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Success',
-            0,
-            savedSkill.steps.length,
-            results,
-          );
-          await _finishTask(TaskStatus.completed, savedSkill.steps.length, 0,
-              results, const []);
-
-          await _screenService.showToast(
-            'Task Complete! (Memory)',
-          );
-
-          return 'Done.';
-        }
-
-        _report(
-          'Replay failed, falling back to AI...',
-        );
-
-        await _skillMemory.recordFailure(
-          savedSkill.id,
-        );
-      } else {
-        _report(
-          'Saved UI skill found, but Accessibility is unavailable. '
-          'Falling back to general agent.',
-        );
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // Navigation shortcuts
-    //
-    // We intentionally do NOT launch Chrome automatically for generic
-    // "browse/search Google" requests anymore.
-    // -------------------------------------------------------------------------
-
-    final shortcut =
-        _getNavigationShortcut(userGoal);
-
+    // Every operation goes through the checkpointed planner and policy gate.
     String lastAction = '';
 
     int sameActionCount = 0;
@@ -496,77 +454,6 @@ GENERAL RULES:
     int totalTokens = previousTask?.tokens ?? 0;
 
     final List<ActionStep> executedSteps = [];
-
-    if (shortcut != null &&
-        shortcut.isNotEmpty) {
-      final accessibilityAvailable =
-          await _screenService.isServiceRunning();
-
-      if (accessibilityAvailable) {
-        results.add(
-          'Using navigation shortcut: '
-          '${shortcut.length} steps',
-        );
-
-        _report(
-          'Using navigation shortcut...',
-        );
-
-        for (final stepAction in shortcut) {
-          if (_cancelled || _paused) {
-            break;
-          }
-
-          bool success = false;
-
-          if (stepAction.action == 'open_app') {
-            final appName =
-                stepAction.params['app_name']
-                        as String? ??
-                    '';
-
-            final res =
-                await _appLauncher.openApp(
-              appName,
-            );
-
-            success =
-                res.startsWith('Opened');
-
-            await Future.delayed(
-              const Duration(milliseconds: 3000),
-            );
-          } else if (
-              stepAction.action ==
-                  'click_text') {
-            final text =
-                stepAction.params['text']
-                        as String? ??
-                    '';
-
-            success =
-                await _screenService.clickByText(
-              text,
-            );
-
-            await Future.delayed(
-              const Duration(milliseconds: 1500),
-            );
-          }
-
-          if (success) {
-            executedSteps.add(
-              stepAction,
-            );
-
-            lastAction =
-                stepAction.action;
-          } else {
-            break;
-          }
-        }
-      }
-    }
 
     // -------------------------------------------------------------------------
     // Screen state
@@ -605,6 +492,9 @@ GENERAL RULES:
       if (_paused) {
         return await _handlePause(
             userGoal, totalTokens, step, results, failedStrategies);
+      }
+      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+        return await _stopForBudget(totalTokens, step, results, failedStrategies);
       }
 
       await _taskStore.update(
@@ -680,9 +570,15 @@ Consider a different tool or method.
       // Planner prompt
       // -----------------------------------------------------------------------
 
+      final durable = (await _taskStore.get(_activeTaskId!))!;
       final prompt = '''
 TASK:
 $userGoal
+
+ORIGINAL GOAL:
+${durable.originalGoal}
+PERSISTED PLAN AND SAFE EVIDENCE:
+${jsonEncode(durable.execution.toJson())}
 
 CURRENT STEP:
 ${step + 1}/${_aiService.maxSteps}
@@ -733,6 +629,11 @@ Remember:
       String response;
 
       try {
+        if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
+        if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+        if (_budgetExpired || totalTokens >= maxTaskTokens) {
+          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        }
         _cancelCompleter =
             Completer<void>();
 
@@ -740,6 +641,8 @@ Remember:
             _aiService.sendTaskMessage(
           _taskSystemPrompt,
           prompt,
+          cancellationToken: _remoteCancellation,
+          maxOutputTokens: _remainingOutputTokens(totalTokens),
         );
 
         final result =
@@ -752,6 +655,9 @@ Remember:
           ),
         ]);
 
+        if (_budgetExpired) {
+          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        }
         if (_paused) {
           return await _handlePause(
               userGoal, totalTokens, step, results, failedStrategies);
@@ -765,8 +671,7 @@ Remember:
           );
         }
 
-        final aiResponse =
-            result as AiResponse;
+        final aiResponse = result;
 
         response =
             aiResponse.content;
@@ -775,6 +680,9 @@ Remember:
             aiResponse.totalTokens;
 
       } catch (e) {
+        if (_budgetExpired) {
+          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        }
         if (_paused) {
           return await _handlePause(
               userGoal, totalTokens, step, results, failedStrategies);
@@ -820,6 +728,9 @@ Remember:
       // -----------------------------------------------------------------------
 
       Map<String, dynamic>? actionJson;
+      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+      }
 
       try {
         final jsonStr =
@@ -841,11 +752,18 @@ Remember:
         );
 
         try {
+          if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
+          if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+          if (_budgetExpired || totalTokens >= maxTaskTokens) {
+            return await _stopForBudget(totalTokens, step, results, failedStrategies);
+          }
           final retryResponse =
               await _aiService
                   .sendTaskMessage(
             _taskSystemPrompt,
             prompt,
+            cancellationToken: _remoteCancellation,
+            maxOutputTokens: _remainingOutputTokens(totalTokens),
           );
 
           totalTokens +=
@@ -860,6 +778,9 @@ Remember:
               jsonDecode(jsonStr)
                   as Map<String, dynamic>;
         } catch (e) {
+          if (_budgetExpired) return await _stopForBudget(totalTokens, step, results, failedStrategies);
+          if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
+          if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
           results.add(
             'Step ${step + 1}: Error after retry: $e',
           );
@@ -941,7 +862,7 @@ Remember:
 
           for (final entry
               in actionJson.entries) {
-            if (entry.key == 'tool') {
+            if (const ['tool', 'reasoning', 'is_complete'].contains(entry.key)) {
               continue;
             }
 
@@ -953,10 +874,7 @@ Remember:
         }
       }
 
-      // Safety fallback.
-      if (action.isEmpty) {
-        action = 'done';
-      }
+      // Missing actions are invalid, never implicit completion.
 
       final reasoning =
           actionJson['reasoning']
@@ -978,6 +896,38 @@ Remember:
       if (_cancelled) {
         return await _handleCancellation(
             userGoal, totalTokens, step, results);
+      }
+      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+      }
+      ValidatedToolCall call;
+      try {
+        call = const ToolRegistry().validate(action, params);
+      } on ToolValidationException {
+        previousResult = 'Tool rejected: invalid or unsupported parameters.';
+        results.add(previousResult);
+        consecutiveFailures++;
+        continue;
+      }
+      action = call.name;
+      params = call.params;
+      if (const ToolPolicy().requiresApproval(call)) {
+        _report('Waiting for approval: $action');
+      }
+      final decision = await _authorizeTool(call);
+      // Approval may take arbitrarily long; no checkpoint or side effect before
+      // checking every stop condition again.
+      if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
+      if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+      }
+      if (!decision.allowed) {
+        const denied = 'Action denied. Task requires revision; no tool was executed.';
+        results.add(denied);
+        _report(denied);
+        await _finishTask(TaskStatus.needsRevision, step, totalTokens, results, failedStrategies);
+        return denied;
       }
 
       // -----------------------------------------------------------------------
@@ -1034,8 +984,33 @@ Remember:
       // DONE
       // -----------------------------------------------------------------------
 
-      if (action == 'done' ||
-          isComplete) {
+      // is_complete attached to a tool is only a hint: execute the tool first.
+      if (action == 'done') {
+        final references = <String, Map<String, List<String>>>{};
+        final rawEvidence = params['evidence'];
+        if (rawEvidence is Map) {
+          for (final entry in rawEvidence.entries) {
+            if (entry.value is Map) {
+              references[entry.key.toString()] =
+                  (entry.value as Map).map((k, v) => MapEntry(
+                      k.toString(), v is List ? v.whereType<String>().toList() : <String>[]));
+            }
+          }
+        }
+        final verified = await _taskStore.verifyCompletion(_activeTaskId!, references);
+        if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
+        if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+        if (_budgetExpired) return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        if (verified.execution.verification != 'verified') {
+          const message = 'Task stopped with partial or unverified results. '
+              'Completion criteria lack verified evidence; successful tool execution '
+              'does not confirm the requested outcome.';
+          results.add(message);
+          await _finishTask(TaskStatus.needsRevision, step, totalTokens,
+              results, failedStrategies);
+          _report(message);
+          return message;
+        }
         final finalText =
             reasoning.trim().isEmpty
                 ? 'Done.'
@@ -1089,6 +1064,26 @@ Remember:
       // READ SCREEN
       // -----------------------------------------------------------------------
 
+      if (action == 'plan') {
+        final rawPlan = params['subtasks'];
+        if (rawPlan is! List) throw const FormatException('Missing subtasks');
+        await _taskStore.setPlan(_activeTaskId!, rawPlan.map((s) =>
+            TaskSubtask.fromJson(Map<String, dynamic>.from(s))).toList());
+        previousResult = 'Structured plan saved; prior criterion evidence invalidated.';
+        continue;
+      }
+
+      await _taskStore.beginAction(_activeTaskId!, action,
+          mutation: call.mutation != ToolMutation.readOnly);
+      bool toolSucceeded = false;
+      bool toolThrew = false;
+      try {
+      if (_paused || _cancelled || _budgetExpired) {
+        // Clear the just-created checkpoint as not executed, then the loop's
+        // stop handling will preserve the task. Never dispatch after a stop.
+        previousResult = 'Action stopped before dispatch.';
+        continue;
+      }
       if (action == 'read_screen') {
         final accessibilityAvailable =
             await _screenService
@@ -1121,6 +1116,8 @@ Remember:
 
           previousResult =
               'Screen successfully read.';
+          toolSucceeded = screenContent.isNotEmpty &&
+              !ToolRegistry.isFailureResult(screenContent);
 
           results.add(
             'read_screen ? Screen successfully read.',
@@ -1175,6 +1172,7 @@ Remember:
           consecutiveFailures++;
         } else {
           consecutiveFailures = 0;
+          toolSucceeded = !ToolRegistry.isFailureResult(searchResult);
         }
 
         continue;
@@ -1247,6 +1245,7 @@ Remember:
             _extractHttpStatus(
           webResult,
         );
+        toolSucceeded = status != null && status >= 200 && status < 300;
 
         final failed =
             webResult.startsWith(
@@ -1357,12 +1356,6 @@ Remember:
               previousResult = 'File written to agent_files: $path';
               break;
             case 'delete_file':
-              if (!RegExp(r'\b(delete|remove|borrar|eliminar)\b',
-                      caseSensitive: false)
-                  .hasMatch(userGoal)) {
-                throw StateError(
-                    'Deleting a file requires an explicit user request.');
-              }
               await _files.delete(path);
               previousResult = 'File deleted from agent_files: $path';
               break;
@@ -1371,7 +1364,9 @@ Remember:
               ? 'read_file: content returned to planner (not saved in task history).'
               : '$action: $previousResult');
           consecutiveFailures = 0;
+          toolSucceeded = true;
         } catch (error) {
+          toolThrew = call.mutation != ToolMutation.readOnly;
           previousResult = '$action failed: $error';
           results.add(previousResult);
           consecutiveFailures++;
@@ -1410,6 +1405,7 @@ Remember:
 
         previousResult =
             openResult;
+        toolSucceeded = openResult.startsWith('Opened');
 
         results.add(
           'open_url $url ? $openResult',
@@ -1457,6 +1453,7 @@ Remember:
             await _screenService
                 .isServiceRunning();
 
+        if (_paused || _cancelled || _budgetExpired) continue;
         if (!accessibilityAvailable) {
           // Opening an app itself does not strictly require Accessibility.
           final openResult =
@@ -1465,6 +1462,7 @@ Remember:
 
           previousResult =
               openResult;
+          toolSucceeded = openResult.startsWith('Opened');
 
           results.add(
             'open_app $appName ? $openResult',
@@ -1493,6 +1491,7 @@ Remember:
 
         previousResult =
             openResult;
+        toolSucceeded = openResult.startsWith('Opened');
 
         results.add(
           'open_app $appName ? $openResult',
@@ -1568,6 +1567,9 @@ Remember:
                   normalized.startsWith(
                     'error',
                   );
+          // Shell strings do not provide a trustworthy exit status.
+          toolSucceeded = false;
+          toolThrew = true; // Preserve uncertain mutation for explicit review.
 
           if (failed) {
             consecutiveFailures++;
@@ -1578,6 +1580,7 @@ Remember:
         } catch (e) {
           previousResult =
               'ERROR executing command: $e';
+          toolThrew = true;
 
           consecutiveFailures++;
         }
@@ -1622,7 +1625,7 @@ Remember:
                 ?.toInt() ??
             1000;
 
-        await Future.delayed(
+        await _remoteCancellation.delay(
           Duration(
             milliseconds:
                 milliseconds,
@@ -1631,6 +1634,7 @@ Remember:
 
         previousResult =
             'Waited ${milliseconds}ms.';
+        toolSucceeded = !_paused && !_cancelled && !_budgetExpired;
 
         results.add(
           'wait ? ${milliseconds}ms',
@@ -1650,6 +1654,7 @@ Remember:
           await _screenService
               .isServiceRunning();
 
+      if (_paused || _cancelled || _budgetExpired) continue;
       if (!accessibilityAvailable) {
         previousResult =
             'ERROR: Accessibility service is not enabled. '
@@ -1672,38 +1677,9 @@ Remember:
       // -----------------------------------------------------------------------
 
       if (screenContent.isEmpty) {
-        try {
-          screenContent =
-              _aiService
-                  .useScreenCompression
-                  ? await _screenService
-                      .getCompressedScreenDescription(
-                      userGoal,
-                    )
-                  : await _screenService
-                      .getScreenDescription();
-
-          previousResult =
-              'Screen read successfully. '
-              'The UI action must be reconsidered using this screen.';
-
-          results.add(
-            'read_screen ? Screen successfully read.',
-          );
-
-          consecutiveFailures =
-              0;
-
-          // Do not execute the stale action.
-          continue;
-        } catch (e) {
-          previousResult =
-              'ERROR reading screen: $e';
-
-          consecutiveFailures++;
-
-          continue;
-        }
+        previousResult = 'UI action not executed: select read_screen first, '
+            'then reconsider the action against the observed screen.';
+        continue;
       }
 
       // -----------------------------------------------------------------------
@@ -1879,6 +1855,7 @@ Remember:
 
       previousResult =
           actionResult;
+      toolSucceeded = success;
 
       results.add(
         'Step ${step + 1}: '
@@ -1960,65 +1937,37 @@ Remember:
         continue;
       }
 
-      final recovery =
-          await _recoveryEngine
-              .diagnose(
-        action,
-        screenContent,
-      );
-
-      _report(
-        'Recovering: ${recovery.description}',
-      );
-
-      if (recovery.action ==
-          'wait') {
-        await Future.delayed(
-          const Duration(seconds: 2),
-        );
-      } else if (
-          recovery.action ==
-              'press_back') {
-        await _screenService
-            .pressBack();
-      } else if (
-          recovery.action ==
-              'scroll') {
-        final dir =
-            recovery.params[
-                    'direction'] ??
-                'down';
-
-        if (dir == 'down') {
-          await _shizukuService
-              .runCommand(
-            'input swipe 540 1800 540 600 600',
-          );
-        } else {
-          await _shizukuService
-              .runCommand(
-            'input swipe 540 600 540 1800 600',
-          );
-        }
-      } else if (
-          recovery.action ==
-              'press_home') {
-        await _screenService
-            .pressHome();
-      }
-
-      results.add(
-        'Recovery step: '
-        '${recovery.description}',
-      );
-
-      // Recovery changed the UI.
+      // Recovery must be selected as the next normal checkpointed action.
+      // Never run hidden press_back/scroll/shell side effects here.
+      previousResult = '$actionResult. Re-observe and choose a recovery action.';
       screenContent = '';
+      continue;
+      } catch (_) {
+        toolThrew = true;
+        rethrow;
+      } finally {
+        // Dart runs finally on every continue and return in the dispatch.
+        final classification = ToolRegistry.classifyResult(
+            succeeded: toolSucceeded &&
+                !ToolRegistry.isFailureResult(previousResult),
+            threw: toolThrew);
+        await _taskStore.endAction(_activeTaskId!,
+            technicalSuccess: classification == ToolResultClassification.succeeded,
+            uncertain: toolThrew);
+        if (toolThrew) {
+          throw StateError('Tool outcome is uncertain; review required before continuing');
+        }
+      }
     }
 
     // =========================================================================
     // MAX STEPS
     // =========================================================================
+    if (_paused) return await _handlePause(userGoal, totalTokens, _aiService.maxSteps, results, failedStrategies);
+    if (_cancelled) return await _handleCancellation(userGoal, totalTokens, _aiService.maxSteps, results);
+    if (_budgetExpired || totalTokens >= maxTaskTokens) {
+      return await _stopForBudget(totalTokens, _aiService.maxSteps, results, failedStrategies);
+    }
 
     results.add(
       'Reached maximum steps '
@@ -2113,13 +2062,52 @@ Remember:
   // ===========================================================================
 
   void _report(String message) {
-    onProgress?.call(message);
+    onProgress?.call(PrivacySanitizer.sanitizeTaskTrace(message));
+  }
+
+  int _remainingOutputTokens(int used) {
+    final remaining = maxTaskTokens - used;
+    return remaining < _aiService.maxTokens ? remaining : _aiService.maxTokens;
+  }
+
+  Future<String> _stopForBudget(int tokens, int step, List<String> results,
+      List<String> failedStrategies) async {
+    _remoteCancellation.cancel();
+    const message = 'Task budget exhausted. Results preserved; revision required.';
+    results.add(message);
+    _report(message);
+    await _finishTask(TaskStatus.needsRevision, step, tokens, results, failedStrategies);
+    return message;
+  }
+
+  Future<ToolPolicyDecision> _authorizeTool(ValidatedToolCall call) async {
+    if (_remoteCancellation.isCancelled) {
+      return const ToolPolicyDecision(false, 'Task stopped.');
+    }
+    final stopped = Completer<ToolPolicyDecision>();
+    final remove = _remoteCancellation.onCancel(() {
+      if (!stopped.isCompleted) {
+        stopped.complete(const ToolPolicyDecision(false, 'Task stopped.'));
+      }
+    });
+    try {
+      return await Future.any([
+        const ToolPolicy().authorize(call, onApproval: onApproval),
+        stopped.future,
+      ]);
+    } finally {
+      remove();
+    }
   }
 
   Future<void> _finishTask(TaskStatus status, int steps, int tokens,
       List<String> results, List<String> failedStrategies) async {
     final id = _activeTaskId;
     if (id == null) return;
+    final record = await _taskStore.get(id);
+    if (record?.execution.inFlight?.mutation == true) {
+      status = TaskStatus.needsRevision;
+    }
     await _taskStore.update(id,
         status: status,
         progress: status == TaskStatus.completed ? 1 : null,
@@ -2127,7 +2115,8 @@ Remember:
         results: results.length <= 20
             ? results
             : results.sublist(results.length - 20),
-        failedStrategies: failedStrategies);
+        failedStrategies: failedStrategies.isEmpty
+            ? record?.failedStrategies : failedStrategies);
     lastStatus = status;
     _activeTaskId = null;
   }
@@ -2135,10 +2124,11 @@ Remember:
   Future<void> failUnexpected(Object error) async {
     final id = _activeTaskId;
     if (id == null) return;
-    await _taskStore.update(id,
-        status: TaskStatus.failed,
-        results: ['Task stopped unexpectedly: $error']);
-    lastStatus = TaskStatus.failed;
+    final record = await _taskStore.get(id);
+    final status = record?.execution.inFlight?.mutation == true
+        ? TaskStatus.needsRevision : TaskStatus.failed;
+    await _taskStore.update(id, status: status);
+    lastStatus = status;
     _activeTaskId = null;
   }
 
@@ -2164,35 +2154,9 @@ Remember:
   // ===========================================================================
 
   Future<bool> _submitKeyboardAction() async {
-    if (await _screenService.pressEnter()) {
-      return true;
-    }
-
-    final shizukuAvailable =
-        await _shizukuService
-            .checkAvailability();
-
-    if (!shizukuAvailable) {
-      return false;
-    }
-
-    final result =
-        await _shizukuService.runCommand(
-      'input keyevent 66',
-    );
-
-    final normalized =
-        result.toLowerCase();
-
-    return !normalized.contains(
-          'not running',
-        ) &&
-        !normalized.contains(
-          'permission denied',
-        ) &&
-        !normalized.startsWith(
-          'error',
-        );
+    if (_paused || _cancelled || _budgetExpired) return false;
+    // Never silently escalate an approved UI operation to privileged shell.
+    return _screenService.pressEnter();
   }
 
   // ===========================================================================
@@ -2202,21 +2166,8 @@ Remember:
   Future<bool> _performScroll(
     String direction,
   ) async {
-    if (await _screenService
-        .scroll(direction)) {
-      return true;
-    }
-
-    final isDown =
-        direction.toLowerCase() ==
-            'down';
-
-    return _performSwipe(
-      540,
-      isDown ? 1800 : 600,
-      540,
-      isDown ? 600 : 1800,
-    );
+    if (_paused || _cancelled || _budgetExpired) return false;
+    return _screenService.scroll(direction);
   }
 
   // ===========================================================================
@@ -2229,428 +2180,13 @@ Remember:
     double endX,
     double endY,
   ) async {
-    if (await _screenService.swipe(
+    if (_paused || _cancelled || _budgetExpired) return false;
+    return _screenService.swipe(
       startX,
       startY,
       endX,
       endY,
-    )) {
-      return true;
-    }
-
-    final shizukuAvailable =
-        await _shizukuService
-            .checkAvailability();
-
-    if (!shizukuAvailable) {
-      return false;
-    }
-
-    final result =
-        await _shizukuService.runCommand(
-      'input swipe '
-      '${startX.toInt()} '
-      '${startY.toInt()} '
-      '${endX.toInt()} '
-      '${endY.toInt()} 600',
     );
-
-    final normalized =
-        result.toLowerCase();
-
-    return !normalized.contains(
-          'not running',
-        ) &&
-        !normalized.contains(
-          'permission denied',
-        ) &&
-        !normalized.startsWith(
-          'error',
-        );
   }
 
-  // ===========================================================================
-  // SKILL REPLAY
-  // ===========================================================================
-
-  Future<bool> _replaySkill(
-    SavedSkill skill,
-    List<String> results,
-  ) async {
-    for (
-      int i = 0;
-      i < skill.steps.length;
-      i++
-    ) {
-      if (_cancelled || _paused) {
-        return false;
-      }
-
-      final step =
-          skill.steps[i];
-
-      _report(
-        'Replaying step '
-        '${i + 1}/${skill.steps.length}: '
-        '${step.action}',
-      );
-
-      int delay = 1200;
-
-      if (step.action ==
-          'open_app') {
-        delay = 3000;
-      } else if (
-          step.action ==
-              'type_text') {
-        delay = 2000;
-      } else if (
-          step.action ==
-                  'click_text' ||
-              step.action ==
-                  'click_at') {
-        delay = 1500;
-      } else if (
-          step.action ==
-              'scroll') {
-        delay = 1000;
-      }
-
-      await Future.delayed(
-        Duration(
-          milliseconds: delay,
-        ),
-      );
-      if (_cancelled || _paused) return false;
-
-      bool success = false;
-
-      String actionResult = '';
-
-      switch (step.action) {
-        case 'click_text':
-          final text =
-              step.params['text']
-                      as String? ??
-                  '';
-
-          success =
-              await _screenService
-                  .clickByText(text);
-
-          actionResult = success
-              ? 'Clicked "$text"'
-              : 'Could not find "$text" to click';
-
-          break;
-
-        case 'click_at':
-          final x =
-              (step.params['x']
-                          as num?)
-                      ?.toDouble() ??
-                  0;
-
-          final y =
-              (step.params['y']
-                          as num?)
-                      ?.toDouble() ??
-                  0;
-
-          success =
-              await _screenService
-                  .clickAt(
-            x,
-            y,
-          );
-
-          actionResult = success
-              ? 'Clicked at ($x, $y)'
-              : 'Click failed';
-
-          break;
-
-        case 'type_text':
-          final text =
-              step.params['text']
-                      as String? ??
-                  '';
-
-          final hint =
-              step.params['field_hint']
-                  as String?;
-
-          success =
-              await _screenService
-                  .typeText(
-            text,
-            fieldHint: hint,
-          );
-
-          actionResult = success
-              ? 'Typed "$text"'
-              : 'Could not type text';
-
-          break;
-
-        case 'press_enter':
-          success =
-              await _submitKeyboardAction();
-
-          actionResult = success
-              ? 'Submitted the focused search/form field'
-              : 'Could not submit the focused field';
-
-          break;
-
-        case 'swipe':
-          final startX =
-              (step.params['startX']
-                          as num?)
-                      ?.toDouble() ??
-                  540;
-
-          final startY =
-              (step.params['startY']
-                          as num?)
-                      ?.toDouble() ??
-                  2000;
-
-          final endX =
-              (step.params['endX']
-                          as num?)
-                      ?.toDouble() ??
-                  540;
-
-          final endY =
-              (step.params['endY']
-                          as num?)
-                      ?.toDouble() ??
-                  500;
-
-          success =
-              await _performSwipe(
-            startX,
-            startY,
-            endX,
-            endY,
-          );
-
-          actionResult =
-              success
-                  ? 'Swiped from '
-                      '($startX,$startY) to '
-                      '($endX,$endY)'
-                  : 'Swipe failed';
-
-          break;
-
-        case 'scroll':
-          final direction =
-              step.params['direction']
-                      as String? ??
-                  'down';
-
-          success =
-              await _performScroll(
-            direction,
-          );
-
-          actionResult = success
-              ? 'Scrolled $direction'
-              : 'Could not scroll $direction';
-
-          break;
-
-        case 'press_back':
-          success =
-              await _screenService
-                  .pressBack();
-
-          actionResult =
-              success
-                  ? 'Pressed back'
-                  : 'Could not press back';
-
-          break;
-
-        case 'press_home':
-          success =
-              await _screenService
-                  .pressHome();
-
-          actionResult =
-              success
-                  ? 'Pressed home'
-                  : 'Could not press home';
-
-          break;
-
-        case 'open_app':
-          final appName =
-              step.params['app_name']
-                      as String? ??
-                  '';
-
-          actionResult =
-              await _appLauncher
-                  .openApp(appName);
-
-          success =
-              actionResult.startsWith(
-            'Opened',
-          );
-
-          break;
-
-        case 'wait':
-          await Future.delayed(
-            const Duration(seconds: 1),
-          );
-
-          actionResult =
-              'Waited';
-
-          success = true;
-
-          break;
-
-        case 'done':
-          success = true;
-          actionResult =
-              'Done step reached';
-
-          break;
-
-        default:
-          success = false;
-
-          actionResult =
-              'Unknown action: '
-              '${step.action}';
-      }
-
-      results.add(
-        'Memory Replay Step '
-        '${i + 1}: $actionResult',
-      );
-
-      developer.log(
-        '=== MEMORY REPLAY RESULT ===\n'
-        '$actionResult',
-        name: 'PrivateAgent',
-      );
-
-      if (!success) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  // ===========================================================================
-  // NAVIGATION SHORTCUTS
-  // ===========================================================================
-
-  List<ActionStep>? _getNavigationShortcut(
-    String goal,
-  ) {
-    final lower =
-        goal.toLowerCase().trim();
-
-    // These are explicit Android settings tasks.
-    if (lower.contains('dark mode') ||
-        lower.contains('dark theme')) {
-      return [
-        ActionStep(
-          action: 'open_app',
-          params: {
-            'app_name': 'Settings',
-          },
-        ),
-        ActionStep(
-          action: 'click_text',
-          params: {
-            'text': 'Display',
-          },
-        ),
-      ];
-    }
-
-    if (lower.contains('wifi') ||
-        lower.contains('wi-fi')) {
-      return [
-        ActionStep(
-          action: 'open_app',
-          params: {
-            'app_name': 'Settings',
-          },
-        ),
-        ActionStep(
-          action: 'click_text',
-          params: {
-            'text': 'Network & internet',
-          },
-        ),
-      ];
-    }
-
-    if (lower.contains('bluetooth')) {
-      return [
-        ActionStep(
-          action: 'open_app',
-          params: {
-            'app_name': 'Settings',
-          },
-        ),
-        ActionStep(
-          action: 'click_text',
-          params: {
-            'text': 'Connected devices',
-          },
-        ),
-      ];
-    }
-
-    // IMPORTANT:
-    //
-    // We intentionally removed broad patterns such as:
-    //
-    // 'browse' -> Chrome
-    // 'search google' -> Chrome
-    //
-    // Those caused Internet tasks to be forced into UI automation.
-    //
-    // Explicit app-opening requests can still use the shortcut.
-
-    final explicitOpen =
-        RegExp(
-          r'^(open|abrir|abre)\s+(.+)$',
-          caseSensitive: false,
-        ).firstMatch(
-      lower,
-    );
-
-    if (explicitOpen != null) {
-      final app =
-          explicitOpen.group(2)?.trim();
-
-      if (app != null &&
-          app.isNotEmpty) {
-        return [
-          ActionStep(
-            action: 'open_app',
-            params: {
-              'app_name':
-                  app[0].toUpperCase() +
-                      app.substring(1),
-            },
-          ),
-        ];
-      }
-    }
-
-    return null;
-  }
 }

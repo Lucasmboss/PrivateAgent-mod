@@ -84,4 +84,39 @@ void main() {
     expect(await service.listFiles(), <String>['sub/note.txt']);
     expect(await service.readText('sub/note.txt'), 'ok');
   });
+
+  test('rejects dangling, internal and parent symlinks before creating parents', () async {
+    await service.writeText('real.txt', 'safe');
+    await Link('${temporary.path}/internal').create('${temporary.path}/real.txt');
+    await Link('${temporary.path}/dangling').create('${temporary.path}/missing');
+    await Link('${temporary.path}/parent').create(temporary.path);
+    for (final path in ['internal', 'dangling', 'parent/new/deep.txt']) {
+      await expectLater(service.writeText(path, 'bad'), throwsA(isA<FileServiceException>()));
+      await expectLater(service.readText(path), throwsA(isA<FileServiceException>()));
+      await expectLater(service.delete(path), throwsA(isA<FileServiceException>()));
+    }
+    expect(await Directory('${temporary.path}/new').exists(), isFalse);
+    expect(await File('${temporary.path}/missing').exists(), isFalse);
+    expect(await service.readText('real.txt'), 'safe');
+  });
+
+  test('injected root symlink is rejected including listing', () async {
+    final link = Link('${temporary.path}/root-link');
+    await link.create(temporary.path);
+    final linked = FileService(rootDirectory: Directory(link.path));
+    await expectLater(linked.listFiles(), throwsA(isA<FileServiceException>()));
+    await expectLater(linked.writeText('bad.txt', 'bad'), throwsA(isA<FileServiceException>()));
+  });
+
+  test('atomic replacement leaves no staging files and preserves old data on rejection', () async {
+    await service.writeText('note.txt', 'old');
+    await expectLater(service.writeText('note.txt', 'too large'), throwsA(isA<FileSizeLimitException>()));
+    expect(await service.readText('note.txt'), 'old');
+    await service.writeText('note.txt', 'new');
+    expect(await service.readText('note.txt'), 'new');
+    expect(await temporary.list().map((e) => e.path.split('/').last).toList(), ['note.txt']);
+    await Directory('${temporary.path}/folder').create();
+    await expectLater(service.writeText('folder', 'bad'), throwsA(isA<FileServiceException>()));
+    expect(await Directory('${temporary.path}/folder').exists(), isTrue);
+  });
 }

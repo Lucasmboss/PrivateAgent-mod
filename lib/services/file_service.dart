@@ -23,6 +23,10 @@ class FileSizeLimitException extends FileServiceException {
 typedef FileServiceDirectoryProvider = Future<Directory> Function();
 
 /// Provides access only to files below the application's private directory.
+///
+/// Existing symlinks are rejected and writes use a same-filesystem rename.
+/// Dart's path-based IO cannot eliminate concurrent hostile ancestor swaps
+/// (no openat/O_NOFOLLOW); the private directory must remain app-owned.
 class FileService {
   FileService({
     Directory? rootDirectory,
@@ -52,7 +56,23 @@ class FileService {
     return agentFiles;
   }
 
-  Future<Directory> _root() async => _directoryProvider();
+  Future<Directory> _root() async {
+    final root = (await _directoryProvider()).absolute;
+    await _rejectLinks(root.path);
+    return root;
+  }
+
+  /// Check with lstat semantics, including dangling links. Never create a
+  /// directory through an unchecked parent.
+  Future<void> _rejectLinks(String path) async {
+    final entity = File(path).absolute;
+    final parent = entity.parent;
+    if (parent.path != entity.path) await _rejectLinks(parent.path);
+    if (await FileSystemEntity.type(entity.path, followLinks: false) ==
+        FileSystemEntityType.link) {
+      throw FileServiceException('Symlinks are not allowed in private file paths.');
+    }
+  }
 
   /// Lists files in the private directory. Returned paths use `/` separators.
   Future<List<String>> listFiles({bool recursive = true}) async {
@@ -82,16 +102,34 @@ class FileService {
 
   /// Writes UTF-8 text, refusing content larger than [maxWriteBytes].
   Future<void> writeText(String relativePath, String text) async {
-    final file = await _fileInsideRoot(relativePath, forWrite: true);
     final bytes = utf8.encode(text);
     if (bytes.length > maxWriteBytes) {
       throw FileSizeLimitException(maxWriteBytes);
     }
-    if (await file.exists() && await FileSystemEntity.isDirectory(file.path)) {
-      throw FileServiceException('Directories cannot be written as files.');
+    final file = await _fileInsideRoot(relativePath, forWrite: true);
+    final type = await FileSystemEntity.type(file.path, followLinks: false);
+    if (type != FileSystemEntityType.notFound && type != FileSystemEntityType.file) {
+      throw FileServiceException('Only regular files can be written.');
     }
-    await file.parent.create(recursive: true);
-    await file.writeAsBytes(bytes, flush: true);
+    // A unique staging directory on the same filesystem prevents partial
+    // destination contents and avoids following pre-created temporary links.
+    final staging = await file.parent.createTemp('.agent-write-');
+    try {
+      final staged = File('${staging.path}/content');
+      await staged.writeAsBytes(bytes, flush: true);
+      await _rejectLinks(staging.path);
+      final checked = await _fileInsideRoot(relativePath, forWrite: true);
+      if (checked.path != file.path) {
+        throw FileServiceException('The private files directory changed.');
+      }
+      await staged.rename(file.path);
+    } finally {
+      // Do not recurse into a path that has been replaced by a link.
+      if (await FileSystemEntity.type(staging.path, followLinks: false) ==
+          FileSystemEntityType.directory) {
+        await staging.delete(recursive: true);
+      }
+    }
   }
 
   /// Deletes a regular file only; directories and unsafe paths are rejected.
@@ -114,11 +152,16 @@ class FileService {
   Future<File> _fileInsideRoot(String value, {bool forWrite = false}) async {
     final relative = _validateRelativePath(value);
     final root = await _root();
+    final file = File('${root.path}/$relative');
+    await _rejectLinks(file.path);
     await root.create(recursive: true);
     final rootCanonical = await root.resolveSymbolicLinks();
-    final file = File('${root.path}/$relative');
 
     if (await file.exists()) {
+      if (await FileSystemEntity.type(file.path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        throw FileServiceException('Only regular files are allowed.');
+      }
       final canonical = await file.resolveSymbolicLinks();
       _ensureContained(rootCanonical, canonical);
       return file;
@@ -128,6 +171,7 @@ class FileService {
     // pre-existing symlinked directory from escaping the private directory.
     final parent = file.parent;
     if (forWrite) await parent.create(recursive: true);
+    await _rejectLinks(file.path);
     final parentCanonical = await parent.resolveSymbolicLinks();
     _ensureContained(rootCanonical, parentCanonical);
     return file;

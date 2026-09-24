@@ -6,6 +6,10 @@ import '../services/ai_service.dart';
 import '../services/shizuku_service.dart';
 import '../services/screen_automation_service.dart';
 import '../services/telegram_service.dart';
+import '../services/chat_history_service.dart';
+import '../services/task_history_logger.dart';
+import '../services/task_store.dart';
+import '../privacy_sanitizer.dart';
 import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
@@ -35,8 +39,13 @@ class _SettingsScreenState extends State<SettingsScreen>
   late TextEditingController _baseUrlController;
   late TextEditingController _modelController;
   late TextEditingController _telegramTokenController;
+  late TextEditingController _telegramAllowedChatController;
   bool _obscureKey = true;
+  bool _obscureTelegramToken = true;
   bool _telegramEnabled = false;
+  bool _chatHistoryEnabled = true;
+  bool _taskHistoryEnabled = true;
+  int _historyRetentionDays = PrivacyPreferenceKeys.defaultRetentionDays;
   double _maxSteps = 15;
   bool _disableMaxSteps = false;
   late TextEditingController _maxTokensController;
@@ -58,6 +67,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     _telegramTokenController = TextEditingController(
       text: widget.telegramService.botToken,
     );
+    _telegramAllowedChatController = TextEditingController();
     _telegramEnabled = widget.telegramService.isEnabled;
     _maxSteps = widget.aiService.rawMaxSteps.toDouble();
     _disableMaxSteps = widget.aiService.disableMaxSteps;
@@ -73,9 +83,11 @@ class _SettingsScreenState extends State<SettingsScreen>
     _baseUrlController.addListener(_autoSave);
     _modelController.addListener(_autoSave);
     _telegramTokenController.addListener(_autoSave);
+    _telegramAllowedChatController.addListener(_saveTelegramAllowedChat);
     _maxTokensController.addListener(_autoSave);
 
     _checkPermissions();
+    _loadPrivacySettings();
     if (FeatureFlags.floatingOverlayEnabled) {
       _checkOverlayStatus();
     }
@@ -99,13 +111,80 @@ class _SettingsScreenState extends State<SettingsScreen>
     _baseUrlController.removeListener(_autoSave);
     _modelController.removeListener(_autoSave);
     _telegramTokenController.removeListener(_autoSave);
+    _telegramAllowedChatController.removeListener(_saveTelegramAllowedChat);
     _maxTokensController.removeListener(_autoSave);
     _apiKeyController.dispose();
     _baseUrlController.dispose();
     _modelController.dispose();
     _telegramTokenController.dispose();
+    _telegramAllowedChatController.dispose();
     _maxTokensController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadPrivacySettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _chatHistoryEnabled =
+          prefs.getBool(PrivacyPreferenceKeys.chatHistoryEnabled) ?? true;
+      _taskHistoryEnabled =
+          prefs.getBool(PrivacyPreferenceKeys.taskHistoryEnabled) ?? true;
+      final savedRetention = prefs.getInt(
+        PrivacyPreferenceKeys.historyRetentionDays,
+      );
+      _historyRetentionDays = const [1, 7, 30, 90].contains(savedRetention)
+          ? savedRetention!
+          : PrivacyPreferenceKeys.defaultRetentionDays;
+      _telegramAllowedChatController.text =
+          prefs.getString(PrivacyPreferenceKeys.telegramAllowedChatId) ?? '';
+    });
+  }
+
+  Future<void> _saveTelegramAllowedChat() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      PrivacyPreferenceKeys.telegramAllowedChatId,
+      _telegramAllowedChatController.text.trim(),
+    );
+  }
+
+  Future<void> _setChatHistoryEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(PrivacyPreferenceKeys.chatHistoryEnabled, enabled);
+    if (!enabled) await ChatHistoryService.clearPendingHandoffs();
+    if (mounted) setState(() => _chatHistoryEnabled = enabled);
+  }
+
+  Future<void> _setTaskHistoryEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(PrivacyPreferenceKeys.taskHistoryEnabled, enabled);
+    if (mounted) setState(() => _taskHistoryEnabled = enabled);
+  }
+
+  Future<void> _setRetentionDays(int days) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(PrivacyPreferenceKeys.historyRetentionDays, days);
+    if (mounted) setState(() => _historyRetentionDays = days);
+  }
+
+  Future<void> _clearPrivateHistory() async {
+    try {
+      // Clear the task store first. It rejects active and unresolved actions,
+      // preventing a partially-cleared history when task state is unsafe.
+      await TaskStore().clear();
+      await TaskHistoryLogger.clearHistory();
+      await ChatHistoryService.clearAll();
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Saved history cleared.')));
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not clear history: $error')),
+      );
+    }
   }
 
   @override
@@ -763,6 +842,31 @@ class _SettingsScreenState extends State<SettingsScreen>
                   labelText: 'Telegram Bot Token',
                   hintText: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11',
                   prefixIcon: const Icon(Icons.send_rounded, size: 18),
+                  suffixIcon: IconButton(
+                    icon: Icon(
+                      _obscureTelegramToken
+                          ? Icons.visibility_off
+                          : Icons.visibility,
+                      size: 18,
+                    ),
+                    onPressed: () => setState(
+                      () => _obscureTelegramToken = !_obscureTelegramToken,
+                    ),
+                  ),
+                ),
+                obscureText: _obscureTelegramToken,
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _telegramAllowedChatController,
+                keyboardType: TextInputType.number,
+                decoration: _buildInputDecoration(
+                  labelText: 'Authorized Telegram Chat ID',
+                  hintText: 'Only this chat may issue commands',
+                  prefixIcon: const Icon(
+                    Icons.verified_user_outlined,
+                    size: 18,
+                  ),
                 ),
               ),
               SwitchListTile(
@@ -796,7 +900,75 @@ class _SettingsScreenState extends State<SettingsScreen>
             children: _buildPermissionTiles(),
           ),
 
-          // 8. Task History Card
+          // 8. Privacy Card
+          _buildSettingsCard(
+            icon: Icons.privacy_tip_outlined,
+            title: 'Privacy & Retention',
+            subtitle:
+                'Credential patterns are redacted; arbitrary PII is not detected',
+            isDark: isDark,
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Save chat history'),
+                subtitle: const Text(
+                  'When off, chats and overlay handoffs are not persisted',
+                ),
+                value: _chatHistoryEnabled,
+                onChanged: (value) async {
+                  try {
+                    await _setChatHistoryEnabled(value);
+                  } catch (error) {
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            'Could not update privacy setting: $error',
+                          ),
+                        ),
+                      );
+                    }
+                  }
+                },
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Save execution summaries'),
+                subtitle: const Text(
+                  'Raw file, HTTP, and screen bodies are never saved in logs',
+                ),
+                value: _taskHistoryEnabled,
+                onChanged: _setTaskHistoryEnabled,
+              ),
+              DropdownButtonFormField<int>(
+                value: _historyRetentionDays,
+                decoration: _buildInputDecoration(
+                  labelText: 'History retention',
+                  hintText: 'Choose retention period',
+                  prefixIcon: const Icon(Icons.event_outlined, size: 18),
+                ),
+                items: const [1, 7, 30, 90]
+                    .map(
+                      (days) => DropdownMenuItem(
+                        value: days,
+                        child: Text('$days day${days == 1 ? '' : 's'}'),
+                      ),
+                    )
+                    .toList(),
+                onChanged: (days) {
+                  if (days != null) _setRetentionDays(days);
+                },
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: _clearPrivateHistory,
+                icon: const Icon(Icons.delete_forever_outlined),
+                label: const Text('Clear chat, logs, and saved tasks'),
+              ),
+            ],
+          ),
+
+          // 9. Task History Card
           _buildSettingsCard(
             icon: Icons.history_outlined,
             title: 'Execution logs',
@@ -806,9 +978,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('View Task History'),
-                subtitle: const Text(
-                  'Access complete trace of execution steps',
-                ),
+                subtitle: const Text('Access redacted execution summaries'),
                 trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
                 onTap: () {
                   Navigator.push(

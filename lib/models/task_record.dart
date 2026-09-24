@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'task_execution_state.dart';
+export 'task_execution_state.dart';
 
 enum TaskStatus {
   running,
@@ -21,6 +23,9 @@ TaskStatus taskStatusFromJson(Object? value) {
 class TaskRecord {
   final String identifier;
   final String goal;
+  final String? _originalGoal;
+  String get originalGoal => _originalGoal ?? goal;
+  final TaskExecutionState execution;
   final TaskStatus status;
   final DateTime createdAt;
   final DateTime updatedAt;
@@ -34,6 +39,8 @@ class TaskRecord {
   const TaskRecord({
     required this.identifier,
     required this.goal,
+    String? originalGoal,
+    this.execution = const TaskExecutionState(),
     required this.status,
     required this.createdAt,
     required this.updatedAt,
@@ -43,11 +50,12 @@ class TaskRecord {
     this.tokens = 0,
     this.results,
     this.failedStrategies = const [],
-  });
+  }) : _originalGoal = originalGoal;
 
   TaskRecord copyWith({
     String? identifier,
     String? goal,
+    TaskExecutionState? execution,
     TaskStatus? status,
     DateTime? createdAt,
     DateTime? updatedAt,
@@ -61,6 +69,8 @@ class TaskRecord {
       TaskRecord(
         identifier: identifier ?? this.identifier,
         goal: goal ?? this.goal,
+        originalGoal: originalGoal,
+        execution: execution ?? this.execution,
         status: status ?? this.status,
         createdAt: createdAt ?? this.createdAt,
         updatedAt: updatedAt ?? this.updatedAt,
@@ -75,6 +85,8 @@ class TaskRecord {
   Map<String, dynamic> toJson() => {
         'identifier': identifier,
         'goal': goal,
+        'originalGoal': originalGoal,
+        'execution': execution.toJson(),
         'status': status.name,
         'createdAt': createdAt.toIso8601String(),
         'updatedAt': updatedAt.toIso8601String(),
@@ -102,6 +114,9 @@ class TaskRecord {
     return TaskRecord(
       identifier: json['identifier'] as String,
       goal: json['goal'] as String,
+      originalGoal: json['originalGoal'] as String?,
+      execution: json['execution'] == null ? const TaskExecutionState()
+          : TaskExecutionState.fromJson(Map<String, dynamic>.from(json['execution'])),
       status: taskStatusFromJson(json['status']),
       createdAt: date('createdAt'),
       updatedAt: date('updatedAt'),

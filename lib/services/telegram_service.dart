@@ -4,12 +4,15 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'action_handler.dart';
 import 'ai_service.dart';
+import '../privacy_sanitizer.dart';
 
 class TelegramService {
   final ActionHandler _actionHandler;
   final AiService _aiService;
   
   String _botToken = '';
+  String _allowedChatId = '';
+  bool _handlingMessage = false;
   bool _isEnabled = false;
   int _lastUpdateId = 0;
   bool _isPolling = false;
@@ -24,16 +27,23 @@ class TelegramService {
     final prefs = await SharedPreferences.getInstance();
     _botToken = prefs.getString('telegram_bot_token') ?? '';
     _isEnabled = prefs.getBool('telegram_enabled') ?? false;
+    _allowedChatId = prefs.getString('telegram_allowed_chat_id')?.trim() ?? '';
 
     if (_isEnabled && _botToken.isNotEmpty) {
       startPolling();
     }
   }
 
-  Future<void> saveSettings({required String botToken, required bool isEnabled}) async {
+  Future<void> saveSettings({required String botToken, required bool isEnabled,
+      String? allowedChatId}) async {
     _botToken = botToken;
     _isEnabled = isEnabled;
     final prefs = await SharedPreferences.getInstance();
+    _allowedChatId = allowedChatId?.trim() ??
+        prefs.getString('telegram_allowed_chat_id')?.trim() ?? '';
+    if (allowedChatId != null) {
+      await prefs.setString('telegram_allowed_chat_id', _allowedChatId);
+    }
     await prefs.setString('telegram_bot_token', _botToken);
     await prefs.setBool('telegram_enabled', _isEnabled);
 
@@ -87,7 +97,7 @@ class TelegramService {
         }
       }
     } catch (e) {
-      print('Telegram polling error: $e');
+      print('Telegram polling failed.');
     }
 
     // Continue polling
@@ -97,12 +107,21 @@ class TelegramService {
   }
 
   Future<void> _handleIncomingMessage(String chatId, String text) async {
+    // Never enroll a caller automatically. Re-read explicit settings so revoking
+    // access applies to subsequent messages without restarting polling.
+    final prefs = await SharedPreferences.getInstance();
+    _allowedChatId = prefs.getString('telegram_allowed_chat_id')?.trim() ?? '';
+    if (!isAuthorizedChat(chatId, _allowedChatId) || !_isEnabled || _handlingMessage) return;
+    _handlingMessage = true;
     // Acknowledge receipt
     await _sendMessage(chatId, '🤖 Received: "$text". Working on it...');
 
     try {
       // 1. Send text to AI
       final aiResponse = await _aiService.sendMessage(text);
+      final current = await SharedPreferences.getInstance();
+      _allowedChatId = current.getString('telegram_allowed_chat_id')?.trim() ?? '';
+      if (!_isEnabled || !isAuthorizedChat(chatId, _allowedChatId)) return;
       
       // 2. Parse the action
       final action = _aiService.parseAction(aiResponse);
@@ -112,23 +131,29 @@ class TelegramService {
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
+          // Telegram text is not a trustworthy interactive approval channel.
+          onApproval: (_) async => false,
           onProgress: (msg) {
             // Send progress updates back to telegram
             _sendMessage(chatId, '⏳ $msg');
           },
         );
-        await _sendMessage(chatId, '✅ ${result.details ?? "Done"}');
+        await _sendMessage(chatId, '${result.success ? '✅' : '⛔'} ${result.details ?? "Stopped"}');
       } else {
         // It's a plain text response
         await _sendMessage(chatId, '💬 $aiResponse');
       }
     } catch (e) {
-      await _sendMessage(chatId, '❌ Error: $e');
+      await _sendMessage(chatId, '❌ Request failed.');
+    } finally {
+      _handlingMessage = false;
     }
   }
 
   Future<void> _sendMessage(String chatId, String text) async {
-    if (_botToken.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    _allowedChatId = prefs.getString('telegram_allowed_chat_id')?.trim() ?? '';
+    if (_botToken.isEmpty || !isAuthorizedChat(chatId, _allowedChatId)) return;
     try {
       final url = Uri.parse('https://api.telegram.org/bot$_botToken/sendMessage');
       await http.post(
@@ -136,15 +161,19 @@ class TelegramService {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'chat_id': chatId,
-          'text': text,
+          'text': PrivacySanitizer.sanitizeText(text),
         }),
       );
     } catch (e) {
-      print('Failed to send telegram message: $e');
+      print('Failed to send Telegram message.');
     }
   }
 
   void dispose() {
     stopPolling();
   }
+
+  static bool isAuthorizedChat(String chatId, String configuredChatId) =>
+      RegExp(r'^-?[0-9]+$').hasMatch(configuredChatId) &&
+      configuredChatId.isNotEmpty && chatId == configuredChatId;
 }

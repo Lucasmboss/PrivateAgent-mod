@@ -13,6 +13,9 @@ import 'web_service.dart';
 import 'web_search_service.dart';
 import 'file_service.dart';
 import '../models/task_record.dart';
+import 'tool_registry.dart';
+import 'tool_policy.dart';
+import '../privacy_sanitizer.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -31,6 +34,7 @@ class ActionHandler {
 
   /// The currently running task executor, if any
   TaskExecutor? _currentExecutor;
+  int _stopGeneration = 0;
 
   /// Execute an action and return the result
   Future<AgentActionResult> execute(
@@ -38,8 +42,26 @@ class ActionHandler {
     AiService? aiService,
     void Function(String)? onProgress,
     String? userRequest,
+    ToolApprovalCallback? onApproval,
   }) async {
+    final generation = _stopGeneration;
     try {
+      final call = const ToolRegistry().validate(action.action, action.params);
+      if (call.name == 'plan' || call.name == 'done') {
+        throw StateError('Internal planning actions require an active task.');
+      }
+      if (const ToolPolicy().requiresApproval(call)) {
+        onProgress?.call('Waiting for approval: ${call.name}');
+      }
+      final decision = await const ToolPolicy().authorize(call, onApproval: onApproval);
+      if (generation != _stopGeneration || !decision.allowed) {
+        final details = generation != _stopGeneration
+            ? 'Action paused or cancelled before execution.'
+            : 'Action denied: ${decision.reason}';
+        onProgress?.call(details);
+        return AgentActionResult(actionType: call.name, success: false, details: details);
+      }
+      action = AgentAction(action: call.name, params: call.params, response: action.response);
       String result;
       bool taskSucceeded = false;
 
@@ -159,12 +181,6 @@ class ActionHandler {
           break;
 
         case 'delete_file':
-          if (userRequest == null ||
-              !RegExp(r'\b(delete|remove|borrar|eliminar)\b',
-                      caseSensitive: false)
-                  .hasMatch(userRequest)) {
-            throw StateError('Deleting a file requires an explicit user request.');
-          }
           await _files.delete(action.params['path'] as String? ?? '');
           result = 'File deleted from agent_files.';
           break;
@@ -189,23 +205,47 @@ class ActionHandler {
           result = await _screenAutomation.getScreenDescription();
           break;
 
-        case 'click_element':
+        case 'click_text':
           final text = action.params['text'] as String? ?? '';
           final success = await _screenAutomation.clickByText(text);
           result = success ? 'Clicked "$text"' : 'Could not find "$text" to click';
           break;
 
-        case 'type_on_screen':
+        case 'type_text':
           final text = action.params['text'] as String? ?? '';
           final hint = action.params['field_hint'] as String?;
           final success = await _screenAutomation.typeText(text, fieldHint: hint);
           result = success ? 'Typed "$text"' : 'Could not type into field';
           break;
 
-        case 'scroll_screen':
+        case 'scroll':
           final direction = action.params['direction'] as String? ?? 'down';
           final success = await _screenAutomation.scroll(direction);
           result = success ? 'Scrolled $direction' : 'Could not scroll';
+          break;
+
+        case 'click_at':
+          final success = await _screenAutomation.clickAt(
+              (action.params['x'] as num).toDouble(), (action.params['y'] as num).toDouble());
+          result = success ? 'Clicked screen position.' : 'Could not click screen position.';
+          break;
+        case 'swipe':
+          final success = await _screenAutomation.swipe(
+              (action.params['startX'] as num).toDouble(), (action.params['startY'] as num).toDouble(),
+              (action.params['endX'] as num).toDouble(), (action.params['endY'] as num).toDouble());
+          result = success ? 'Swiped screen.' : 'Could not swipe screen.';
+          break;
+        case 'press_enter':
+          final success = await _screenAutomation.pressEnter();
+          result = success ? 'Pressed enter.' : 'Could not press enter.';
+          break;
+        case 'press_home':
+          final success = await _screenAutomation.pressHome();
+          result = success ? 'Pressed home.' : 'Could not press home.';
+          break;
+        case 'wait':
+          await Future<void>.delayed(Duration(milliseconds: action.params['milliseconds'] as int));
+          result = 'Wait completed.';
           break;
 
         case 'press_back':
@@ -230,6 +270,7 @@ class ActionHandler {
             appLauncher: _appLauncher,
             shizukuService: _shizuku,
             onProgress: onProgress,
+            onApproval: onApproval,
           );
           try {
             result = await _currentExecutor!.executeTask(
@@ -247,15 +288,18 @@ class ActionHandler {
           break;
 
         default:
-          result = action.response;
+          throw StateError('Tool is not supported by this router.');
       }
 
       final requestSucceeded = action.action == 'execute_task'
           ? taskSucceeded
           : action.action == 'web_request'
               ? WebService.isSuccessfulResponse(result)
-              : !result.startsWith('Web search error:') &&
-                  !result.startsWith('AI service not available');
+               : action.action == 'run_adb_command'
+                   ? false // No exit-code evidence is available from this adapter.
+                   : !ToolRegistry.isFailureResult(result) &&
+                       !RegExp(r'^(error|could not|cannot|no phone|shizuku |web search error:|ai service not available)', caseSensitive: false)
+                       .hasMatch(result.trim());
 
       return AgentActionResult(
         actionType: action.action,
@@ -266,17 +310,19 @@ class ActionHandler {
       return AgentActionResult(
         actionType: action.action,
         success: false,
-        details: 'Error: $e',
+        details: PrivacySanitizer.sanitizeTaskTrace('Error: $e'),
       );
     }
   }
 
   /// Cancel the currently running task
   void cancelTask() {
+    _stopGeneration++;
     _currentExecutor?.cancel();
   }
 
   void pauseTask() {
+    _stopGeneration++;
     _currentExecutor?.pause();
   }
 }

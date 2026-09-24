@@ -1,8 +1,13 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+
 import '../models/task_record.dart';
 import '../services/task_history_logger.dart';
 import '../services/task_store.dart';
+import '../widgets/task_execution_details.dart';
 
 class TaskHistoryScreen extends StatefulWidget {
   const TaskHistoryScreen({super.key});
@@ -12,490 +17,330 @@ class TaskHistoryScreen extends StatefulWidget {
 }
 
 class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
-  List<Map<String, dynamic>> _history = [];
+  final TaskStore _store = TaskStore();
   List<TaskRecord> _records = [];
-  Map<String, dynamic>? _analytics;
-  bool _isLoading = true;
-  final TaskStore _taskStore = TaskStore();
+  List<Map<String, dynamic>> _legacy = [];
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadHistory();
+    _refresh();
   }
 
-  Future<void> _loadHistory() async {
-    setState(() => _isLoading = true);
-    final records = await _taskStore.list();
-    final history = await TaskHistoryLogger.readHistory();
-    final analytics = await TaskHistoryLogger.getAnalytics();
-    if (!mounted) return;
+  Future<void> _refresh() async {
     setState(() {
-      _records = records;
-      _history = history;
-      _analytics = analytics;
-      _isLoading = false;
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final records = await _store.list();
+      if (mounted) setState(() => _records = records.reversed.toList());
+      final legacy = await TaskHistoryLogger.readHistory();
+      if (mounted) setState(() => _legacy = legacy);
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Could not refresh history: $error');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _perform(Future<void> Function() operation) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await operation();
+      if (mounted) await _refresh();
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Operation failed: $error');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  bool _safeToResume(TaskRecord record) =>
+      record.status != TaskStatus.running &&
+      record.status != TaskStatus.completed &&
+      record.execution.inFlight == null &&
+      record.execution.unverifiedMutations.isEmpty;
+
+  Future<void> _resume(TaskRecord record) async {
+    final controller = TextEditingController(text: record.goal);
+    final goal = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Revise and resume'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Text('Changing the goal invalidates current criterion evidence. '
+                'Previous actions are retained in the audit, not undone.'),
+            const SizedBox(height: 12),
+            TextField(controller: controller, maxLines: 4,
+                decoration: const InputDecoration(labelText: 'Goal')),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: () {
+            if (controller.text.trim().isNotEmpty) {
+              Navigator.pop(context, controller.text.trim());
+            }
+          }, child: const Text('Resume')),
+        ],
+      ),
+    );
+    // Allow the dialog's closing animation to detach its TextField.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    controller.dispose();
+    if (goal == null || !mounted) return;
+    await _perform(() async {
+      final current = await _store.get(record.identifier);
+      if (current == null || !_safeToResume(current)) {
+        throw StateError('Task changed or has unresolved actions. Refresh and review before resuming.');
+      }
+      if (mounted) Navigator.pop(context, current.copyWith(goal: goal));
     });
   }
 
-  Future<void> _clearHistory() async {
-    final confirm = await showDialog<bool>(
+  Future<void> _review(TaskRecord record, {int? sequence}) async {
+    final pending = record.execution.inFlight;
+    final uncertain = sequence == null;
+    final id = uncertain ? pending!.evidenceId : 'action-$sequence';
+    final decision = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text('Independent review: $id'),
+        content: SingleChildScrollView(child: Text(
+          'You must independently verify the effects in the destination app, '
+          'file, or service before confirming. A tool success message or an AI '
+          'claim is not proof of the intended outcome.\n\n'
+          '${uncertain ? 'This action may already have changed external state. '
+              'Resolving it does not replay or undo it. Only mark “did not succeed” '
+              'if you verified that outcome; if unsure, keep it unresolved. '
+              'A later resume could attempt the operation again.' : 'Confirm only if you personally verified the intended outcome.'}\n\n'
+          'This records your attestation, not independent automated verification '
+          'of the entire goal.',
+        )),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context),
+              child: const Text('Keep unresolved')),
+          if (uncertain)
+            TextButton(onPressed: () => Navigator.pop(context, false),
+                child: const Text('Verified: did not succeed')),
+          FilledButton(onPressed: () => Navigator.pop(context, true),
+              child: const Text('I independently verified success')),
+        ],
+      ),
+    );
+    if (decision == null || !mounted) return;
+    await _perform(() async {
+      final current = await _store.get(record.identifier);
+      if (current == null || current.status == TaskStatus.running ||
+          (uncertain && current.execution.inFlight?.sequence != pending!.sequence)) {
+        throw StateError('Task changed during review. Refresh and review the current action.');
+      }
+      if (uncertain) {
+        await _store.resolveUncertainAction(record.identifier,
+            userConfirmedSuccess: decision);
+      } else {
+        await _store.confirmActionOutcome(record.identifier, sequence);
+      }
+    });
+  }
+
+  Future<void> _reviewCriterion(TaskRecord record, TaskSubtask subtask,
+      String criterion, bool confirmed) async {
+    final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
+    final approved = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Clear Task History'),
-        content: const Text(
-            'Delete all task history, including saved progress and resumable tasks?'),
+        title: Text(confirmed ? 'Independently verify criterion' : 'Revoke criterion confirmation?'),
+        content: SingleChildScrollView(child: SelectableText(
+          'Task: ${record.goal}\nRevision: ${record.execution.revision}\n'
+          'Subtask: ${subtask.id} — ${subtask.objective}\n'
+          'Exact criterion: $criterion\n'
+          'Supporting audit IDs: ${refs.isEmpty ? 'None recorded' : refs.join(', ')}\n\n'
+          'Audit IDs and tool success do not establish that this criterion is met. '
+          'You must independently verify the actual effects in the destination '
+          'app, file, or service. Do not rely on an AI claim.\n\n'
+          '${confirmed ? 'Confirm only this exact criterion for this revision if you personally verified it. If unsure, cancel.' : 'Revoking removes your attestation and requires verification again. It does not undo any external effects.'}',
+        )),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Clear', style: TextStyle(color: Colors.red)),
-          ),
+          TextButton(onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true),
+              child: Text(confirmed ? 'I independently verified this criterion' : 'Revoke confirmation')),
         ],
       ),
     );
+    if (approved != true || !mounted) return;
+    await _perform(() async {
+      // The store atomically rejects stale revisions and running/in-flight tasks.
+      await _store.confirmCriterion(record.identifier,
+          expectedRevision: record.execution.revision, subtaskId: subtask.id,
+          criterion: criterion, confirmed: confirmed);
+    });
+  }
 
-    if (confirm == true) {
+  Future<void> _finalize(TaskRecord record) async {
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Finalize verified task?'),
+        content: const Text('Mark this task completed using its current criterion '
+            'confirmations. This does not execute actions or confirm new evidence.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true),
+              child: const Text('Mark completed')),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+    await _perform(() async {
+      final current = await _store.get(record.identifier);
+      if (current == null || current.execution.revision != record.execution.revision ||
+          current.execution.verification != 'verified' || !_safeToResume(current)) {
+        throw StateError('Task changed or is not safely verified. Refresh before finalizing.');
+      }
+      await _store.update(record.identifier, status: TaskStatus.completed);
+    });
+  }
+
+  Future<void> _clear() async {
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear task history?'),
+        content: const Text('Delete saved plans, evidence, audit and legacy logs? '
+            'Active or unresolved tasks cannot be cleared. This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete history')),
+        ],
+      ),
+    );
+    if (approved != true || !mounted) return;
+    await _perform(() async {
+      // Check the durable store guard before touching the legacy log.
+      await _store.clear();
       await TaskHistoryLogger.clearHistory();
-      await _taskStore.clear();
-      _loadHistory();
+    });
+  }
+
+  Future<void> _copy(TaskRecord record) async {
+    try {
+      await Clipboard.setData(ClipboardData(text: const JsonEncoder.withIndent('  ')
+          .convert({'taskId': record.identifier, 'goal': record.goal,
+            'originalGoal': record.originalGoal, 'execution': record.execution.toJson()})));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Plan and evidence metadata copied')));
+      }
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Could not copy evidence: $error');
     }
   }
 
-  Color _getStatusColor(String status) {
-    switch (status) {
-      case 'Success':
-        return Colors.green;
-      case 'Failed':
-        return Colors.red;
-      case 'Cancelled':
-        return Colors.orange;
-      default:
-        return Colors.grey;
-    }
-  }
-
-  IconData _getStatusIcon(String status) {
-    switch (status) {
-      case 'Success':
-        return Icons.check_circle;
-      case 'Failed':
-        return Icons.cancel;
-      case 'Cancelled':
-        return Icons.stop_circle;
-      default:
-        return Icons.info;
-    }
-  }
+  String _date(DateTime date) => DateFormat('MMM d, y h:mm a').format(date);
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('Task History (${_history.length + _records.length})'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.delete),
-            onPressed: (_history.isEmpty && _records.isEmpty) ||
-                    _records.any((record) => record.status == TaskStatus.running)
-                ? null
-                : _clearHistory,
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Task history'), actions: [
+      IconButton(tooltip: 'Refresh', onPressed: _busy || _loading ? null : _refresh,
+          icon: const Icon(Icons.refresh)),
+      IconButton(tooltip: 'Clear history', onPressed: _busy || _loading ? null : _clear,
+          icon: const Icon(Icons.delete_outline)),
+    ]),
+    body: Column(children: [
+      if (_error != null)
+        Material(color: Theme.of(context).colorScheme.errorContainer,
+          child: Padding(padding: const EdgeInsets.all(16),
+            child: Row(children: [
+              Expanded(child: SelectableText(_error!)),
+              TextButton(onPressed: _loading || _busy ? null : _refresh,
+                  child: const Text('Refresh')),
+            ]),
           ),
-        ],
-      ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _history.isEmpty && _records.isEmpty
-              ? const Center(child: Text('No task history found.'))
-              : Column(
+        ),
+      if (_loading || _busy) const LinearProgressIndicator(),
+      Expanded(child: RefreshIndicator(
+        onRefresh: () async { if (!_busy && !_loading) await _refresh(); },
+        child: ListView(padding: const EdgeInsets.all(16),
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: [
+            Text('Saved tasks (${_records.length})',
+                style: Theme.of(context).textTheme.titleLarge),
+            if (!_loading && _records.isEmpty) const Text('No saved tasks.'),
+            ..._records.map((record) => Card(child: ExpansionTile(
+              key: PageStorageKey(record.identifier),
+              title: Text(record.goal),
+              subtitle: Text('${record.status.name} • ${_date(record.updatedAt)}'),
+              children: [
+                Padding(padding: const EdgeInsets.all(16), child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    if (_analytics != null && _analytics!['totalTasks'] > 0)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                        child: Card(
-                          child: Padding(
-                            padding: const EdgeInsets.all(16.0),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceAround,
-                              children: [
-                                _buildStatColumn('Total', _analytics!['totalTasks'].toString(), isDark: Theme.of(context).brightness == Brightness.dark),
-                                _buildStatColumn('Success', _analytics!['successCount'].toString(), color: Colors.green, isDark: Theme.of(context).brightness == Brightness.dark),
-                                _buildStatColumn('Failed', _analytics!['failedCount'].toString(), color: Colors.red, isDark: Theme.of(context).brightness == Brightness.dark),
-                                _buildStatColumn('Rate', '${(_analytics!['successRate'] * 100).toStringAsFixed(1)}%', isDark: Theme.of(context).brightness == Brightness.dark),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    Expanded(
-                      child: ListView.builder(
-                        itemCount: _records.length + _history.length,
-                        padding: const EdgeInsets.all(16),
-                        itemBuilder: (context, index) {
-                          if (index < _records.length) {
-                            return _buildRecordCard(_records[index]);
-                          }
-                          final legacyIndex = index - _records.length;
-                          final task = _history[legacyIndex];
-                          final date = DateTime.tryParse(task['timestamp'] ?? '');
-                          final dateStr = date != null
-                              ? DateFormat('MMM d, y h:mm a').format(date)
-                              : 'Unknown Date';
-                          final status = task['status'] as String? ?? 'Unknown';
-
-                          return Card(
-                            margin: const EdgeInsets.only(bottom: 16),
-                            child: ExpansionTile(
-                              leading: Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: _getStatusColor(status).withOpacity(0.12),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Icon(
-                                  _getStatusIcon(status),
-                                  color: _getStatusColor(status),
-                                  size: 24,
-                                ),
-                              ),
-                              title: Text(
-                                task['goal'] ?? 'Unknown Goal',
-                                style: const TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              subtitle: Padding(
-                                padding: const EdgeInsets.only(top: 8.0),
-                                child: Row(
-                                  children: [
-                                    Text(dateStr, style: const TextStyle(fontSize: 12)),
-                                    const Spacer(),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                      decoration: BoxDecoration(
-                                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                      child: Text(
-                                        '${task['total_tokens'] ?? 0} tokens',
-                                        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              children: [
-                                Padding(
-                                  padding: const EdgeInsets.all(16.0),
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                            decoration: BoxDecoration(
-                                              color: _getStatusColor(status).withOpacity(0.12),
-                                              borderRadius: BorderRadius.circular(8),
-                                              border: Border.all(color: _getStatusColor(status).withOpacity(0.3)),
-                                            ),
-                                            child: Text(
-                                              status.toUpperCase(),
-                                              style: TextStyle(
-                                                color: _getStatusColor(status),
-                                                fontWeight: FontWeight.w800,
-                                                fontSize: 10,
-                                                letterSpacing: 0.5,
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 12),
-                                          Text(
-                                            'Steps taken: ${task['steps_taken'] ?? 0}',
-                                            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(height: 20),
-                                      const Text(
-                                        'Execution Trace:',
-                                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      ...((task['trace'] as List<dynamic>?) ?? []).map((t) => Container(
-                                        margin: const EdgeInsets.only(bottom: 6),
-                                        padding: const EdgeInsets.all(10),
-                                        decoration: BoxDecoration(
-                                          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                                          borderRadius: BorderRadius.circular(8),
-                                        ),
-                                        child: Text(
-                                          '• $t',
-                                          style: TextStyle(
-                                            fontFamily: 'monospace',
-                                            fontSize: 12,
-                                            color: Theme.of(context).colorScheme.onSurface.withOpacity(0.85),
-                                          ),
-                                        ),
-                                      )),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                    ),
+                    SelectableText('Task ${record.identifier}\n'
+                        'Created ${_date(record.createdAt)} • ${record.tokens} tokens'),
+                    TaskExecutionDetails(record: record,
+                      onReviewCriterion: _busy || _loading ? null :
+                          (subtask, criterion, confirmed) =>
+                              _reviewCriterion(record, subtask, criterion, confirmed),
+                      onFinalize: _busy || _loading ? null : () => _finalize(record),
+                      onReviewUncertain: _busy || _loading ||
+                          record.status == TaskStatus.running ? null : () => _review(record),
+                      onConfirmOutcome: _busy || _loading ||
+                          record.status == TaskStatus.running ? null :
+                          (sequence) => _review(record, sequence: sequence)),
+                    Wrap(spacing: 8, children: [
+                      FilledButton(onPressed: _busy || _loading || !_safeToResume(record)
+                          ? null : () => _resume(record),
+                          child: const Text('Revise / resume')),
+                      TextButton.icon(onPressed: () => _copy(record),
+                          icon: const Icon(Icons.copy), label: const Text('Copy evidence metadata')),
+                    ]),
+                    if (record.execution.inFlight != null ||
+                        record.execution.unverifiedMutations.isNotEmpty)
+                      const Text('Resume is blocked until unresolved actions are reviewed. '
+                          'Stop a running task before reviewing.'),
+                    if (record.results != null) ...[
+                      const Text('Recorded results (not proof of goal completion)'),
+                      SelectableText(record.results.toString()),
+                    ],
+                    if (record.failedStrategies.isNotEmpty) ...[
+                      const Text('Failed strategies'),
+                      ...record.failedStrategies.map((s) => SelectableText(s)),
+                    ],
                   ],
-                ),
-    );
-  }
-
-  Color _recordStatusColor(TaskStatus status) {
-    switch (status) {
-      case TaskStatus.completed:
-        return Colors.green;
-      case TaskStatus.failed:
-        return Colors.red;
-      case TaskStatus.cancelled:
-        return Colors.orange;
-      case TaskStatus.paused:
-      case TaskStatus.needsRevision:
-        return Colors.amber.shade800;
-      case TaskStatus.running:
-        return Colors.blue;
-    }
-  }
-
-  IconData _recordStatusIcon(TaskStatus status) {
-    switch (status) {
-      case TaskStatus.completed:
-        return Icons.check_circle;
-      case TaskStatus.failed:
-        return Icons.cancel;
-      case TaskStatus.cancelled:
-        return Icons.stop_circle;
-      case TaskStatus.paused:
-        return Icons.pause_circle;
-      case TaskStatus.needsRevision:
-        return Icons.edit_note;
-      case TaskStatus.running:
-        return Icons.timelapse;
-    }
-  }
-
-  Future<void> _reviseAndResume(TaskRecord record) async {
-    final controller = TextEditingController(text: record.goal);
-    try {
-      final revisedGoal = await showDialog<String>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: const Text('Resume task'),
-          content: TextField(
-            controller: controller,
-            maxLines: 4,
-            autofocus: true,
-            decoration: const InputDecoration(
-              labelText: 'Objective and updated instructions',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final goal = controller.text.trim();
-                if (goal.isNotEmpty) Navigator.pop(context, goal);
-              },
-              child: const Text('Continue'),
-            ),
+                )),
+              ],
+            ))),
+            const SizedBox(height: 24),
+            Text('Legacy execution logs (${_legacy.length})',
+                style: Theme.of(context).textTheme.titleLarge),
+            const Text('Separate historical logs may overlap saved tasks. Counts are not '
+                'added together. Legacy “Success” is a recorded claim, not verified completion.'),
+            ..._legacy.map((entry) => Card(child: ExpansionTile(
+              title: Text('${entry['goal'] ?? 'Unknown goal'}'),
+              subtitle: Text('${entry['status'] ?? 'Unknown'} • ${entry['timestamp'] ?? 'Unknown date'}'),
+              children: [Padding(padding: const EdgeInsets.all(16),
+                child: SelectableText('Steps: ${entry['steps_taken'] ?? 'Unknown'} • '
+                    'Tokens: ${entry['total_tokens'] ?? 'Unknown'}\n'
+                    'Trace events: ${entry['trace_event_count'] ?? 0}\n'
+                    'Detailed legacy traces are omitted for privacy.'))],
+            ))),
           ],
         ),
-      );
-      if (revisedGoal != null && mounted) {
-        Navigator.pop(context, record.copyWith(goal: revisedGoal));
-      }
-    } finally {
-      controller.dispose();
-    }
-  }
-
-  String _recordDate(DateTime value) =>
-      DateFormat('MMM d, y h:mm a').format(value);
-
-  Widget _buildRecordCard(TaskRecord record) {
-    final color = _recordStatusColor(record.status);
-    final resumable = record.status == TaskStatus.paused ||
-        record.status == TaskStatus.cancelled ||
-        record.status == TaskStatus.needsRevision ||
-        record.status == TaskStatus.failed;
-    final results = record.results;
-    final resultItems = results is List
-        ? results.reversed.take(5).toList().reversed.toList()
-        : <dynamic>[];
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 16),
-      child: ExpansionTile(
-        leading: Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.12),
-            shape: BoxShape.circle,
-          ),
-          child: Icon(_recordStatusIcon(record.status), color: color),
-        ),
-        title: Text(record.goal,
-            style: const TextStyle(fontWeight: FontWeight.bold)),
-        subtitle: Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: Wrap(
-            spacing: 10,
-            runSpacing: 4,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              Text(_recordDate(record.updatedAt),
-                  style: const TextStyle(fontSize: 12)),
-              Text('${record.tokens} tokens',
-                  style: const TextStyle(fontSize: 12)),
-              _recordStatusChip(record.status, color),
-            ],
-          ),
-        ),
-        trailing: resumable
-            ? TextButton(
-                onPressed: () => _reviseAndResume(record),
-                child: const Text('Resume'),
-              )
-            : null,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Wrap(
-                  spacing: 18,
-                  runSpacing: 8,
-                  children: [
-                    _recordDetail('Created', _recordDate(record.createdAt)),
-                    _recordDetail('Updated', _recordDate(record.updatedAt)),
-                    if (record.startedAt != null)
-                      _recordDetail('Started', _recordDate(record.startedAt!)),
-                    if (record.completedAt != null)
-                      _recordDetail(
-                          'Completed', _recordDate(record.completedAt!)),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  children: [
-                    const Text('Progress',
-                        style: TextStyle(fontWeight: FontWeight.w600)),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: LinearProgressIndicator(
-                        value: record.progress.clamp(0.0, 1.0).toDouble(),
-                        minHeight: 7,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Text('${(record.progress * 100).round()}%'),
-                  ],
-                ),
-                if (results != null) ...[
-                  const SizedBox(height: 14),
-                  const Text('Recent results',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  if (resultItems.isNotEmpty)
-                    ...resultItems.map((item) => _recordLine(item.toString()))
-                  else
-                    _recordLine(results.toString()),
-                ],
-                if (record.failedStrategies.isNotEmpty) ...[
-                  const SizedBox(height: 14),
-                  const Text('Failed strategies',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  ...record.failedStrategies.map(_recordLine),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _recordStatusChip(TaskStatus status, Color color) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-        decoration: BoxDecoration(
-          color: color.withOpacity(0.12),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text(status.name.toUpperCase(),
-            style: TextStyle(
-                color: color, fontSize: 10, fontWeight: FontWeight.w800)),
-      );
-
-  Widget _recordDetail(String label, String value) => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 11)),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
-        ],
-      );
-
-  Widget _recordLine(String value) => Container(
-        width: double.infinity,
-        margin: const EdgeInsets.only(bottom: 5),
-        padding: const EdgeInsets.all(9),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(7),
-        ),
-        child: Text(value, style: const TextStyle(fontSize: 12)),
-      );
-
-  Widget _buildStatColumn(String label, String value, {Color? color, required bool isDark}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: isDark ? const Color(0xFF1E293B) : const Color(0xFFF1F5F9),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: Theme.of(context).colorScheme.onSurface.withOpacity(0.06),
-        ),
-      ),
-      child: Column(
-        children: [
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w900,
-              color: color ?? (isDark ? Colors.white : const Color(0xFF1E293B)),
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            label.toUpperCase(),
-            style: TextStyle(
-              fontSize: 9,
-              fontWeight: FontWeight.w800,
-              color: isDark ? const Color(0xFF94A3B8) : const Color(0xFF64748B),
-              letterSpacing: 0.5,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+      )),
+    ]),
+  );
 }

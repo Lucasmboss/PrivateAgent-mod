@@ -1,8 +1,10 @@
 import 'dart:convert';
-import 'dart:developer' as developer;
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import 'remote_provider_adapter.dart';
+import 'remote_cancellation.dart';
+export 'remote_provider_adapter.dart' show RemoteProviderException, RemoteErrorKind;
+export 'remote_cancellation.dart' show RemoteCancellationToken;
 
 class AiResponse {
   final String content;
@@ -11,6 +13,9 @@ class AiResponse {
 }
 
 class AiService {
+  final RemoteProviderAdapter _remote;
+  AiService({RemoteProviderAdapter? remoteProvider})
+      : _remote = remoteProvider ?? RemoteProviderAdapter();
   static const String _defaultBaseUrl = 'https://api.deepseek.com';
   static const String _defaultModel = 'deepseek-chat';
   static const String nvidiaBaseUrl = 'https://integrate.api.nvidia.com/v1';
@@ -155,6 +160,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     String? baseUrl,
     String? model,
   }) async {
+    if (baseUrl != null && baseUrl.isNotEmpty) {
+      RemoteProviderAdapter.endpoint(baseUrl);
+    }
     final prefs = await SharedPreferences.getInstance();
 
     // Clean up the API key in case the user pasted "Bearer sk-..."
@@ -233,122 +241,33 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }
 
   void addHistoryMessage(String role, String content) {
+    if (content.length > RemoteProviderAdapter.maxContentCharacters ||
+        utf8.encode(content).length > 256 * 1024) {
+      throw const RemoteProviderException(RemoteErrorKind.invalidRequest);
+    }
     _conversationHistory.add({'role': role, 'content': content});
-    if (_conversationHistory.length > 20) {
-      _conversationHistory.removeRange(0, _conversationHistory.length - 20);
+    while (_conversationHistory.length > 20 ||
+        _conversationHistory.fold<int>(0,
+            (sum, message) => sum + utf8.encode(message['content']!).length) >
+            256 * 1024) {
+      _conversationHistory.removeAt(0);
     }
   }
 
   /// Send a message to the AI and get a response.
   Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+      throw const RemoteProviderException(RemoteErrorKind.authentication);
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
-    _conversationHistory.add({'role': 'user', 'content': message});
-
-    // Keep conversation history manageable (last 20 messages)
-    if (_conversationHistory.length > 20) {
-      _conversationHistory.removeRange(0, _conversationHistory.length - 20);
-    }
-
-    try {
-      // Build the prompt including system instructions
-      final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
-      final messages = [
-        if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-        ..._conversationHistory,
-      ];
-
-      String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl; // User already included it
-      } else {
-        if (requestUrl.endsWith('/')) {
-          requestUrl = '${requestUrl}chat/completions';
-        } else {
-          requestUrl = '$requestUrl/chat/completions';
-        }
-      }
-
-      final requestBody = jsonEncode({
-        'model': _model,
-        'messages': messages,
-        'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
-      });
-
-      developer.log(
-        'API Request: $requestUrl\n$requestBody',
-        name: 'AiService',
-      );
-
-      final response = await http
-          .post(
-            Uri.parse(requestUrl),
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $_apiKey',
-              'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-              'X-Title': 'PrivateAgent',
-            },
-            body: requestBody,
-          )
-          .timeout(const Duration(minutes: 30));
-
-      developer.log(
-        'API Response [${response.statusCode}]: ${response.body}',
-        name: 'AiService',
-      );
-
-      if (response.statusCode != 200) {
-        String errorMessage = response.body;
-        try {
-          final decoded = jsonDecode(response.body);
-          if (decoded is Map<String, dynamic>) {
-            if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage =
-                  decoded['error']['message']?.toString() ?? response.body;
-            } else if (decoded['error'] is String) {
-              errorMessage = decoded['error'];
-            }
-          }
-        } catch (_) {
-          // ignore parsing errors, use raw body
-        }
-        throw Exception('API error (${response.statusCode}): $errorMessage');
-      }
-
-      final data = jsonDecode(response.body);
-      if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
-        throw Exception('Unexpected API response format: $data');
-      }
-
-      String assistantMessage =
-          data['choices'][0]['message']['content'] as String;
-
-      // Strip <think> blocks commonly produced by reasoning models
-      assistantMessage = assistantMessage
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-          .trim();
-
-      if (assistantMessage.trim().isEmpty) {
-        throw Exception(
-          'API returned an empty response. This may be due to rate limits or API instability.',
-        );
-      }
-
-      _conversationHistory.add({
-        'role': 'assistant',
-        'content': assistantMessage,
-      });
-
-      return assistantMessage;
-    } catch (e) {
-      if (e is Exception) rethrow;
-      throw Exception('Network error: $e');
-    }
+    addHistoryMessage('user', message);
+    final result = await _complete([
+      if (_useSystemPrompt)
+        {'role': 'system', 'content': isAgentMode ? _systemPrompt : _chatSystemPrompt},
+      ..._conversationHistory,
+    ]);
+    addHistoryMessage('assistant', result.content);
+    return result.content;
   }
 
   /// Interpret a raw tool result and turn it into a natural language response.
@@ -358,7 +277,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     required String toolResult,
   }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+      throw const RemoteProviderException(RemoteErrorKind.authentication);
     }
 
     final prompt = '''
@@ -381,8 +300,7 @@ Rules:
 - If the operation failed, clearly explain what went wrong.
 ''';
 
-    try {
-      final messages = [
+    final messages = [
         {
           'role': 'system',
           'content':
@@ -396,313 +314,56 @@ Rules:
         },
       ];
 
-      String requestUrl = _baseUrl;
-      if (!requestUrl.endsWith('/chat/completions')) {
-        if (requestUrl.endsWith('/')) {
-          requestUrl = '${requestUrl}chat/completions';
-        } else {
-          requestUrl = '$requestUrl/chat/completions';
-        }
-      }
-
-      final response = await http
-          .post(
-            Uri.parse(requestUrl),
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer $_apiKey',
-              'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-              'X-Title': 'PrivateAgent',
-            },
-            body: jsonEncode({
-              'model': _model,
-              'messages': messages,
-              'temperature': _temperature,
-              'max_tokens': _effectiveMaxTokens,
-            }),
-          )
-          .timeout(const Duration(minutes: 30));
-
-      if (response.statusCode != 200) {
-        throw Exception(
-          'API error (${response.statusCode}): ${response.body}',
-        );
-      }
-
-      final data = jsonDecode(response.body);
-
-      if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
-        throw Exception('Unexpected API response format: $data');
-      }
-
-      String answer =
-          data['choices'][0]['message']['content'] as String;
-
-      answer = answer
-          .replaceAll(
-            RegExp(r'<think>.*?</think>', dotAll: true),
-            '',
-          )
-          .trim();
-
-      if (answer.isEmpty) {
-        throw Exception('AI returned an empty interpretation.');
-      }
-
-      return answer;
-    } catch (e) {
-      if (e is Exception) rethrow;
-      throw Exception('Network error: $e');
-    }
+    return (await _complete(messages)).content;
   }
 
-  /// Send a message and stream the response chunk-by-chunk.
+  /// Uses SSE transport, buffering before emission so fragmented reasoning
+  /// delimiters can never be exposed to the UI.
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
   }) async* {
     if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+      throw const RemoteProviderException(RemoteErrorKind.authentication);
     }
 
-    _conversationHistory.add({'role': 'user', 'content': message});
-
-    if (_conversationHistory.length > 20) {
-      _conversationHistory.removeRange(0, _conversationHistory.length - 20);
-    }
-
-    try {
-      final systemPrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
-      final messages = [
-        if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-        ..._conversationHistory,
-      ];
-
-      String requestUrl = _baseUrl;
-      if (requestUrl.endsWith('/chat/completions')) {
-        requestUrl = requestUrl;
-      } else {
-        if (requestUrl.endsWith('/')) {
-          requestUrl = '${requestUrl}chat/completions';
-        } else {
-          requestUrl = '$requestUrl/chat/completions';
-        }
-      }
-
-      final client = http.Client();
-      final request = http.Request('POST', Uri.parse(requestUrl));
-      request.headers.addAll({
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $_apiKey',
-        'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-        'X-Title': 'PrivateAgent',
-      });
-
-      request.body = jsonEncode({
-        'model': _model,
-        'messages': messages,
-        'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
-        'stream': true,
-      });
-
-      final response = await client
-          .send(request)
-          .timeout(const Duration(minutes: 30));
-
-      if (response.statusCode != 200) {
-        final body = await response.stream.bytesToString();
-        String errorMessage = body;
-        try {
-          final decoded = jsonDecode(body);
-          if (decoded is Map<String, dynamic>) {
-            if (decoded['error'] is Map<String, dynamic>) {
-              errorMessage = decoded['error']['message']?.toString() ?? body;
-            } else if (decoded['error'] is String) {
-              errorMessage = decoded['error'];
-            }
-          }
-        } catch (_) {}
-        client.close();
-        throw Exception('API error (${response.statusCode}): $errorMessage');
-      }
-
-      final accumulatedContent = StringBuffer();
-      bool inThinkBlock = false;
-
-      // Listen to response stream
-      final lineStream = response.stream
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
-
-      await for (final line in lineStream) {
-        final trimmedLine = line.trim();
-        if (trimmedLine.isEmpty) continue;
-        if (trimmedLine.startsWith('data:')) {
-          final dataStr = trimmedLine.substring(5).trim();
-          if (dataStr == '[DONE]') break;
-          try {
-            final json = jsonDecode(dataStr);
-            if (json is Map && json['choices'] is List) {
-              final choices = json['choices'] as List;
-              if (choices.isNotEmpty) {
-                final choice = choices[0];
-                if (choice is! Map) continue;
-                final rawDelta = choice['delta'];
-                final delta = rawDelta is Map ? rawDelta : const {};
-                final rawContent = delta['content'];
-                if (rawContent is String && rawContent.isNotEmpty) {
-                  final content = rawContent;
-                  accumulatedContent.write(content);
-
-                  // Handle <think> block stripping on the fly for better stream styling
-                  if (content.contains('<think>')) {
-                    inThinkBlock = true;
-                    // If there is text before <think>, yield it
-                    final parts = content.split('<think>');
-                    if (parts[0].isNotEmpty) {
-                      yield parts[0];
-                    }
-                  } else if (content.contains('</think>')) {
-                    inThinkBlock = false;
-                    // If there is text after </think>, yield it
-                    final parts = content.split('</think>');
-                    if (parts.length > 1 && parts[1].isNotEmpty) {
-                      yield parts[1];
-                    }
-                  } else if (!inThinkBlock) {
-                    yield content;
-                  }
-                }
-                if (choice['finish_reason'] != null) break;
-              }
-            }
-          } catch (_) {
-            // Ignore incomplete chunks
-          }
-        }
-      }
-
-      client.close();
-
-      // Clean up final accumulated response and add to history
-      String finalResponse = accumulatedContent.toString().trim();
-      finalResponse = finalResponse
-          .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-          .trim();
-
-      if (finalResponse.isEmpty) {
-        throw Exception(
-          'The model finished without a visible answer. Increase Max Tokens '
-          'or try another NVIDIA model.',
-        );
-      }
-      _conversationHistory.add({'role': 'assistant', 'content': finalResponse});
-    } catch (e) {
-      if (e is Exception) rethrow;
-      throw Exception('Network error: $e');
-    }
+    addHistoryMessage('user', message);
+    final result = await _complete([
+      if (_useSystemPrompt)
+        {'role': 'system', 'content': isAgentMode ? _systemPrompt : _chatSystemPrompt},
+      ..._conversationHistory,
+    ], stream: true);
+    addHistoryMessage('assistant', result.content);
+    yield result.content;
   }
 
-  /// Send a task execution message � no conversation history, low temperature, limited tokens.
-  /// This is much faster and cheaper than sendMessage.
-  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt) async {
+  /// Task completion without conversation history. Explicit token budgets take
+  /// precedence over provider-specific defaults.
+  Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt, {
+    RemoteCancellationToken? cancellationToken,
+    int? maxOutputTokens,
+  }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
-      throw Exception('API Key is not configured. Please go to Settings.');
+      throw const RemoteProviderException(RemoteErrorKind.authentication);
     }
 
-    int maxRetries = 4;
-    int currentTry = 0;
-
-    while (true) {
-      try {
-        currentTry++;
-        final messages = [
-          if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
-          {'role': 'user', 'content': prompt},
-        ];
-
-        String requestUrl = _baseUrl;
-        if (!requestUrl.endsWith('/chat/completions')) {
-          if (requestUrl.endsWith('/')) {
-            requestUrl = '${requestUrl}chat/completions';
-          } else {
-            requestUrl = '$requestUrl/chat/completions';
-          }
-        }
-
-        final response = await http
-            .post(
-              Uri.parse(requestUrl),
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer $_apiKey',
-                'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
-                'X-Title': 'PrivateAgent',
-              },
-              body: jsonEncode({
-                'model': _model,
-                'messages': messages,
-                'temperature': _temperature,
-                'max_tokens': _effectiveMaxTokens,
-              }),
-            )
-            .timeout(const Duration(minutes: 30));
-
-        if (response.statusCode != 200) {
-          String errorMessage = response.body;
-          try {
-            final decoded = jsonDecode(response.body);
-            if (decoded is Map<String, dynamic>) {
-              if (decoded['error'] is Map<String, dynamic>) {
-                errorMessage = decoded['error']['message'] ?? response.body;
-              } else if (decoded['error'] is String) {
-                errorMessage = decoded['error'];
-              }
-            }
-          } catch (_) {
-            // ignore parsing errors, use raw body
-          }
-          throw Exception('API error (${response.statusCode}): $errorMessage');
-        }
-
-        final data = jsonDecode(response.body);
-        if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
-          throw Exception('Unexpected API response format: $data');
-        }
-        String content = data['choices'][0]['message']['content'] as String;
-
-        // Strip <think> blocks commonly produced by reasoning models
-        content = content
-            .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
-            .trim();
-
-        if (content.trim().isEmpty) {
-          throw Exception(
-            'API returned an empty response. This may be due to strict rate limits or safety filters.',
-          );
-        }
-
-        int tokens = 0;
-        if (data.containsKey('usage') &&
-            data['usage']['total_tokens'] != null) {
-          tokens = data['usage']['total_tokens'] as int;
-        }
-        return AiResponse(content, tokens);
-      } catch (e) {
-        if (currentTry > maxRetries) {
-          if (e is Exception) rethrow;
-          throw Exception('Network error after $maxRetries retries: $e');
-        }
-        int delaySeconds = 3 * currentTry;
-        developer.log(
-          'API call failed ($e), retrying $currentTry/$maxRetries in $delaySeconds seconds...',
-          name: 'PrivateAgent',
-        );
-        await Future.delayed(Duration(seconds: delaySeconds));
-      }
-    }
+    final result = await _complete([
+      if (_useSystemPrompt) {'role': 'system', 'content': systemPrompt},
+      {'role': 'user', 'content': prompt},
+    ], cancellationToken: cancellationToken, maxOutputTokens: maxOutputTokens);
+    return AiResponse(result.content, result.totalTokens);
   }
+
+  Future<RemoteCompletion> _complete(List<Map<String, String>> messages, {
+    RemoteCancellationToken? cancellationToken,
+    int? maxOutputTokens,
+    bool stream = false,
+  }) => _remote.complete(
+    baseUrl: _baseUrl, apiKey: _apiKey ?? '', model: _model,
+    messages: messages, temperature: _temperature,
+    maxOutputTokens: maxOutputTokens ?? _effectiveMaxTokens,
+    cancellationToken: cancellationToken, stream: stream,
+  );
 
   /// Parse the AI response to check if it's an action or plain text
   AgentAction? parseAction(String response) {
@@ -753,40 +414,7 @@ Rules:
     String baseUrl,
     String apiKey,
   ) async {
-    try {
-      String cleanBaseUrl = baseUrl;
-      // Many providers host it at /models, but some require the base URL without /chat/completions logic
-      if (cleanBaseUrl.endsWith('/chat/completions')) {
-        cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
-      }
-
-      final response = await http.get(
-        Uri.parse('$cleanBaseUrl/models'),
-        headers: {'Authorization': 'Bearer $apiKey'},
-      );
-
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        List<String> models;
-        if (data is Map && data.containsKey('data')) {
-          final modelsList = data['data'] as List;
-          models = modelsList.map((m) => m['id'].toString()).toList();
-        } else if (data is List) {
-          models = data.map((m) => m['id'].toString()).toList();
-        } else {
-          return [];
-        }
-
-        if (isNvidiaBaseUrl(cleanBaseUrl)) {
-          return filterNvidiaFreeModels(models);
-        }
-        models.sort();
-        return models;
-      }
-      return [];
-    } catch (e) {
-      print('Error fetching models: $e');
-      return [];
-    }
+    final models = await _remote.discover(baseUrl, apiKey);
+    return isNvidiaBaseUrl(baseUrl) ? filterNvidiaFreeModels(models) : models;
   }
 }
