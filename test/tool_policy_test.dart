@@ -42,7 +42,6 @@ void main() {
       'resume_task_id': 'a',
       'question': 'a',
       'blocker_type': 'sign_in',
-      'evidence': 'Sign in',
       'attempted_strategies': ['open_app'],
       'remaining_strategies': <String>[],
       'subtasks': [
@@ -58,7 +57,10 @@ void main() {
     for (final definition in ToolRegistry.definitions) {
       final params = {
         for (final key in definition.schema.keys)
-          if (key != 'headers') key: values[key],
+          if (key != 'headers')
+            key: key == 'evidence' && definition.name == 'ask_user'
+                ? 'Sign in to continue'
+                : values[key],
       };
       for (final name in [definition.name, ...definition.aliases]) {
         final call = registry.validate(' ${name.toUpperCase()} ', params);

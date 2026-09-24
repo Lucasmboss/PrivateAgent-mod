@@ -34,14 +34,18 @@ class _NoopNotificationService extends NotificationService {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('router denies aliases and ignores keyword-based delete consent', () async {
+  test('explicit host veto blocks direct action dispatch', () async {
     final handler = ActionHandler();
     for (final action in [
       AgentAction(action: 'click_element', params: {'text': 'Send'}, response: ''),
       AgentAction(action: 'delete_file', params: {'path': 'notes'}, response: ''),
       AgentAction(action: 'run_adb_command', params: {'command': 'echo approved'}, response: ''),
     ]) {
-      final result = await handler.execute(action, userRequest: 'yes approved delete remove');
+      final result = await handler.execute(
+        action,
+        userRequest: 'yes approved delete remove',
+        onApproval: (_) async => false,
+      );
       expect(result.success, isFalse);
       expect(result.details, contains('denied'));
     }
@@ -102,9 +106,12 @@ void main() {
           taskStore: store, onApproval: approve, maxTaskTokens: tokens,
           maxTaskDuration: duration);
 
-    test('denied alias never creates success evidence or action checkpoint', () async {
-      final engine = executor(_Planner((_, __) async =>
-          AiResponse('{"action":"click_element","params":{"text":"Send"}}', 1)));
+    test('explicit host veto never creates success evidence or action checkpoint', () async {
+      final engine = executor(
+        _Planner((_, __) async =>
+            AiResponse('{"action":"click_element","params":{"text":"Send"}}', 1)),
+        approve: (_) async => false,
+      );
       expect(await engine.executeTask('Send it'), contains('denied'));
       final record = (await store.list()).single;
       expect(record.status, TaskStatus.needsRevision);
