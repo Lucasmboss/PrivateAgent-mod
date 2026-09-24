@@ -34,8 +34,7 @@ class TaskExecutor {
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
 
-  final NotificationService _notificationService =
-      NotificationService();
+  final NotificationService _notificationService;
 
   final SkillMemoryService _skillMemory =
       SkillMemoryService();
@@ -80,7 +79,9 @@ class TaskExecutor {
     this.maxTaskTokens = 100000,
     this.maxTaskDuration = const Duration(minutes: 30),
     TaskStore? taskStore,
+    NotificationService? notificationService,
   })  : _aiService = aiService,
+        _notificationService = notificationService ?? NotificationService(),
         _taskStore = taskStore ?? TaskStore(),
         _screenService = screenService,
         _appLauncher = appLauncher,

@@ -8,6 +8,7 @@ import 'package:private_agent/models/task_record.dart';
 import 'package:private_agent/services/action_handler.dart';
 import 'package:private_agent/services/ai_service.dart';
 import 'package:private_agent/services/app_launcher_service.dart';
+import 'package:private_agent/services/notification_service.dart';
 import 'package:private_agent/services/screen_automation_service.dart';
 import 'package:private_agent/services/shizuku_service.dart';
 import 'package:private_agent/services/task_executor.dart';
@@ -23,6 +24,11 @@ class _Planner extends AiService {
   Future<AiResponse> sendTaskMessage(String systemPrompt, String prompt, {
     RemoteCancellationToken? cancellationToken, int? maxOutputTokens,
   }) => answer(cancellationToken, maxOutputTokens);
+}
+
+class _NoopNotificationService extends NotificationService {
+  @override
+  Future<void> showTaskCompleteNotification(String title, String body) async {}
 }
 
 void main() {
@@ -65,10 +71,7 @@ void main() {
   group('checkpointed executor gates', () {
     late Directory directory;
     late TaskStore store;
-    // Cancellation persists task history and shows an Android notification.
-    const notificationsChannel = MethodChannel(
-      'dexterous.com/flutter/local_notifications',
-    );
+    // Task history uses path_provider; keep its writes inside the test folder.
     const pathProviderChannel = MethodChannel(
       'plugins.flutter.io/path_provider',
     );
@@ -77,17 +80,6 @@ void main() {
       directory = await Directory.systemTemp.createTemp('router-security-');
       store = TaskStore(directory: directory);
       SharedPreferences.setMockInitialValues({});
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(notificationsChannel, (call) async {
-            switch (call.method) {
-              case 'initialize':
-                return true;
-              case 'show':
-                return null;
-              default:
-                return true;
-            }
-          });
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(pathProviderChannel, (call) async {
             if (call.method == 'getApplicationDocumentsDirectory') {
@@ -98,8 +90,6 @@ void main() {
     });
     tearDown(() async {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(notificationsChannel, null);
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(pathProviderChannel, null);
       await directory.delete(recursive: true);
     });
@@ -108,6 +98,7 @@ void main() {
         int tokens = 100, Duration duration = const Duration(minutes: 1)}) =>
         TaskExecutor(aiService: ai, screenService: ScreenAutomationService(),
           appLauncher: AppLauncherService(), shizukuService: ShizukuService(),
+          notificationService: _NoopNotificationService(),
           taskStore: store, onApproval: approve, maxTaskTokens: tokens,
           maxTaskDuration: duration);
 
