@@ -208,6 +208,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
 
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _voiceOutputEnabled =
           prefs.getBool(VoiceService.speechOutputPreferenceKey) ?? false;
