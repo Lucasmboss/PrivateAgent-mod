@@ -43,7 +43,8 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Clear Task History'),
-        content: const Text('Are you sure you want to delete all task history?'),
+        content: const Text(
+            'Delete all task history, including saved progress and resumable tasks?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -59,6 +60,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
 
     if (confirm == true) {
       await TaskHistoryLogger.clearHistory();
+      await _taskStore.clear();
       _loadHistory();
     }
   }
@@ -97,7 +99,10 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.delete),
-            onPressed: _history.isEmpty ? null : _clearHistory,
+            onPressed: (_history.isEmpty && _records.isEmpty) ||
+                    _records.any((record) => record.status == TaskStatus.running)
+                ? null
+                : _clearHistory,
           ),
         ],
       ),
@@ -281,6 +286,45 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
     }
   }
 
+  Future<void> _reviseAndResume(TaskRecord record) async {
+    final controller = TextEditingController(text: record.goal);
+    try {
+      final revisedGoal = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Resume task'),
+          content: TextField(
+            controller: controller,
+            maxLines: 4,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Objective and updated instructions',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final goal = controller.text.trim();
+                if (goal.isNotEmpty) Navigator.pop(context, goal);
+              },
+              child: const Text('Continue'),
+            ),
+          ],
+        ),
+      );
+      if (revisedGoal != null && mounted) {
+        Navigator.pop(context, record.copyWith(goal: revisedGoal));
+      }
+    } finally {
+      controller.dispose();
+    }
+  }
+
   String _recordDate(DateTime value) =>
       DateFormat('MMM d, y h:mm a').format(value);
 
@@ -325,7 +369,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
         ),
         trailing: resumable
             ? TextButton(
-                onPressed: () => Navigator.pop(context, record),
+                onPressed: () => _reviseAndResume(record),
                 child: const Text('Resume'),
               )
             : null,
