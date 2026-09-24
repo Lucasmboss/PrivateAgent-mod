@@ -49,6 +49,7 @@ class TaskExecutor {
   final FileService _files = FileService();
   final TaskStore _taskStore = TaskStore();
   String? _activeTaskId;
+  TaskStatus? lastStatus;
 
   final WebSearchService _webSearchService =
     WebSearchService();
@@ -366,6 +367,7 @@ GENERAL RULES:
     _cancelled = false;
     _paused = false;
     _cancelCompleter = null;
+    lastStatus = null;
     final previousTask =
         resumeTaskId == null ? null : await _taskStore.get(resumeTaskId);
     final task = previousTask == null
@@ -2126,6 +2128,7 @@ Remember:
             ? results
             : results.sublist(results.length - 20),
         failedStrategies: failedStrategies);
+    lastStatus = status;
     _activeTaskId = null;
   }
 
@@ -2135,6 +2138,7 @@ Remember:
     await _taskStore.update(id,
         status: TaskStatus.failed,
         results: ['Task stopped unexpectedly: $error']);
+    lastStatus = TaskStatus.failed;
     _activeTaskId = null;
   }
 
