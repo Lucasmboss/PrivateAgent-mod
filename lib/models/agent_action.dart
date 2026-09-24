@@ -29,6 +29,11 @@ class AgentAction {
     'read_screen',
     'run_adb_command',
     'web_request',
+    'list_files',
+    'read_file',
+    'write_file',
+    'delete_file',
+    'execute_task',
     'general_query',
   ];
 }
