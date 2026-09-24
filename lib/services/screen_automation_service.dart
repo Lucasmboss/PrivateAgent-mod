@@ -94,7 +94,6 @@ class ScreenAutomationService {
     }
     buffer.writeln('Screen elements:');
 
-    int count = 0;
     // Limit removed as requested by user. Kotlin now filters invisibles, so this is safe.
 
     for (final node in nodes) {
@@ -134,7 +133,6 @@ class ScreenAutomationService {
       }
 
       buffer.writeln('  [$index] $type $label $tagStr$boundsStr');
-      count++;
     }
 
     return buffer.toString();
