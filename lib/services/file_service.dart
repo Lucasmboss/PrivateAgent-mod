@@ -55,7 +55,7 @@ class FileService {
   Future<Directory> _root() async => _directoryProvider();
 
   /// Lists files in the private directory. Returned paths use `/` separators.
-  Future<List<String>> listFiles({bool recursive = false}) async {
+  Future<List<String>> listFiles({bool recursive = true}) async {
     final root = await _root();
     if (!await root.exists()) return <String>[];
 
