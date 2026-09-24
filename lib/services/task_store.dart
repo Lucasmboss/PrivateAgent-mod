@@ -10,7 +10,7 @@ class TaskStore {
   final Directory? directory;
   final Future<Directory> Function()? directoryProvider;
   final String fileName;
-  Future<void> _queue = Future.value();
+  static Future<void> _queue = Future.value();
 
   TaskStore({
     this.directory,
@@ -31,6 +31,27 @@ class TaskStore {
     _queue = result.then<void>((_) {}, onError: (_, __) {});
     return result;
   }
+
+  /// Atomically claims a saved task so it cannot be resumed twice.
+  Future<TaskRecord> claim(String identifier, String goal) =>
+      _serialized(() async {
+        final records = await _read();
+        final index = records.indexWhere((record) => record.identifier == identifier);
+        if (index < 0 ||
+            records[index].status == TaskStatus.running ||
+            records[index].status == TaskStatus.completed) {
+          throw StateError('Task is missing or cannot be resumed');
+        }
+        final current = records[index];
+        final claimed = current.copyWith(
+          goal: goal,
+          status: TaskStatus.running,
+          updatedAt: DateTime.now(),
+        );
+        records[index] = claimed;
+        await _write(records);
+        return claimed;
+      });
 
   Future<List<TaskRecord>> _read() async {
     final file = await _file();
