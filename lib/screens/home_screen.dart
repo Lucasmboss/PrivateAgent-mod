@@ -20,6 +20,7 @@ import '../services/chat_history_service.dart';
 import '../services/notification_service.dart';
 import 'settings_screen.dart';
 import 'task_history_screen.dart';
+import '../widgets/assistant_quick_panel.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
 import '../config/feature_flags.dart';
@@ -43,6 +44,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isListening = false;
+  bool _isAssistantCompact = false;
+  bool _isAssistantPressHeld = false;
+  String _assistantTranscript = '';
+  String? _assistantVoiceError;
   bool _servicesReady = false;
   bool _assistantInvocationQueued = false;
   bool _isTaskExecutorActive = false;
@@ -53,6 +58,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _taskStateLabel = 'Thinking...';
   int _approvalGeneration = 0;
   BuildContext? _approvalDialogContext;
+  BuildContext? _userQuestionDialogContext;
+  bool _voiceOutputEnabled = false;
+  VoicePlaybackState _voicePlaybackState = VoicePlaybackState.idle;
+  StreamSubscription<VoicePlaybackState>? _voicePlaybackSubscription;
+  static const Duration _userQuestionTimeout = Duration(seconds: 90);
 
   void _stopActiveTask({required bool pause}) {
     if (_stopRequested) return;
@@ -67,6 +77,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _actionHandler.cancelTask();
     }
     _dismissApproval();
+    _dismissUserQuestion();
     if (mounted) {
       setState(() {
         _taskStateLabel = canPause
@@ -84,6 +95,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final dialog = _approvalDialogContext;
     _approvalDialogContext = null;
     if (dialog != null && dialog.mounted) Navigator.of(dialog).pop(false);
+  }
+
+  void _dismissUserQuestion() {
+    final dialog = _userQuestionDialogContext;
+    _userQuestionDialogContext = null;
+    if (dialog != null && dialog.mounted) Navigator.of(dialog).pop();
   }
 
   Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
@@ -111,9 +128,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: const Text('Deny'),
             ),
             TextButton(
-              onPressed: () => _stopActiveTask(
-                pause: _isTaskExecutorActive,
-              ),
+              onPressed: () => _stopActiveTask(pause: _isTaskExecutorActive),
               child: Text(
                 _isTaskExecutorActive ? 'Pause task' : 'Stop request',
               ),
@@ -142,6 +157,89 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return allowed;
   }
 
+  Future<String?> _requestTaskUserAnswer(String question) async {
+    if (!mounted || _appLifecycleState != AppLifecycleState.resumed)
+      return null;
+    final controller = TextEditingController();
+    Timer? timeout;
+    setState(() => _taskStateLabel = 'Waiting for your reply');
+    try {
+      return await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          _userQuestionDialogContext = dialogContext;
+          timeout ??= Timer(_userQuestionTimeout, _dismissUserQuestion);
+          return StatefulBuilder(
+            builder: (context, setDialogState) => AlertDialog(
+              title: const Text('I need your input'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(question),
+                    const SizedBox(height: 14),
+                    TextField(
+                      controller: controller,
+                      autofocus: true,
+                      minLines: 1,
+                      maxLines: 4,
+                      textInputAction: TextInputAction.done,
+                      decoration: const InputDecoration(
+                        labelText: 'Your reply',
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (_) => setDialogState(() {}),
+                      onSubmitted: (value) {
+                        final reply = value.trim();
+                        if (reply.isNotEmpty) {
+                          Navigator.of(dialogContext).pop(reply);
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      'Reply within 90 seconds. Do not enter passwords, '
+                      'tokens, or verification codes here. If sign-in is '
+                      'needed, complete it directly in the relevant app or page.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Use safe fallback'),
+                ),
+                TextButton(
+                  onPressed: () => _stopActiveTask(pause: true),
+                  child: const Text('Pause task'),
+                ),
+                FilledButton(
+                  onPressed: controller.text.trim().isEmpty
+                      ? null
+                      : () => Navigator.of(
+                          dialogContext,
+                        ).pop(controller.text.trim()),
+                  child: const Text('Reply'),
+                ),
+              ],
+            ),
+          );
+        },
+      );
+    } finally {
+      timeout?.cancel();
+      _userQuestionDialogContext = null;
+      controller.dispose();
+      if (mounted && !_stopRequested) {
+        setState(() => _taskStateLabel = 'Continuing task...');
+      }
+    }
+  }
+
   // Custom switch state: 'chat' or 'agent'. Agent is the safe product default.
   String _mode = 'agent';
 
@@ -157,9 +255,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _telegramService = TelegramService(_actionHandler, _aiService);
+    _voicePlaybackSubscription = _voiceService.playbackEvents.listen((state) {
+      if (mounted) setState(() => _voicePlaybackState = state);
+    });
     _assistantInvocationSubscription = AssistantPlatformService
         .assistantInvocations
-        .listen((_) {
+        .listen((event) {
+          if (event is Map && event['type'] == 'openApp') {
+            unawaited(_expandAssistant());
+            return;
+          }
           unawaited(_handleAssistantInvocation());
         });
     _initServices();
@@ -180,6 +285,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
 
     final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _voiceOutputEnabled =
+          prefs.getBool(VoiceService.speechOutputPreferenceKey) ?? false;
+    });
     final assistantInvocation =
         await AssistantPlatformService.consumeAssistantInvocation();
     final shouldActivateAssistant =
@@ -192,9 +301,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final savedMode = prefs.getString('interaction_mode');
-    if (savedMode == 'chat' || savedMode == 'agent') {
-      setState(() => _mode = savedMode!);
-    }
+    setState(() {
+      if (savedMode == 'chat' || savedMode == 'agent') _mode = savedMode!;
+    });
   }
 
   Future<void> _handleAssistantInvocation() async {
@@ -211,14 +320,99 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('interaction_mode', 'agent');
-    if (mounted) setState(() => _mode = 'agent');
+    if (!mounted) return;
+    setState(() {
+      _mode = 'agent';
+      _isAssistantCompact = true;
+      _assistantTranscript = '';
+      _assistantVoiceError = null;
+    });
+    await AssistantPlatformService.setAssistantOverlayExpanded(false);
+  }
 
-    // Android's default-assistant entry point opens the audited Agent UI and
-    // starts the same native Google voice path as the microphone button.
-    await Future<void>.delayed(const Duration(milliseconds: 350));
-    if (mounted && !_isLoading && !_isListening) {
-      await _toggleVoice();
+  String get _latestAssistantResponse {
+    for (var index = _messages.length - 1; index >= 0; index--) {
+      final message = _messages[index];
+      if (!message.isUser &&
+          message.content.trim().isNotEmpty &&
+          !message.content.trimLeft().startsWith('⏳')) {
+        return message.content.trim();
+      }
     }
+    return '';
+  }
+
+  int get _latestFinalAssistantIndex {
+    for (var index = _messages.length - 1; index >= 0; index--) {
+      final message = _messages[index];
+      if (!message.isUser &&
+          message.content.trim().isNotEmpty &&
+          !message.content.trimLeft().startsWith('⏳')) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  Future<void> _startAssistantPushToTalk() async {
+    if (!mounted || !_isAssistantCompact || _isLoading || _isListening) return;
+    setState(() {
+      _isListening = true;
+      _isAssistantPressHeld = true;
+      _assistantTranscript = '';
+      _assistantVoiceError = null;
+    });
+
+    final started = await _voiceService.startListening(
+      holdToTalk: true,
+      onPartialResult: (transcript) {
+        if (!mounted) return;
+        setState(() => _assistantTranscript = transcript);
+      },
+      onResult: (text) {
+        if (!mounted || text.trim().isEmpty) return;
+        setState(() => _assistantTranscript = text.trim());
+        unawaited(_sendMessage(text));
+      },
+      onDone: () {
+        if (!mounted) return;
+        setState(() {
+          _isListening = false;
+          _isAssistantPressHeld = false;
+        });
+      },
+      onError: (message) {
+        if (!mounted) return;
+        setState(() => _assistantVoiceError = message);
+      },
+    );
+
+    if (!started && mounted) {
+      setState(() {
+        _isListening = false;
+        _isAssistantPressHeld = false;
+      });
+    }
+  }
+
+  void _releaseAssistantPushToTalk() {
+    if (!_isAssistantPressHeld) return;
+    setState(() => _isAssistantPressHeld = false);
+    unawaited(_voiceService.stopPushToTalk());
+  }
+
+  Future<void> _expandAssistant() async {
+    if (!_isAssistantCompact) return;
+    await AssistantPlatformService.setAssistantOverlayExpanded(true);
+    if (!mounted) return;
+    setState(() => _isAssistantCompact = false);
+  }
+
+  Future<void> _dismissAssistant() async {
+    if (_isAssistantPressHeld) {
+      await _voiceService.stopPushToTalk();
+    }
+    await AssistantPlatformService.dismissAssistant();
   }
 
   Future<void> _saveSession() async {
@@ -245,10 +439,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await ChatHistoryService.saveSession(session);
   }
 
-  Future<void> _sendMessage(
-    String text, {
-    bool speakActionResponse = false,
-  }) async {
+  Future<void> _sendMessage(String text) async {
     if (!mounted || _isLoading || text.trim().isEmpty) return;
     final generation = _approvalGeneration;
     final responseCancellation = RemoteCancellationToken();
@@ -354,6 +545,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           action,
           aiService: _aiService,
           onApproval: _requestToolApproval,
+          onUserQuestion: _requestTaskUserAnswer,
           userRequest: text.trim(),
           onProgress: (msg) {
             if (msg.contains('budget exhausted') ||
@@ -424,7 +616,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           );
         });
         _sendOverlayEvent('OVERLAY_TASK_FINISHED', finalResponse);
-        if (speakActionResponse) {
+        if (_voiceOutputEnabled) {
           unawaited(_speakVoiceResponse(finalResponse));
         }
         if (action.action != 'execute_task') {
@@ -435,8 +627,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
         await _saveSession();
       } else {
-        // Plain text response, we already rendered it, just speak it
-        unawaited(_speakVoiceResponse(accumulated));
+        if (_voiceOutputEnabled) {
+          unawaited(_speakVoiceResponse(accumulated));
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -451,7 +644,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _messages.add(
               ChatMessage(
                 role: 'assistant',
-                content: 'Error: ${e.toString().replaceFirst('Exception: ', '')}',
+                content:
+                    'Error: ${e.toString().replaceFirst('Exception: ', '')}',
               ),
             );
           });
@@ -492,6 +686,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         aiService: _aiService,
         onApproval: _requestToolApproval,
+        onUserQuestion: _requestTaskUserAnswer,
         onProgress: (message) {
           if (message.contains('budget exhausted') ||
               message.startsWith('Task paused') ||
@@ -500,20 +695,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _dismissApproval();
           }
           if (mounted) {
-            setState(
-              () {
-                if (message.startsWith('Task paused')) {
-                  _taskStateLabel = 'Paused';
-                } else if (message.startsWith('Task cancelled')) {
-                  _taskStateLabel = 'Cancelled';
-                } else if (!_stopRequested) {
-                  _taskStateLabel = message;
-                }
-                _messages.add(
-                  ChatMessage(role: 'assistant', content: '⏳ $message'),
-                );
-              },
-            );
+            setState(() {
+              if (message.startsWith('Task paused')) {
+                _taskStateLabel = 'Paused';
+              } else if (message.startsWith('Task cancelled')) {
+                _taskStateLabel = 'Cancelled';
+              } else if (!_stopRequested) {
+                _taskStateLabel = message;
+              }
+              _messages.add(
+                ChatMessage(role: 'assistant', content: '⏳ $message'),
+              );
+            });
             _scrollToBottom();
           }
         },
@@ -530,6 +723,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         );
         await _saveSession();
+        if (_voiceOutputEnabled) {
+          unawaited(_speakVoiceResponse(result.details ?? 'Task stopped.'));
+        }
       }
     } finally {
       if (mounted) {
@@ -611,15 +807,79 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _speakVoiceResponse(String text) async {
+    if (!_voiceOutputEnabled || text.trim().isEmpty) return;
     try {
       await _voiceService.speak(text);
     } catch (error) {
       developer.log('Voice output failed: $error', name: 'PrivateAgent');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Voice output could not be played.')),
+        const SnackBar(content: Text('Google Text-to-Speech is unavailable.')),
       );
     }
+  }
+
+  Future<void> _toggleFinalSpeech() async {
+    try {
+      switch (_voicePlaybackState) {
+        case VoicePlaybackState.speaking:
+          await _voiceService.pauseSpeaking();
+          break;
+        case VoicePlaybackState.paused:
+          await _voiceService.resumeSpeaking();
+          break;
+        case VoicePlaybackState.idle:
+          await _speakVoiceResponse(_latestAssistantResponse);
+          break;
+      }
+    } catch (error) {
+      developer.log(
+        'Voice playback control failed: $error',
+        name: 'PrivateAgent',
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Google Text-to-Speech is unavailable.'),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _stopFinalSpeech() => _voiceService.stopSpeaking();
+
+  void _handleVoiceOutputSettingChanged(bool enabled) {
+    if (!mounted) return;
+    setState(() => _voiceOutputEnabled = enabled);
+    if (!enabled) unawaited(_voiceService.stopSpeaking());
+  }
+
+  Future<void> _reloadVoiceOutputPreference() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final enabled =
+        prefs.getBool(VoiceService.speechOutputPreferenceKey) ?? false;
+    setState(() => _voiceOutputEnabled = enabled);
+    if (!enabled) await _voiceService.stopSpeaking();
+  }
+
+  Future<void> _openSettingsScreen() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SettingsScreen(
+          aiService: _aiService,
+          shizukuService: _actionHandler.shizuku,
+          screenAutomationService: _actionHandler.screenAutomation,
+          telegramService: _telegramService,
+          onVoiceOutputChanged: _handleVoiceOutputSettingChanged,
+        ),
+      ),
+    );
+    await _actionHandler.shizuku.checkAvailability();
+    await _reloadVoiceOutputPreference();
+    if (mounted) setState(() {});
   }
 
   Future<void> _toggleVoice() async {
@@ -633,7 +893,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final started = await _voiceService.startListening(
       onResult: (text) {
-        unawaited(_sendMessage(text, speakActionResponse: true));
+        unawaited(_sendMessage(text));
       },
       onDone: () {
         if (mounted) {
@@ -687,6 +947,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _overlayHistoryTimer?.cancel();
     _assistantInvocationSubscription?.cancel();
+    _voicePlaybackSubscription?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _voiceService.dispose();
@@ -818,6 +1079,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
+    if (_isAssistantCompact) {
+      return Scaffold(
+        backgroundColor: Colors.transparent,
+        body: SafeArea(
+          top: false,
+          child: AssistantQuickPanel(
+            isDark: isDark,
+            isListening: _isListening,
+            isPressed: _isAssistantPressHeld,
+            isLoading: _isLoading,
+            transcript: _assistantTranscript,
+            response: _latestAssistantResponse,
+            error: _assistantVoiceError,
+            onHoldStart: () => unawaited(_startAssistantPushToTalk()),
+            onHoldEnd: _releaseAssistantPushToTalk,
+            onExpand: () => unawaited(_expandAssistant()),
+            onDismiss: () => unawaited(_dismissAssistant()),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: isDark
           ? const Color(0xFF0C0A15)
@@ -866,21 +1149,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           // Settings Action
           IconButton(
             icon: const Icon(Icons.settings_rounded),
-            onPressed: () async {
-              await Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(
-                    aiService: _aiService,
-                    shizukuService: _actionHandler.shizuku,
-                    screenAutomationService: _actionHandler.screenAutomation,
-                    telegramService: _telegramService,
-                  ),
-                ),
-              );
-              await _actionHandler.shizuku.checkAvailability();
-              if (mounted) setState(() {});
-            },
+            onPressed: () => unawaited(_openSettingsScreen()),
           ),
         ],
       ),
@@ -937,21 +1206,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                       TextButton(
-                        onPressed: () async {
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => SettingsScreen(
-                                aiService: _aiService,
-                                shizukuService: _actionHandler.shizuku,
-                                screenAutomationService:
-                                    _actionHandler.screenAutomation,
-                                telegramService: _telegramService,
-                              ),
-                            ),
-                          );
-                          if (mounted) setState(() {});
-                        },
+                        onPressed: () => unawaited(_openSettingsScreen()),
                         child: const Text('Configure'),
                       ),
                     ],
@@ -971,7 +1226,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                         itemCount: _messages.length,
                         itemBuilder: (context, index) {
-                          return MessageBubble(message: _messages[index]);
+                          final message = _messages[index];
+                          final showSpeechControls =
+                              _voiceOutputEnabled &&
+                              !_isLoading &&
+                              index == _latestFinalAssistantIndex;
+                          return MessageBubble(
+                            message: message,
+                            showSpeechControls: showSpeechControls,
+                            isSpeaking:
+                                _voicePlaybackState ==
+                                VoicePlaybackState.speaking,
+                            isSpeechPaused:
+                                _voicePlaybackState ==
+                                VoicePlaybackState.paused,
+                            onToggleSpeech: () =>
+                                unawaited(_toggleFinalSpeech()),
+                            onStopSpeech: () => unawaited(_stopFinalSpeech()),
+                          );
                         },
                       ),
               ),
@@ -1301,17 +1573,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             title: Text('Settings', style: textStyle),
             onTap: () {
               Navigator.pop(context);
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(
-                    aiService: _aiService,
-                    shizukuService: _actionHandler.shizuku,
-                    screenAutomationService: _actionHandler.screenAutomation,
-                    telegramService: _telegramService,
-                  ),
-                ),
-              );
+              unawaited(_openSettingsScreen());
             },
           ),
           const SizedBox(height: 20),

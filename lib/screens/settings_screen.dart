@@ -10,6 +10,7 @@ import '../services/chat_history_service.dart';
 import '../services/task_history_logger.dart';
 import '../services/task_store.dart';
 import '../services/assistant_platform_service.dart';
+import '../services/voice_service.dart';
 import '../privacy_sanitizer.dart';
 import 'task_history_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -21,6 +22,7 @@ class SettingsScreen extends StatefulWidget {
   final ShizukuService shizukuService;
   final ScreenAutomationService screenAutomationService;
   final TelegramService telegramService;
+  final ValueChanged<bool>? onVoiceOutputChanged;
 
   const SettingsScreen({
     super.key,
@@ -28,6 +30,7 @@ class SettingsScreen extends StatefulWidget {
     required this.shizukuService,
     required this.screenAutomationService,
     required this.telegramService,
+    this.onVoiceOutputChanged,
   });
 
   @override
@@ -58,6 +61,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _isDefaultAssistant = false;
   bool _googleSpeechAvailable = false;
   bool _googleTtsAvailable = false;
+  bool _voiceOutputEnabled = false;
 
   final Map<String, PermissionStatus> _permissions = {};
 
@@ -143,7 +147,16 @@ class _SettingsScreenState extends State<SettingsScreen>
           : PrivacyPreferenceKeys.defaultRetentionDays;
       _telegramAllowedChatController.text =
           prefs.getString(PrivacyPreferenceKeys.telegramAllowedChatId) ?? '';
+      _voiceOutputEnabled =
+          prefs.getBool(VoiceService.speechOutputPreferenceKey) ?? false;
     });
+  }
+
+  Future<void> _setVoiceOutputEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(VoiceService.speechOutputPreferenceKey, enabled);
+    if (mounted) setState(() => _voiceOutputEnabled = enabled);
+    widget.onVoiceOutputChanged?.call(enabled);
   }
 
   Future<void> _saveTelegramAllowedChat() async {
@@ -582,6 +595,19 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ],
               ),
               const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                secondary: const Icon(Icons.volume_up_outlined),
+                title: const Text('Read chat responses aloud'),
+                subtitle: Text(
+                  _googleTtsAvailable
+                      ? 'Use Google Text-to-Speech for final responses.'
+                      : 'Requires Google Text-to-Speech; no other voice engine is used.',
+                ),
+                value: _voiceOutputEnabled,
+                onChanged: _setVoiceOutputEnabled,
+              ),
+              const SizedBox(height: 8),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -600,7 +626,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                   Text(
                     _googleTtsAvailable
                         ? 'Voice output: Google Text-to-Speech detected.'
-                        : 'Voice output: Google TTS not found; the compatibility voice will be used.',
+                        : 'Voice output: Google TTS not found; spoken responses are unavailable.',
                     style: TextStyle(
                       fontSize: 12,
                       color: _googleTtsAvailable

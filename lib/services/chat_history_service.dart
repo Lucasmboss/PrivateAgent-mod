@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
@@ -35,6 +36,20 @@ class ChatSession {
 
 class ChatHistoryService {
   static const int maxSessions = 100;
+  static Future<void> _persistenceQueue = Future<void>.value();
+  static int _temporaryFileSequence = 0;
+
+  static Future<T> _runSerialized<T>(Future<T> Function() operation) {
+    final result = Completer<T>();
+    _persistenceQueue = _persistenceQueue.then((_) async {
+      try {
+        result.complete(await operation());
+      } catch (error, stackTrace) {
+        result.completeError(error, stackTrace);
+      }
+    });
+    return result.future;
+  }
 
   static Future<bool> isPersistenceEnabled() async {
     final prefs = await SharedPreferences.getInstance();
@@ -98,10 +113,13 @@ class ChatHistoryService {
   }
 
   /// Saves a session. Overwrites if ID already exists.
-  static Future<void> saveSession(ChatSession session) async {
+  static Future<void> saveSession(ChatSession session) =>
+      _runSerialized(() => _saveSession(session));
+
+  static Future<void> _saveSession(ChatSession session) async {
     if (!await isPersistenceEnabled()) return;
     final file = await _localFile;
-    List<ChatSession> sessions = await loadSessions();
+    List<ChatSession> sessions = await _loadSessions();
     final clean = _sanitizeSession(session);
 
     final index = sessions.indexWhere((s) => s.id == clean.id);
@@ -116,7 +134,10 @@ class ChatHistoryService {
   }
 
   /// Loads all saved chat sessions.
-  static Future<List<ChatSession>> loadSessions() async {
+  static Future<List<ChatSession>> loadSessions() =>
+      _runSerialized(_loadSessions);
+
+  static Future<List<ChatSession>> _loadSessions() async {
     if (!await isPersistenceEnabled()) return [];
     final file = await _localFile;
     if (!await file.exists()) return [];
@@ -188,26 +209,40 @@ class ChatHistoryService {
 
   static Future<void> _write(File file, List<ChatSession> sessions) async {
     await file.parent.create(recursive: true);
-    final temporary = File('${file.path}.tmp');
-    await temporary.writeAsString(
-      jsonEncode(sessions.map((session) => session.toJson()).toList()),
-      flush: true,
+    final sequence = _temporaryFileSequence++;
+    final temporary = File(
+      '${file.path}.${DateTime.now().microsecondsSinceEpoch}.$sequence.tmp',
     );
-    await temporary.rename(file.path);
+    try {
+      await temporary.writeAsString(
+        jsonEncode(sessions.map((session) => session.toJson()).toList()),
+        flush: true,
+      );
+      await temporary.rename(file.path);
+    } finally {
+      if (await temporary.exists()) {
+        await temporary.delete();
+      }
+    }
   }
 
   /// Deletes a specific session.
-  static Future<void> deleteSession(String id) async {
+  static Future<void> deleteSession(String id) =>
+      _runSerialized(() => _deleteSession(id));
+
+  static Future<void> _deleteSession(String id) async {
     if (!await isPersistenceEnabled()) return;
     final file = await _localFile;
-    List<ChatSession> sessions = await loadSessions();
+    List<ChatSession> sessions = await _loadSessions();
     sessions.removeWhere((s) => s.id == id);
 
     await _write(file, sessions);
   }
 
   /// Clears all saved chat sessions.
-  static Future<void> clearAll() async {
+  static Future<void> clearAll() => _runSerialized(_clearAll);
+
+  static Future<void> _clearAll() async {
     final file = await _localFile;
     if (await file.exists()) {
       await file.delete();

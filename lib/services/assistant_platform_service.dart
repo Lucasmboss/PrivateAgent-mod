@@ -77,6 +77,27 @@ class AssistantPlatformService {
     }
   }
 
+  static Future<bool> setAssistantOverlayExpanded(bool expanded) async {
+    if (!_isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('setAssistantOverlayExpanded', {
+            'expanded': expanded,
+          }) ??
+          false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<bool> dismissAssistant() async {
+    if (!_isAndroid) return false;
+    try {
+      return await _channel.invokeMethod<bool>('dismissAssistant') ?? false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   static Future<bool> consumeAssistantInvocation() async {
     if (!_isAndroid) return false;
     try {
@@ -95,10 +116,9 @@ class AssistantPlatformService {
   static Future<GoogleVoiceStatus> googleVoiceStatus() async {
     if (!_isAndroid) return const GoogleVoiceStatus();
     try {
-      final result =
-          await _voiceChannel.invokeMethod<Map<dynamic, dynamic>>(
-            'getGoogleVoiceStatus',
-          );
+      final result = await _voiceChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'getGoogleVoiceStatus',
+      );
       return GoogleVoiceStatus.fromMap(result);
     } on PlatformException {
       return const GoogleVoiceStatus();

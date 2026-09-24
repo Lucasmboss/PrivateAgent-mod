@@ -19,6 +19,8 @@ import 'task_store.dart';
 import '../models/task_record.dart';
 import '../models/saved_skill.dart';
 
+typedef TaskUserQuestionCallback = Future<String?> Function(String question);
+
 /// Executes autonomous multi-step tasks using multiple strategies.
 ///
 /// Strategy priority:
@@ -36,8 +38,7 @@ class TaskExecutor {
 
   final NotificationService _notificationService;
 
-  final SkillMemoryService _skillMemory =
-      SkillMemoryService();
+  final SkillMemoryService _skillMemory = SkillMemoryService();
 
   /// Direct Internet / HTTP access.
   ///
@@ -49,12 +50,12 @@ class TaskExecutor {
   String? _activeTaskId;
   TaskStatus? lastStatus;
 
-  final WebSearchService _webSearchService =
-    WebSearchService();
+  final WebSearchService _webSearchService = WebSearchService();
 
   /// Callback to report progress messages to the UI.
   final void Function(String message)? onProgress;
   final ToolApprovalCallback? onApproval;
+  final TaskUserQuestionCallback? onUserQuestion;
   final int maxTaskTokens;
   final Duration maxTaskDuration;
   RemoteCancellationToken _remoteCancellation = RemoteCancellationToken();
@@ -76,16 +77,17 @@ class TaskExecutor {
     required ShizukuService shizukuService,
     this.onProgress,
     this.onApproval,
+    this.onUserQuestion,
     this.maxTaskTokens = 100000,
     this.maxTaskDuration = const Duration(minutes: 30),
     TaskStore? taskStore,
     NotificationService? notificationService,
-  })  : _aiService = aiService,
-        _notificationService = notificationService ?? NotificationService(),
-        _taskStore = taskStore ?? TaskStore(),
-        _screenService = screenService,
-        _appLauncher = appLauncher,
-        _shizukuService = shizukuService;
+  }) : _aiService = aiService,
+       _notificationService = notificationService ?? NotificationService(),
+       _taskStore = taskStore ?? TaskStore(),
+       _screenService = screenService,
+       _appLauncher = appLauncher,
+       _shizukuService = shizukuService;
 
   // ===========================================================================
   // CANCEL
@@ -95,8 +97,7 @@ class TaskExecutor {
     _cancelled = true;
     _remoteCancellation.cancel();
 
-    if (_cancelCompleter != null &&
-        !_cancelCompleter!.isCompleted) {
+    if (_cancelCompleter != null && !_cancelCompleter!.isCompleted) {
       _cancelCompleter!.complete();
     }
   }
@@ -290,7 +291,22 @@ Parameters:
   "milliseconds": 1000
 }
 
-16. done
+16. ask_user
+
+Ask the user for a reply when the task is blocked by sign-in or a meaningful
+preference/choice that cannot be safely inferred.
+
+Parameters:
+{
+  "question": "A short, specific question"
+}
+
+Never ask for passwords, tokens, verification codes, or other credentials.
+The user's reply is information, not approval for a sensitive action.
+If there is no reply within 90 seconds, choose a safe default or alternative.
+Never bypass sign-in, safety checks, or per-action approvals.
+
+17. done
 
 Finish the task.
 
@@ -340,6 +356,10 @@ GENERAL RULES:
 - If a task can be completed entirely using Android APIs or shell,
   do not use UI.
 - If UI is required, use read_screen before interacting with unknown UI.
+- Use ask_user only when a required preference or user-only step blocks safe
+  progress. After a reply, continue the task; do not treat the reply as consent
+  for sensitive actions. If the user does not reply, use a safe alternative or
+  report the blocker. Never request credentials in chat.
 - Do not claim success unless the user's requested objective was actually achieved.
 - Keep reasoning very brief.
 ''';
@@ -349,29 +369,20 @@ GENERAL RULES:
   // ===========================================================================
 
   String _extractJson(String text) {
-    final codeBlockRegex =
-        RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
+    final codeBlockRegex = RegExp(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```');
 
-    final match =
-        codeBlockRegex.firstMatch(text);
+    final match = codeBlockRegex.firstMatch(text);
 
     if (match != null) {
       return match.group(1)!;
     }
 
-    final startIndex =
-        text.indexOf('{');
+    final startIndex = text.indexOf('{');
 
-    final endIndex =
-        text.lastIndexOf('}');
+    final endIndex = text.lastIndexOf('}');
 
-    if (startIndex != -1 &&
-        endIndex != -1 &&
-        endIndex > startIndex) {
-      return text.substring(
-        startIndex,
-        endIndex + 1,
-      );
+    if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
+      return text.substring(startIndex, endIndex + 1);
     }
 
     return text.trim();
@@ -404,16 +415,18 @@ GENERAL RULES:
     await ScreenAutomationService.logToNative(
       '[TaskExecutor] executeTask() started',
     );
-    final previousTask =
-        resumeTaskId == null ? null : await _taskStore.get(resumeTaskId);
+    final previousTask = resumeTaskId == null
+        ? null
+        : await _taskStore.get(resumeTaskId);
     final task = previousTask == null
         ? resumeTaskId == null
-            ? await _taskStore.create(goal: userGoal)
-            : throw StateError('Task not found')
+              ? await _taskStore.create(goal: userGoal)
+              : throw StateError('Task not found')
         : await _taskStore.claim(resumeTaskId!, userGoal);
     _activeTaskId = task.identifier;
     // Wall-clock lifetime is cumulative across resumes, including time paused.
-    final remainingTime = maxTaskDuration - DateTime.now().difference(task.createdAt);
+    final remainingTime =
+        maxTaskDuration - DateTime.now().difference(task.createdAt);
     if (remainingTime <= Duration.zero) {
       _budgetExpired = true;
     } else {
@@ -428,9 +441,7 @@ GENERAL RULES:
 
     final results = <String>[];
 
-    results.add(
-      'Starting task: $userGoal',
-    );
+    results.add('Starting task: $userGoal');
     if (previousTask != null) {
       results.insertAll(0, [
         'Resuming task. Previous results: ${previousTask.results}',
@@ -438,9 +449,7 @@ GENERAL RULES:
       ]);
     }
 
-    _report(
-      'Starting task: $userGoal',
-    );
+    _report('Starting task: $userGoal');
 
     // Every operation goes through the checkpointed planner and policy gate.
     String lastAction = '';
@@ -448,11 +457,14 @@ GENERAL RULES:
     int sameActionCount = 0;
 
     int consecutiveFailures = 0;
+    int userQuestionsAsked = 0;
+    bool userQuestionTimedOut = false;
 
     String lastFailedAction = '';
 
-    final List<String> failedStrategies =
-        List<String>.from(previousTask?.failedStrategies ?? const []);
+    final List<String> failedStrategies = List<String>.from(
+      previousTask?.failedStrategies ?? const [],
+    );
 
     int totalTokens = previousTask?.tokens ?? 0;
 
@@ -475,29 +487,30 @@ GENERAL RULES:
     // MAIN AGENT LOOP
     // -------------------------------------------------------------------------
 
-    for (
-      int step = 0;
-      step < _aiService.maxSteps;
-      step++
-    ) {
+    for (int step = 0; step < _aiService.maxSteps; step++) {
       // -----------------------------------------------------------------------
       // Cancellation
       // -----------------------------------------------------------------------
 
       if (_cancelled) {
-        return await _handleCancellation(
+        return await _handleCancellation(userGoal, totalTokens, step, results);
+      }
+      if (_paused) {
+        return await _handlePause(
           userGoal,
           totalTokens,
           step,
           results,
+          failedStrategies,
         );
       }
-      if (_paused) {
-        return await _handlePause(
-            userGoal, totalTokens, step, results, failedStrategies);
-      }
       if (_budgetExpired || totalTokens >= maxTaskTokens) {
-        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        return await _stopForBudget(
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
       }
 
       await _taskStore.update(
@@ -519,48 +532,32 @@ GENERAL RULES:
       // -----------------------------------------------------------------------
 
       if (lastAction == 'open_app') {
-        await Future.delayed(
-          const Duration(milliseconds: 1800),
-        );
-      } else if (
-          lastAction == 'type_text') {
-        await Future.delayed(
-          const Duration(milliseconds: 1200),
-        );
-      } else if (
-          lastAction == 'click_text' ||
-          lastAction == 'click_at') {
-        await Future.delayed(
-          const Duration(milliseconds: 800),
-        );
-      } else if (
-          lastAction == 'scroll' ||
-          lastAction == 'swipe') {
-        await Future.delayed(
-          const Duration(milliseconds: 600),
-        );
+        await Future.delayed(const Duration(milliseconds: 1800));
+      } else if (lastAction == 'type_text') {
+        await Future.delayed(const Duration(milliseconds: 1200));
+      } else if (lastAction == 'click_text' || lastAction == 'click_at') {
+        await Future.delayed(const Duration(milliseconds: 800));
+      } else if (lastAction == 'scroll' || lastAction == 'swipe') {
+        await Future.delayed(const Duration(milliseconds: 600));
       }
 
       // -----------------------------------------------------------------------
       // Build recent results
       // -----------------------------------------------------------------------
 
-      final recentResults =
-          results.length <= 5
-              ? results
-              : results.sublist(
-                  results.length - 5,
-                );
+      final recentResults = results.length <= 5
+          ? results
+          : results.sublist(results.length - 5);
 
-      final previousResultText =
-          previousResult.isEmpty
-              ? 'None'
-              : previousResult;
+      final previousResultText = previousResult.isEmpty
+          ? 'None'
+          : previousResult;
 
       String failureHint = '';
 
       if (consecutiveFailures >= 3) {
-        failureHint = '''
+        failureHint =
+            '''
 WARNING:
 The agent has failed $consecutiveFailures times recently.
 
@@ -574,7 +571,8 @@ Consider a different tool or method.
       // -----------------------------------------------------------------------
 
       final durable = (await _taskStore.get(_activeTaskId!))!;
-      final prompt = '''
+      final prompt =
+          '''
 TASK:
 $userGoal
 
@@ -624,7 +622,6 @@ Remember:
 - Do not claim completion without actually completing the task.
 ''';
 
-
       // -----------------------------------------------------------------------
       // AI
       // -----------------------------------------------------------------------
@@ -632,38 +629,59 @@ Remember:
       String response;
 
       try {
-        if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
-        if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+        if (_paused)
+          return await _handlePause(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
+        if (_cancelled)
+          return await _handleCancellation(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+          );
         if (_budgetExpired || totalTokens >= maxTaskTokens) {
-          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         }
-        _cancelCompleter =
-            Completer<void>();
+        _cancelCompleter = Completer<void>();
 
-        final aiFuture =
-            _aiService.sendTaskMessage(
+        final aiFuture = _aiService.sendTaskMessage(
           _taskSystemPrompt,
           prompt,
           cancellationToken: _remoteCancellation,
           maxOutputTokens: _remainingOutputTokens(totalTokens),
         );
 
-        final result =
-            await Future.any([
-          aiFuture.then(
-            (r) => r,
-          ),
-          _cancelCompleter!.future.then(
-            (_) => null,
-          ),
+        final result = await Future.any([
+          aiFuture.then((r) => r),
+          _cancelCompleter!.future.then((_) => null),
         ]);
 
         if (_budgetExpired) {
-          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         }
         if (_paused) {
           return await _handlePause(
-              userGoal, totalTokens, step, results, failedStrategies);
+            userGoal,
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         }
         if (result == null || _cancelled) {
           return await _handleCancellation(
@@ -676,19 +694,26 @@ Remember:
 
         final aiResponse = result;
 
-        response =
-            aiResponse.content;
+        response = aiResponse.content;
 
-        totalTokens +=
-            aiResponse.totalTokens;
-
+        totalTokens += aiResponse.totalTokens;
       } catch (e) {
         if (_budgetExpired) {
-          return await _stopForBudget(totalTokens, step, results, failedStrategies);
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         }
         if (_paused) {
           return await _handlePause(
-              userGoal, totalTokens, step, results, failedStrategies);
+            userGoal,
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         }
         if (_cancelled) {
           return await _handleCancellation(
@@ -699,16 +724,11 @@ Remember:
           );
         }
 
-        results.add(
-          'AI error: $e',
-        );
+        results.add('AI error: $e');
 
-        _report(
-          'Error: $e',
-        );
+        _report('Error: $e');
 
-        await _notificationService
-            .showTaskCompleteNotification(
+        await _notificationService.showTaskCompleteNotification(
           'Task Error',
           'AI encountered an error.',
         );
@@ -720,8 +740,13 @@ Remember:
           step,
           results,
         );
-        await _finishTask(TaskStatus.failed, step, totalTokens,
-            results, failedStrategies);
+        await _finishTask(
+          TaskStatus.failed,
+          step,
+          totalTokens,
+          results,
+          failedStrategies,
+        );
 
         return 'I could not complete the task because the AI service failed.';
       }
@@ -732,68 +757,92 @@ Remember:
 
       Map<String, dynamic>? actionJson;
       if (_budgetExpired || totalTokens >= maxTaskTokens) {
-        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        return await _stopForBudget(
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
       }
 
       try {
-        final jsonStr =
-            _extractJson(response);
+        final jsonStr = _extractJson(response);
 
-        actionJson =
-            jsonDecode(jsonStr)
-                as Map<String, dynamic>;
+        actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
       } catch (firstError) {
-        developer.log('AI response was not valid JSON: $firstError',
-            name: 'PrivateAgent');
-
-        _report(
-          'Retrying step ${step + 1}...',
+        developer.log(
+          'AI response was not valid JSON: $firstError',
+          name: 'PrivateAgent',
         );
 
-        await Future.delayed(
-          const Duration(seconds: 1),
-        );
+        _report('Retrying step ${step + 1}...');
+
+        await Future.delayed(const Duration(seconds: 1));
 
         try {
-          if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
-          if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+          if (_paused)
+            return await _handlePause(
+              userGoal,
+              totalTokens,
+              step,
+              results,
+              failedStrategies,
+            );
+          if (_cancelled)
+            return await _handleCancellation(
+              userGoal,
+              totalTokens,
+              step,
+              results,
+            );
           if (_budgetExpired || totalTokens >= maxTaskTokens) {
-            return await _stopForBudget(totalTokens, step, results, failedStrategies);
+            return await _stopForBudget(
+              totalTokens,
+              step,
+              results,
+              failedStrategies,
+            );
           }
-          final retryResponse =
-              await _aiService
-                  .sendTaskMessage(
+          final retryResponse = await _aiService.sendTaskMessage(
             _taskSystemPrompt,
             prompt,
             cancellationToken: _remoteCancellation,
             maxOutputTokens: _remainingOutputTokens(totalTokens),
           );
 
-          totalTokens +=
-              retryResponse.totalTokens;
+          totalTokens += retryResponse.totalTokens;
 
-          final jsonStr =
-              _extractJson(
-            retryResponse.content,
-          );
+          final jsonStr = _extractJson(retryResponse.content);
 
-          actionJson =
-              jsonDecode(jsonStr)
-                  as Map<String, dynamic>;
+          actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
         } catch (e) {
-          if (_budgetExpired) return await _stopForBudget(totalTokens, step, results, failedStrategies);
-          if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
-          if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
-          results.add(
-            'Step ${step + 1}: Error after retry: $e',
-          );
+          if (_budgetExpired)
+            return await _stopForBudget(
+              totalTokens,
+              step,
+              results,
+              failedStrategies,
+            );
+          if (_paused)
+            return await _handlePause(
+              userGoal,
+              totalTokens,
+              step,
+              results,
+              failedStrategies,
+            );
+          if (_cancelled)
+            return await _handleCancellation(
+              userGoal,
+              totalTokens,
+              step,
+              results,
+            );
+          results.add('Step ${step + 1}: Error after retry: $e');
 
-          _report(
-            'AI formatting error.',
-          );
+          _report('AI formatting error.');
 
-          await _notificationService
-              .showTaskCompleteNotification(
+          await _notificationService.showTaskCompleteNotification(
             'Task Error',
             'AI formatting error.',
           );
@@ -805,8 +854,13 @@ Remember:
             step,
             results,
           );
-          await _finishTask(TaskStatus.failed, step, totalTokens,
-              results, failedStrategies);
+          await _finishTask(
+            TaskStatus.failed,
+            step,
+            totalTokens,
+            results,
+            failedStrategies,
+          );
 
           return 'I could not understand the AI response. Please try again.';
         }
@@ -825,22 +879,15 @@ Remember:
       //   "action": "web_request",
       //   "params": {...}
       // }
-      final rawAction =
-          actionJson['action'];
+      final rawAction = actionJson['action'];
 
-      final rawParams =
-          actionJson['params'];
+      final rawParams = actionJson['params'];
 
-      if (rawAction is String &&
-          rawAction.trim().isNotEmpty) {
-        action =
-            rawAction.trim();
+      if (rawAction is String && rawAction.trim().isNotEmpty) {
+        action = rawAction.trim();
 
         if (rawParams is Map) {
-          params =
-              Map<String, dynamic>.from(
-            rawParams,
-          );
+          params = Map<String, dynamic>.from(rawParams);
         }
       }
 
@@ -852,25 +899,23 @@ Remember:
       //   "headers": {...}
       // }
       if (action.isEmpty) {
-        final rawTool =
-            actionJson['tool'];
+        final rawTool = actionJson['tool'];
 
-        if (rawTool is String &&
-            rawTool.trim().isNotEmpty) {
-          action =
-              rawTool.trim();
+        if (rawTool is String && rawTool.trim().isNotEmpty) {
+          action = rawTool.trim();
 
-          final toolParams =
-              <String, dynamic>{};
+          final toolParams = <String, dynamic>{};
 
-          for (final entry
-              in actionJson.entries) {
-            if (const ['tool', 'reasoning', 'is_complete'].contains(entry.key)) {
+          for (final entry in actionJson.entries) {
+            if (const [
+              'tool',
+              'reasoning',
+              'is_complete',
+            ].contains(entry.key)) {
               continue;
             }
 
-            toolParams[entry.key] =
-                entry.value;
+            toolParams[entry.key] = entry.value;
           }
 
           params = toolParams;
@@ -879,29 +924,31 @@ Remember:
 
       // Missing actions are invalid, never implicit completion.
 
-      final reasoning =
-          actionJson['reasoning']
-                  as String? ??
-              '';
+      final reasoning = actionJson['reasoning'] as String? ?? '';
 
-      final isComplete =
-          actionJson['is_complete'] ==
-              true;
+      final isComplete = actionJson['is_complete'] == true;
       developer.log('Selected action: $action', name: 'PrivateAgent');
 
-      _report(
-        'Step ${step + 1}: $reasoning',
-      );
+      _report('Step ${step + 1}: $reasoning');
       if (_paused) {
         return await _handlePause(
-            userGoal, totalTokens, step, results, failedStrategies);
+          userGoal,
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
       }
       if (_cancelled) {
-        return await _handleCancellation(
-            userGoal, totalTokens, step, results);
+        return await _handleCancellation(userGoal, totalTokens, step, results);
       }
       if (_budgetExpired || totalTokens >= maxTaskTokens) {
-        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        return await _stopForBudget(
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
       }
       ValidatedToolCall call;
       try {
@@ -920,16 +967,36 @@ Remember:
       final decision = await _authorizeTool(call);
       // Approval may take arbitrarily long; no checkpoint or side effect before
       // checking every stop condition again.
-      if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
-      if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
+      if (_paused)
+        return await _handlePause(
+          userGoal,
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
+      if (_cancelled)
+        return await _handleCancellation(userGoal, totalTokens, step, results);
       if (_budgetExpired || totalTokens >= maxTaskTokens) {
-        return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        return await _stopForBudget(
+          totalTokens,
+          step,
+          results,
+          failedStrategies,
+        );
       }
       if (!decision.allowed) {
-        const denied = 'Action denied. Task requires revision; no tool was executed.';
+        const denied =
+            'Action denied. Task requires revision; no tool was executed.';
         results.add(denied);
         _report(denied);
-        await _finishTask(TaskStatus.needsRevision, step, totalTokens, results, failedStrategies);
+        await _finishTask(
+          TaskStatus.needsRevision,
+          step,
+          totalTokens,
+          results,
+          failedStrategies,
+        );
         return denied;
       }
 
@@ -937,51 +1004,35 @@ Remember:
       // Repeat protection
       // -----------------------------------------------------------------------
 
-      sameActionCount =
-          action == lastAction
-              ? sameActionCount + 1
-              : 1;
+      sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
 
-      final repeatLimit =
-          action == 'press_enter'
-              ? 2
-              : (
-                  action == 'scroll' ||
-                  action == 'swipe'
-                )
-                  ? 3
-                  : 1000;
+      final repeatLimit = action == 'press_enter'
+          ? 2
+          : (action == 'scroll' || action == 'swipe')
+          ? 3
+          : 1000;
 
-      if (sameActionCount >
-          repeatLimit) {
+      if (sameActionCount > repeatLimit) {
         final blockedResult =
             'Blocked repeated $action action. '
             'Use a different strategy.';
 
-        results.add(
-          blockedResult,
-        );
+        results.add(blockedResult);
 
-        _report(
-          blockedResult,
-        );
+        _report(blockedResult);
 
-        previousResult =
-            blockedResult;
+        previousResult = blockedResult;
 
         consecutiveFailures++;
 
-        lastFailedAction =
-            action;
+        lastFailedAction = action;
 
-        lastAction =
-            action;
+        lastAction = action;
 
         continue;
       }
 
-      lastAction =
-          action;
+      lastAction = action;
 
       // -----------------------------------------------------------------------
       // DONE
@@ -994,41 +1045,64 @@ Remember:
         if (rawEvidence is Map) {
           for (final entry in rawEvidence.entries) {
             if (entry.value is Map) {
-              references[entry.key.toString()] =
-                  (entry.value as Map).map((k, v) => MapEntry(
-                      k.toString(), v is List ? v.whereType<String>().toList() : <String>[]));
+              references[entry.key.toString()] = (entry.value as Map).map(
+                (k, v) => MapEntry(
+                  k.toString(),
+                  v is List ? v.whereType<String>().toList() : <String>[],
+                ),
+              );
             }
           }
         }
-        final verified = await _taskStore.verifyCompletion(_activeTaskId!, references);
-        if (_paused) return await _handlePause(userGoal, totalTokens, step, results, failedStrategies);
-        if (_cancelled) return await _handleCancellation(userGoal, totalTokens, step, results);
-        if (_budgetExpired) return await _stopForBudget(totalTokens, step, results, failedStrategies);
+        final verified = await _taskStore.verifyCompletion(
+          _activeTaskId!,
+          references,
+        );
+        if (_paused)
+          return await _handlePause(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
+        if (_cancelled)
+          return await _handleCancellation(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+          );
+        if (_budgetExpired)
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
         if (verified.execution.verification != 'verified') {
-          const message = 'Task stopped with partial or unverified results. '
+          const message =
+              'Task stopped with partial or unverified results. '
               'Completion criteria lack verified evidence; successful tool execution '
               'does not confirm the requested outcome.';
           results.add(message);
-          await _finishTask(TaskStatus.needsRevision, step, totalTokens,
-              results, failedStrategies);
+          await _finishTask(
+            TaskStatus.needsRevision,
+            step,
+            totalTokens,
+            results,
+            failedStrategies,
+          );
           _report(message);
           return message;
         }
-        final finalText =
-            reasoning.trim().isEmpty
-                ? 'Done.'
-                : reasoning.trim();
+        final finalText = reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
 
-        results.add(
-          'Task complete: $finalText',
-        );
+        results.add('Task complete: $finalText');
 
-        _report(
-          'Task complete: $finalText',
-        );
+        _report('Task complete: $finalText');
 
-        await _notificationService
-            .showTaskCompleteNotification(
+        await _notificationService.showTaskCompleteNotification(
           'Task Completed',
           finalText,
         );
@@ -1040,24 +1114,24 @@ Remember:
           step,
           results,
         );
-        await _finishTask(TaskStatus.completed, step, totalTokens,
-            results, failedStrategies);
+        await _finishTask(
+          TaskStatus.completed,
+          step,
+          totalTokens,
+          results,
+          failedStrategies,
+        );
 
         // Only save UI-based skills.
         //
         // Web/API tasks should not become UI skills.
         if (executedSteps.isNotEmpty) {
-          await _skillMemory.saveSkill(
-            userGoal,
-            executedSteps,
-          );
+          await _skillMemory.saveSkill(userGoal, executedSteps);
         }
 
         // Toast requires Accessibility, so only use it when available.
         if (await _screenService.isServiceRunning()) {
-          await _screenService.showToast(
-            'Task completed',
-          );
+          await _screenService.showToast('Task completed');
         }
 
         return finalText;
@@ -1070,900 +1144,734 @@ Remember:
       if (action == 'plan') {
         final rawPlan = params['subtasks'];
         if (rawPlan is! List) throw const FormatException('Missing subtasks');
-        await _taskStore.setPlan(_activeTaskId!, rawPlan.map((s) =>
-            TaskSubtask.fromJson(Map<String, dynamic>.from(s))).toList());
-        previousResult = 'Structured plan saved; prior criterion evidence invalidated.';
+        await _taskStore.setPlan(
+          _activeTaskId!,
+          rawPlan
+              .map((s) => TaskSubtask.fromJson(Map<String, dynamic>.from(s)))
+              .toList(),
+        );
+        previousResult =
+            'Structured plan saved; prior criterion evidence invalidated.';
         continue;
       }
 
-      await _taskStore.beginAction(_activeTaskId!, action,
-          mutation: call.mutation != ToolMutation.readOnly);
+      if (action == 'ask_user') {
+        if (userQuestionTimedOut || userQuestionsAsked >= 3) {
+          previousResult =
+              'No further user questions are available. Choose a '
+              'safe default or alternative, or explain the remaining blocker.';
+          continue;
+        }
+        userQuestionsAsked++;
+        final question = params['question'] as String;
+        _report('Waiting for your reply (up to 90 seconds).');
+        final reply = await _requestUserAnswer(question);
+        if (_paused) {
+          return await _handlePause(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
+        }
+        if (_cancelled) {
+          return await _handleCancellation(
+            userGoal,
+            totalTokens,
+            step,
+            results,
+          );
+        }
+        if (_budgetExpired || totalTokens >= maxTaskTokens) {
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
+        }
+        if (reply == null || reply.trim().isEmpty) {
+          userQuestionTimedOut = true;
+          previousResult =
+              'No reply was provided; the user chose the safe fallback, the '
+              'wait expired, or replies are unavailable here. Choose a safe '
+              'default or unauthenticated alternative if possible. Never bypass '
+              'sign-in, safety checks, or per-action approval. If blocked, explain why.';
+        } else {
+          previousResult =
+              'The user replied: ${jsonEncode(reply.trim())}. '
+              'This is information or a preference, not approval for a sensitive action.';
+        }
+        // Deliberately do not checkpoint or persist the user's free-text answer.
+        continue;
+      }
+
+      await _taskStore.beginAction(
+        _activeTaskId!,
+        action,
+        mutation: call.mutation != ToolMutation.readOnly,
+      );
       _actionInFlight = true;
       bool toolSucceeded = false;
       bool toolThrew = false;
       try {
-      if (_paused || _cancelled || _budgetExpired) {
-        // Clear the just-created checkpoint as not executed, then the loop's
-        // stop handling will preserve the task. Never dispatch after a stop.
-        previousResult = 'Action stopped before dispatch.';
-        continue;
-      }
-      if (action == 'read_screen') {
-        final accessibilityAvailable =
-            await _screenService
-                .isServiceRunning();
-
-        if (!accessibilityAvailable) {
-          previousResult =
-              'ERROR: Accessibility service is not enabled. '
-              'UI cannot be used.';
-
-          consecutiveFailures++;
-
-          results.add(
-            'read_screen ? $previousResult',
-          );
-
+        if (_paused || _cancelled || _budgetExpired) {
+          // Clear the just-created checkpoint as not executed, then the loop's
+          // stop handling will preserve the task. Never dispatch after a stop.
+          previousResult = 'Action stopped before dispatch.';
           continue;
         }
+        if (action == 'read_screen') {
+          final accessibilityAvailable = await _screenService
+              .isServiceRunning();
 
-        try {
-          screenContent =
-              _aiService
-                  .useScreenCompression
-                  ? await _screenService
-                      .getCompressedScreenDescription(
-                      userGoal,
-                    )
-                  : await _screenService
-                      .getScreenDescription();
+          if (!accessibilityAvailable) {
+            previousResult =
+                'ERROR: Accessibility service is not enabled. '
+                'UI cannot be used.';
 
-          previousResult =
-              'Screen successfully read.';
-          toolSucceeded = screenContent.isNotEmpty &&
-              !ToolRegistry.isFailureResult(screenContent);
+            consecutiveFailures++;
 
-          results.add(
-            'read_screen ? Screen successfully read.',
-          );
+            results.add('read_screen ? $previousResult');
 
-          consecutiveFailures =
-              0;
-        } catch (e) {
-          previousResult =
-              'ERROR reading screen: $e';
-
-          consecutiveFailures++;
-        }
-
-        continue;
-      }
-
-      // ----------------------------------------------------------------------
-      // WEB SEARCH
-      // ----------------------------------------------------------------------
-
-      if (action ==
-          'web_search') {
-        final query =
-            params['query']
-                    as String? ??
-                '';
-
-        if (query.trim().isEmpty) {
-          previousResult =
-              'ERROR: web_search requires a query.';
-
-          consecutiveFailures++;
-          continue;
-        }
-
-        final searchResult =
-            await _webSearchService.search(
-          query.trim(),
-        );
-
-        previousResult =
-            'web_search "$query"\n$searchResult';
-
-        if (searchResult.startsWith(
-          'Web search error:',
-        )) {
-          consecutiveFailures++;
-        } else if (searchResult.startsWith(
-          'Web search returned no results',
-        )) {
-          consecutiveFailures++;
-        } else {
-          consecutiveFailures = 0;
-          toolSucceeded = !ToolRegistry.isFailureResult(searchResult);
-        }
-
-        continue;
-      }
-
-      // -----------------------------------------------------------------------
-      // WEB REQUEST
-      // -----------------------------------------------------------------------
-
-      if (action ==
-          'web_request') {
-        final method =
-            params['method']
-                    as String? ??
-                'GET';
-
-        final url =
-            params['url']
-                    as String? ??
-                '';
-
-        final headers =
-            params['headers'] is Map
-                ? Map<String, dynamic>.from(
-                    params['headers'] as Map,
-                  )
-                : null;
-
-        final body =
-            params['body'];
-
-        if (url.isEmpty) {
-          previousResult =
-              'ERROR: web_request requires a URL.';
-
-          consecutiveFailures++;
-
-          results.add(
-            'web_request ? $previousResult',
-          );
-
-          continue;
-        }
-
-        _report(
-          '?? $method $url',
-        );
-
-        developer.log(
-          'WEB REQUEST: $method $url',
-          name: 'PrivateAgent',
-        );
-
-        final webResult =
-            await _webService.request(
-          method: method,
-          url: url,
-          headers: headers,
-          body: body,
-        );
-
-        previousResult =
-            webResult;
-
-        results.add(
-          'web_request $method $url ?\n$webResult',
-        );
-
-        final status =
-            _extractHttpStatus(
-          webResult,
-        );
-        toolSucceeded = status != null && status >= 200 && status < 300;
-
-        final failed =
-            webResult.startsWith(
-              'Web request error:',
-            ) ||
-            (status != null &&
-                status >= 400);
-
-        if (failed) {
-          consecutiveFailures++;
-
-          String domain = '';
+            continue;
+          }
 
           try {
-            domain = Uri.parse(url).host;
-          } catch (_) {
-            domain = '';
-          }
+            screenContent = _aiService.useScreenCompression
+                ? await _screenService.getCompressedScreenDescription(userGoal)
+                : await _screenService.getScreenDescription();
 
-          String failureType =
-              'HTTP/request failure';
+            previousResult = 'Screen successfully read.';
+            toolSucceeded =
+                screenContent.isNotEmpty &&
+                !ToolRegistry.isFailureResult(screenContent);
 
-          final lowerResult =
-              webResult.toLowerCase();
+            results.add('read_screen ? Screen successfully read.');
 
-          if (lowerResult.contains('captcha') ||
-              lowerResult.contains('robot') ||
-              lowerResult.contains('bot detection') ||
-              lowerResult.contains('access denied') ||
-              lowerResult.contains('automated')) {
-            failureType =
-                'CAPTCHA/anti-bot';
-          } else if (status != null &&
-              status >= 400) {
-            failureType =
-                'HTTP $status';
-          }
+            consecutiveFailures = 0;
+          } catch (e) {
+            previousResult = 'ERROR reading screen: $e';
 
-          final strategy =
-              'web_request'
-              '${domain.isEmpty ? '' : ' $domain'}'
-              ' [$failureType]';
-
-          if (!failedStrategies.contains(
-            strategy,
-          )) {
-            failedStrategies.add(
-              strategy,
-            );
-          }
-
-          previousResult =
-              '$webResult\n\n'
-              'STRATEGY FAILURE:\n'
-              '$strategy\n'
-              'Do NOT repeat this strategy for this domain. '
-              'Choose another method.';
-
-          _report(
-            '?? Web request failed: $strategy',
-          );
-
-          developer.log(
-            'WEB REQUEST FAILED: $strategy',
-            name: 'PrivateAgent',
-          );
-
-          // IMPORTANT:
-          //
-          // Do NOT call RecoveryEngine here.
-          //
-          // This is a web strategy failure, not a UI failure.
-          // The failure memory is passed to Kimi so it can
-          // choose another strategy.
-        } else {
-          consecutiveFailures = 0;
-
-          _report(
-            '?? Web response received.',
-          );
-        }
-
-        continue;
-      }
-
-      if (action == 'list_files' ||
-          action == 'read_file' ||
-          action == 'write_file' ||
-          action == 'delete_file') {
-        try {
-          final path = params['path'] as String? ?? '';
-          switch (action) {
-            case 'list_files':
-              final files = await _files.listFiles(recursive: true);
-              previousResult = files.isEmpty
-                  ? 'No files in agent_files.'
-                  : files.join('\n');
-              break;
-            case 'read_file':
-              final text = await _files.readText(path);
-              previousResult = text.length > 12000
-                  ? '${text.substring(0, 12000)}\n[File content truncated]'
-                  : text;
-              break;
-            case 'write_file':
-              await _files.writeText(
-                  path, params['content'] as String? ?? '');
-              previousResult = 'File written to agent_files: $path';
-              break;
-            case 'delete_file':
-              await _files.delete(path);
-              previousResult = 'File deleted from agent_files: $path';
-              break;
-          }
-          results.add(action == 'read_file'
-              ? 'read_file: content returned to planner (not saved in task history).'
-              : '$action: $previousResult');
-          consecutiveFailures = 0;
-          toolSucceeded = true;
-        } catch (error) {
-          toolThrew = call.mutation != ToolMutation.readOnly;
-          previousResult = '$action failed: $error';
-          results.add(previousResult);
-          consecutiveFailures++;
-          failedStrategies.add('$action: $error');
-        }
-        continue;
-      }
-
-      // ----------------------------------------------------------------------
-      // OPEN URL
-      // ----------------------------------------------------------------------
-
-      if (action ==
-          'open_url') {
-        final url =
-            params['url']
-                    as String? ??
-                '';
-
-        if (url.isEmpty) {
-          previousResult =
-              'ERROR: open_url requires a URL.';
-
-          consecutiveFailures++;
-
-          continue;
-        }
-
-        _report(
-          '?? Opening $url...',
-        );
-
-        final openResult =
-            await _appLauncher
-                .openUrl(url);
-
-        previousResult =
-            openResult;
-        toolSucceeded = openResult.startsWith('Opened');
-
-        results.add(
-          'open_url $url ? $openResult',
-        );
-
-        if (openResult.startsWith(
-              'Error',
-            ) ||
-            openResult.startsWith(
-              'Cannot',
-            )) {
-          consecutiveFailures++;
-        } else {
-          consecutiveFailures =
-              0;
-
-          // External browser/app changed the screen.
-          screenContent = '';
-        }
-
-        continue;
-      }
-
-      // -----------------------------------------------------------------------
-      // OPEN APP
-      // -----------------------------------------------------------------------
-
-      if (action ==
-          'open_app') {
-        final appName =
-            params['app_name']
-                    as String? ??
-                '';
-
-        if (appName.isEmpty) {
-          previousResult =
-              'ERROR: open_app requires app_name.';
-
-          consecutiveFailures++;
-
-          continue;
-        }
-
-        final accessibilityAvailable =
-            await _screenService
-                .isServiceRunning();
-
-        if (_paused || _cancelled || _budgetExpired) continue;
-        if (!accessibilityAvailable) {
-          // Opening an app itself does not strictly require Accessibility.
-          final openResult =
-              await _appLauncher
-                  .openApp(appName);
-
-          previousResult =
-              openResult;
-          toolSucceeded = openResult.startsWith('Opened');
-
-          results.add(
-            'open_app $appName ? $openResult',
-          );
-
-          if (openResult.startsWith(
-                'Opened',
-              )) {
-            screenContent = '';
-            consecutiveFailures =
-                0;
-          } else {
             consecutiveFailures++;
           }
 
           continue;
         }
 
-        _report(
-          '?? Opening $appName...',
-        );
+        // ----------------------------------------------------------------------
+        // WEB SEARCH
+        // ----------------------------------------------------------------------
 
-        final openResult =
-            await _appLauncher
-                .openApp(appName);
+        if (action == 'web_search') {
+          final query = params['query'] as String? ?? '';
 
-        previousResult =
-            openResult;
-        toolSucceeded = openResult.startsWith('Opened');
+          if (query.trim().isEmpty) {
+            previousResult = 'ERROR: web_search requires a query.';
 
-        results.add(
-          'open_app $appName ? $openResult',
-        );
+            consecutiveFailures++;
+            continue;
+          }
 
-        if (openResult.startsWith(
-          'Opened',
-        )) {
-          consecutiveFailures =
-              0;
+          final searchResult = await _webSearchService.search(query.trim());
 
-          screenContent = '';
+          previousResult = 'web_search "$query"\n$searchResult';
 
-          executedSteps.add(
-            ActionStep(
-              action: action,
-              params: params,
-            ),
-          );
-        } else {
-          consecutiveFailures++;
-        }
-
-        continue;
-      }
-
-      // -----------------------------------------------------------------------
-      // SHIZUKU
-      // -----------------------------------------------------------------------
-
-      if (action ==
-          'run_adb_command') {
-        final command =
-            params['command']
-                    as String? ??
-                '';
-
-        if (command.isEmpty) {
-          previousResult =
-              'ERROR: run_adb_command requires command.';
-
-          consecutiveFailures++;
+          if (searchResult.startsWith('Web search error:')) {
+            consecutiveFailures++;
+          } else if (searchResult.startsWith(
+            'Web search returned no results',
+          )) {
+            consecutiveFailures++;
+          } else {
+            consecutiveFailures = 0;
+            toolSucceeded = !ToolRegistry.isFailureResult(searchResult);
+          }
 
           continue;
         }
 
-        _report(
-          '?? Running command...',
-        );
+        // -----------------------------------------------------------------------
+        // WEB REQUEST
+        // -----------------------------------------------------------------------
 
-        try {
-          final commandResult =
-              await _shizukuService
-                  .runCommand(command);
+        if (action == 'web_request') {
+          final method = params['method'] as String? ?? 'GET';
 
-          previousResult =
-              commandResult;
+          final url = params['url'] as String? ?? '';
 
-          results.add(
-            'run_adb_command $command ?\n$commandResult',
+          final headers = params['headers'] is Map
+              ? Map<String, dynamic>.from(params['headers'] as Map)
+              : null;
+
+          final body = params['body'];
+
+          if (url.isEmpty) {
+            previousResult = 'ERROR: web_request requires a URL.';
+
+            consecutiveFailures++;
+
+            results.add('web_request ? $previousResult');
+
+            continue;
+          }
+
+          _report('?? $method $url');
+
+          developer.log('WEB REQUEST: $method $url', name: 'PrivateAgent');
+
+          final webResult = await _webService.request(
+            method: method,
+            url: url,
+            headers: headers,
+            body: body,
           );
 
-          final normalized =
-              commandResult.toLowerCase();
+          previousResult = webResult;
+
+          results.add('web_request $method $url ?\n$webResult');
+
+          final status = _extractHttpStatus(webResult);
+          toolSucceeded = status != null && status >= 200 && status < 300;
 
           final failed =
-              normalized.contains(
-                    'not running',
-                  ) ||
-                  normalized.contains(
-                    'permission denied',
-                  ) ||
-                  normalized.startsWith(
-                    'error',
-                  );
-          // Shell strings do not provide a trustworthy exit status.
-          toolSucceeded = false;
-          toolThrew = true; // Preserve uncertain mutation for explicit review.
+              webResult.startsWith('Web request error:') ||
+              (status != null && status >= 400);
 
           if (failed) {
             consecutiveFailures++;
-          } else {
-            consecutiveFailures =
-                0;
-          }
-        } catch (e) {
-          previousResult =
-              'ERROR executing command: $e';
-          toolThrew = true;
 
-          consecutiveFailures++;
+            String domain = '';
+
+            try {
+              domain = Uri.parse(url).host;
+            } catch (_) {
+              domain = '';
+            }
+
+            String failureType = 'HTTP/request failure';
+
+            final lowerResult = webResult.toLowerCase();
+
+            if (lowerResult.contains('captcha') ||
+                lowerResult.contains('robot') ||
+                lowerResult.contains('bot detection') ||
+                lowerResult.contains('access denied') ||
+                lowerResult.contains('automated')) {
+              failureType = 'CAPTCHA/anti-bot';
+            } else if (status != null && status >= 400) {
+              failureType = 'HTTP $status';
+            }
+
+            final strategy =
+                'web_request'
+                '${domain.isEmpty ? '' : ' $domain'}'
+                ' [$failureType]';
+
+            if (!failedStrategies.contains(strategy)) {
+              failedStrategies.add(strategy);
+            }
+
+            previousResult =
+                '$webResult\n\n'
+                'STRATEGY FAILURE:\n'
+                '$strategy\n'
+                'Do NOT repeat this strategy for this domain. '
+                'Choose another method.';
+
+            _report('?? Web request failed: $strategy');
+
+            developer.log(
+              'WEB REQUEST FAILED: $strategy',
+              name: 'PrivateAgent',
+            );
+
+            // IMPORTANT:
+            //
+            // Do NOT call RecoveryEngine here.
+            //
+            // This is a web strategy failure, not a UI failure.
+            // The failure memory is passed to Kimi so it can
+            // choose another strategy.
+          } else {
+            consecutiveFailures = 0;
+
+            _report('?? Web response received.');
+          }
+
+          continue;
         }
 
-        continue;
-      }
+        if (action == 'list_files' ||
+            action == 'read_file' ||
+            action == 'write_file' ||
+            action == 'delete_file') {
+          try {
+            final path = params['path'] as String? ?? '';
+            switch (action) {
+              case 'list_files':
+                final files = await _files.listFiles(recursive: true);
+                previousResult = files.isEmpty
+                    ? 'No files in agent_files.'
+                    : files.join('\n');
+                break;
+              case 'read_file':
+                final text = await _files.readText(path);
+                previousResult = text.length > 12000
+                    ? '${text.substring(0, 12000)}\n[File content truncated]'
+                    : text;
+                break;
+              case 'write_file':
+                await _files.writeText(
+                  path,
+                  params['content'] as String? ?? '',
+                );
+                previousResult = 'File written to agent_files: $path';
+                break;
+              case 'delete_file':
+                await _files.delete(path);
+                previousResult = 'File deleted from agent_files: $path';
+                break;
+            }
+            results.add(
+              action == 'read_file'
+                  ? 'read_file: content returned to planner (not saved in task history).'
+                  : '$action: $previousResult',
+            );
+            consecutiveFailures = 0;
+            toolSucceeded = true;
+          } catch (error) {
+            toolThrew = call.mutation != ToolMutation.readOnly;
+            previousResult = '$action failed: $error';
+            results.add(previousResult);
+            consecutiveFailures++;
+            failedStrategies.add('$action: $error');
+          }
+          continue;
+        }
 
-      // -----------------------------------------------------------------------
-      // UI ACTIONS
-      // -----------------------------------------------------------------------
+        // ----------------------------------------------------------------------
+        // OPEN URL
+        // ----------------------------------------------------------------------
 
-      final isUiAction = {
-        'click_text',
-        'click_at',
-        'type_text',
-        'press_enter',
-        'scroll',
-        'swipe',
-        'press_back',
-        'press_home',
-        'wait',
-      }.contains(action);
+        if (action == 'open_url') {
+          final url = params['url'] as String? ?? '';
 
-      if (!isUiAction) {
-        previousResult =
-            'ERROR: Unknown action "$action".';
+          if (url.isEmpty) {
+            previousResult = 'ERROR: open_url requires a URL.';
 
-        consecutiveFailures++;
+            consecutiveFailures++;
 
-        continue;
-      }
+            continue;
+          }
 
-      // -----------------------------------------------------------------------
-      // WAIT does not require Accessibility
-      // -----------------------------------------------------------------------
+          _report('?? Opening $url...');
 
-      if (action ==
-          'wait') {
-        final milliseconds =
-            (params['milliseconds']
-                    as num?)
-                ?.toInt() ??
-            1000;
+          final openResult = await _appLauncher.openUrl(url);
 
-        await _remoteCancellation.delay(
-          Duration(
-            milliseconds:
-                milliseconds,
-          ),
-        );
+          previousResult = openResult;
+          toolSucceeded = openResult.startsWith('Opened');
 
-        previousResult =
-            'Waited ${milliseconds}ms.';
-        toolSucceeded = !_paused && !_cancelled && !_budgetExpired;
+          results.add('open_url $url ? $openResult');
 
-        results.add(
-          'wait ? ${milliseconds}ms',
-        );
+          if (openResult.startsWith('Error') ||
+              openResult.startsWith('Cannot')) {
+            consecutiveFailures++;
+          } else {
+            consecutiveFailures = 0;
 
-        consecutiveFailures =
-            0;
+            // External browser/app changed the screen.
+            screenContent = '';
+          }
 
-        continue;
-      }
+          continue;
+        }
 
-      // -----------------------------------------------------------------------
-      // UI requires Accessibility
-      // -----------------------------------------------------------------------
+        // -----------------------------------------------------------------------
+        // OPEN APP
+        // -----------------------------------------------------------------------
 
-      final accessibilityAvailable =
-          await _screenService
+        if (action == 'open_app') {
+          final appName = params['app_name'] as String? ?? '';
+
+          if (appName.isEmpty) {
+            previousResult = 'ERROR: open_app requires app_name.';
+
+            consecutiveFailures++;
+
+            continue;
+          }
+
+          final accessibilityAvailable = await _screenService
               .isServiceRunning();
 
-      if (_paused || _cancelled || _budgetExpired) continue;
-      if (!accessibilityAvailable) {
-        previousResult =
-            'ERROR: Accessibility service is not enabled. '
-            'Cannot execute UI action "$action".';
+          if (_paused || _cancelled || _budgetExpired) continue;
+          if (!accessibilityAvailable) {
+            // Opening an app itself does not strictly require Accessibility.
+            final openResult = await _appLauncher.openApp(appName);
 
-        consecutiveFailures++;
+            previousResult = openResult;
+            toolSucceeded = openResult.startsWith('Opened');
 
-        results.add(
-          '$action ? $previousResult',
-        );
+            results.add('open_app $appName ? $openResult');
 
-        continue;
-      }
+            if (openResult.startsWith('Opened')) {
+              screenContent = '';
+              consecutiveFailures = 0;
+            } else {
+              consecutiveFailures++;
+            }
 
-      // -----------------------------------------------------------------------
-      // If screen has not been read, read it first.
-      //
-      // We intentionally do NOT execute the requested UI action blindly.
-      // Kimi gets another planning cycle with actual screen data.
-      // -----------------------------------------------------------------------
+            continue;
+          }
 
-      if (screenContent.isEmpty) {
-        previousResult = 'UI action not executed: select read_screen first, '
-            'then reconsider the action against the observed screen.';
-        continue;
-      }
+          _report('?? Opening $appName...');
 
-      // -----------------------------------------------------------------------
-      // Execute UI action
-      // -----------------------------------------------------------------------
+          final openResult = await _appLauncher.openApp(appName);
 
-      bool success = false;
-      String actionResult = '';
+          previousResult = openResult;
+          toolSucceeded = openResult.startsWith('Opened');
 
-      switch (action) {
-        case 'click_text':
-          final text =
-              params['text']
-                      as String? ??
-                  '';
+          results.add('open_app $appName ? $openResult');
 
-          success =
-              await _screenService
-                  .clickByText(text);
+          if (openResult.startsWith('Opened')) {
+            consecutiveFailures = 0;
 
-          actionResult = success
-              ? 'Clicked "$text"'
-              : 'Could not find "$text" to click';
+            screenContent = '';
 
-          break;
+            executedSteps.add(ActionStep(action: action, params: params));
+          } else {
+            consecutiveFailures++;
+          }
 
-        case 'click_at':
-          final x =
-              (params['x'] as num?)
-                      ?.toDouble() ??
-                  0;
-
-          final y =
-              (params['y'] as num?)
-                      ?.toDouble() ??
-                  0;
-
-          success =
-              await _screenService
-                  .clickAt(
-            x,
-            y,
-          );
-
-          actionResult = success
-              ? 'Clicked at ($x, $y)'
-              : 'Click failed';
-
-          break;
-
-        case 'type_text':
-          final text =
-              params['text']
-                      as String? ??
-                  '';
-
-          final hint =
-              params['field_hint']
-                  as String?;
-
-          success =
-              await _screenService
-                  .typeText(
-            text,
-            fieldHint: hint,
-          );
-
-          actionResult = success
-              ? 'Typed "$text"'
-              : 'Could not type text';
-
-          break;
-
-        case 'press_enter':
-          success =
-              await _submitKeyboardAction();
-
-          actionResult = success
-              ? 'Submitted the focused search/form field'
-              : 'Could not submit the focused field';
-
-          break;
-
-        case 'swipe':
-          final startX =
-              (params['startX']
-                          as num?)
-                      ?.toDouble() ??
-                  540;
-
-          final startY =
-              (params['startY']
-                          as num?)
-                      ?.toDouble() ??
-                  2000;
-
-          final endX =
-              (params['endX']
-                          as num?)
-                      ?.toDouble() ??
-                  540;
-
-          final endY =
-              (params['endY']
-                          as num?)
-                      ?.toDouble() ??
-                  500;
-
-          success =
-              await _performSwipe(
-            startX,
-            startY,
-            endX,
-            endY,
-          );
-
-          actionResult =
-              success
-                  ? 'Swiped from '
-                      '($startX,$startY) to '
-                      '($endX,$endY)'
-                  : 'Swipe failed';
-
-          break;
-
-        case 'scroll':
-          final direction =
-              params['direction']
-                      as String? ??
-                  'down';
-
-          success =
-              await _performScroll(
-            direction,
-          );
-
-          actionResult = success
-              ? 'Scrolled $direction'
-              : 'Could not scroll $direction';
-
-          break;
-
-        case 'press_back':
-          success =
-              await _screenService
-                  .pressBack();
-
-          actionResult =
-              success
-                  ? 'Pressed back'
-                  : 'Could not press back';
-
-          break;
-
-        case 'press_home':
-          success =
-              await _screenService
-                  .pressHome();
-
-          actionResult =
-              success
-                  ? 'Pressed home'
-                  : 'Could not press home';
-
-          break;
-      }
-
-      developer.log(
-        '=== NATIVE EXECUTION RESULT ===\n'
-        '$actionResult',
-        name: 'PrivateAgent',
-      );
-
-      previousResult =
-          actionResult;
-      toolSucceeded = success;
-
-      results.add(
-        'Step ${step + 1}: '
-        '$actionResult ($reasoning)',
-      );
-
-      // -----------------------------------------------------------------------
-      // UI success
-      // -----------------------------------------------------------------------
-
-      if (success) {
-        consecutiveFailures =
-            0;
-
-        lastFailedAction =
-            '';
-
-        executedSteps.add(
-          ActionStep(
-            action: action,
-            params: params,
-          ),
-        );
-
-        // Screen changed and current dump is now stale.
-        screenContent = '';
-
-        if (!isComplete &&
-            (step + 1) % 3 == 0) {
-          await _screenService
-              .showToast(
-            'Working... (Step ${step + 1})',
-          );
+          continue;
         }
 
-        continue;
-      }
+        // -----------------------------------------------------------------------
+        // SHIZUKU
+        // -----------------------------------------------------------------------
 
-      // -----------------------------------------------------------------------
-      // UI failure ? RecoveryEngine
-      // -----------------------------------------------------------------------
+        if (action == 'run_adb_command') {
+          final command = params['command'] as String? ?? '';
 
-      if (action ==
-              lastFailedAction &&
-          consecutiveFailures > 0) {
-        consecutiveFailures++;
-      } else {
-        consecutiveFailures =
-            1;
+          if (command.isEmpty) {
+            previousResult = 'ERROR: run_adb_command requires command.';
 
-        lastFailedAction =
-            action;
-      }
+            consecutiveFailures++;
 
-      // Prevent infinite UI failure loops.
-      if (consecutiveFailures >= 5) {
-        results.add(
-          'Agent is stuck after '
-          '$consecutiveFailures consecutive failures.',
-        );
+            continue;
+          }
 
-        _report(
-          'Agent stuck � changing strategy.',
-        );
+          _report('?? Running command...');
 
-        // IMPORTANT:
+          try {
+            final commandResult = await _shizukuService.runCommand(command);
+
+            previousResult = commandResult;
+
+            results.add('run_adb_command $command ?\n$commandResult');
+
+            final normalized = commandResult.toLowerCase();
+
+            final failed =
+                normalized.contains('not running') ||
+                normalized.contains('permission denied') ||
+                normalized.startsWith('error');
+            // Shell strings do not provide a trustworthy exit status.
+            toolSucceeded = false;
+            toolThrew =
+                true; // Preserve uncertain mutation for explicit review.
+
+            if (failed) {
+              consecutiveFailures++;
+            } else {
+              consecutiveFailures = 0;
+            }
+          } catch (e) {
+            previousResult = 'ERROR executing command: $e';
+            toolThrew = true;
+
+            consecutiveFailures++;
+          }
+
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // UI ACTIONS
+        // -----------------------------------------------------------------------
+
+        final isUiAction = {
+          'click_text',
+          'click_at',
+          'type_text',
+          'press_enter',
+          'scroll',
+          'swipe',
+          'press_back',
+          'press_home',
+          'wait',
+        }.contains(action);
+
+        if (!isUiAction) {
+          previousResult = 'ERROR: Unknown action "$action".';
+
+          consecutiveFailures++;
+
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // WAIT does not require Accessibility
+        // -----------------------------------------------------------------------
+
+        if (action == 'wait') {
+          final milliseconds =
+              (params['milliseconds'] as num?)?.toInt() ?? 1000;
+
+          await _remoteCancellation.delay(Duration(milliseconds: milliseconds));
+
+          previousResult = 'Waited ${milliseconds}ms.';
+          toolSucceeded = !_paused && !_cancelled && !_budgetExpired;
+
+          results.add('wait ? ${milliseconds}ms');
+
+          consecutiveFailures = 0;
+
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // UI requires Accessibility
+        // -----------------------------------------------------------------------
+
+        final accessibilityAvailable = await _screenService.isServiceRunning();
+
+        if (_paused || _cancelled || _budgetExpired) continue;
+        if (!accessibilityAvailable) {
+          previousResult =
+              'ERROR: Accessibility service is not enabled. '
+              'Cannot execute UI action "$action".';
+
+          consecutiveFailures++;
+
+          results.add('$action ? $previousResult');
+
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // If screen has not been read, read it first.
         //
-        // We don't immediately terminate.
-        // We clear the screen state and allow Kimi to reconsider
-        // the task with the failure result.
-        screenContent = '';
+        // We intentionally do NOT execute the requested UI action blindly.
+        // Kimi gets another planning cycle with actual screen data.
+        // -----------------------------------------------------------------------
 
+        if (screenContent.isEmpty) {
+          previousResult =
+              'UI action not executed: select read_screen first, '
+              'then reconsider the action against the observed screen.';
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // Execute UI action
+        // -----------------------------------------------------------------------
+
+        bool success = false;
+        String actionResult = '';
+
+        switch (action) {
+          case 'click_text':
+            final text = params['text'] as String? ?? '';
+
+            success = await _screenService.clickByText(text);
+
+            actionResult = success
+                ? 'Clicked "$text"'
+                : 'Could not find "$text" to click';
+
+            break;
+
+          case 'click_at':
+            final x = (params['x'] as num?)?.toDouble() ?? 0;
+
+            final y = (params['y'] as num?)?.toDouble() ?? 0;
+
+            success = await _screenService.clickAt(x, y);
+
+            actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
+
+            break;
+
+          case 'type_text':
+            final text = params['text'] as String? ?? '';
+
+            final hint = params['field_hint'] as String?;
+
+            success = await _screenService.typeText(text, fieldHint: hint);
+
+            actionResult = success ? 'Typed "$text"' : 'Could not type text';
+
+            break;
+
+          case 'press_enter':
+            success = await _submitKeyboardAction();
+
+            actionResult = success
+                ? 'Submitted the focused search/form field'
+                : 'Could not submit the focused field';
+
+            break;
+
+          case 'swipe':
+            final startX = (params['startX'] as num?)?.toDouble() ?? 540;
+
+            final startY = (params['startY'] as num?)?.toDouble() ?? 2000;
+
+            final endX = (params['endX'] as num?)?.toDouble() ?? 540;
+
+            final endY = (params['endY'] as num?)?.toDouble() ?? 500;
+
+            success = await _performSwipe(startX, startY, endX, endY);
+
+            actionResult = success
+                ? 'Swiped from '
+                      '($startX,$startY) to '
+                      '($endX,$endY)'
+                : 'Swipe failed';
+
+            break;
+
+          case 'scroll':
+            final direction = params['direction'] as String? ?? 'down';
+
+            success = await _performScroll(direction);
+
+            actionResult = success
+                ? 'Scrolled $direction'
+                : 'Could not scroll $direction';
+
+            break;
+
+          case 'press_back':
+            success = await _screenService.pressBack();
+
+            actionResult = success ? 'Pressed back' : 'Could not press back';
+
+            break;
+
+          case 'press_home':
+            success = await _screenService.pressHome();
+
+            actionResult = success ? 'Pressed home' : 'Could not press home';
+
+            break;
+        }
+
+        developer.log(
+          '=== NATIVE EXECUTION RESULT ===\n'
+          '$actionResult',
+          name: 'PrivateAgent',
+        );
+
+        previousResult = actionResult;
+        toolSucceeded = success;
+
+        results.add(
+          'Step ${step + 1}: '
+          '$actionResult ($reasoning)',
+        );
+
+        // -----------------------------------------------------------------------
+        // UI success
+        // -----------------------------------------------------------------------
+
+        if (success) {
+          consecutiveFailures = 0;
+
+          lastFailedAction = '';
+
+          executedSteps.add(ActionStep(action: action, params: params));
+
+          // Screen changed and current dump is now stale.
+          screenContent = '';
+
+          if (!isComplete && (step + 1) % 3 == 0) {
+            await _screenService.showToast('Working... (Step ${step + 1})');
+          }
+
+          continue;
+        }
+
+        // -----------------------------------------------------------------------
+        // UI failure ? RecoveryEngine
+        // -----------------------------------------------------------------------
+
+        if (action == lastFailedAction && consecutiveFailures > 0) {
+          consecutiveFailures++;
+        } else {
+          consecutiveFailures = 1;
+
+          lastFailedAction = action;
+        }
+
+        // Prevent infinite UI failure loops.
+        if (consecutiveFailures >= 5) {
+          results.add(
+            'Agent is stuck after '
+            '$consecutiveFailures consecutive failures.',
+          );
+
+          _report('Agent stuck � changing strategy.');
+
+          // IMPORTANT:
+          //
+          // We don't immediately terminate.
+          // We clear the screen state and allow Kimi to reconsider
+          // the task with the failure result.
+          screenContent = '';
+
+          previousResult =
+              'UI strategy failed repeatedly. '
+              'Choose a completely different strategy.';
+
+          consecutiveFailures = 3;
+
+          continue;
+        }
+
+        // Recovery must be selected as the next normal checkpointed action.
+        // Never run hidden press_back/scroll/shell side effects here.
         previousResult =
-            'UI strategy failed repeatedly. '
-            'Choose a completely different strategy.';
-
-        consecutiveFailures = 3;
-
+            '$actionResult. Re-observe and choose a recovery action.';
+        screenContent = '';
         continue;
-      }
-
-      // Recovery must be selected as the next normal checkpointed action.
-      // Never run hidden press_back/scroll/shell side effects here.
-      previousResult = '$actionResult. Re-observe and choose a recovery action.';
-      screenContent = '';
-      continue;
       } catch (_) {
         toolThrew = true;
         rethrow;
       } finally {
         // Dart runs finally on every continue and return in the dispatch.
         final classification = ToolRegistry.classifyResult(
-            succeeded: toolSucceeded &&
-                !ToolRegistry.isFailureResult(previousResult),
-            threw: toolThrew);
+          succeeded:
+              toolSucceeded && !ToolRegistry.isFailureResult(previousResult),
+          threw: toolThrew,
+        );
         try {
-          await _taskStore.endAction(_activeTaskId!,
-              technicalSuccess: classification == ToolResultClassification.succeeded,
-              uncertain: toolThrew);
+          await _taskStore.endAction(
+            _activeTaskId!,
+            technicalSuccess:
+                classification == ToolResultClassification.succeeded,
+            uncertain: toolThrew,
+          );
         } finally {
           _actionInFlight = false;
         }
         if (toolThrew) {
-          throw StateError('Tool outcome is uncertain; review required before continuing');
+          throw StateError(
+            'Tool outcome is uncertain; review required before continuing',
+          );
         }
       }
     }
@@ -1971,10 +1879,28 @@ Remember:
     // =========================================================================
     // MAX STEPS
     // =========================================================================
-    if (_paused) return await _handlePause(userGoal, totalTokens, _aiService.maxSteps, results, failedStrategies);
-    if (_cancelled) return await _handleCancellation(userGoal, totalTokens, _aiService.maxSteps, results);
+    if (_paused)
+      return await _handlePause(
+        userGoal,
+        totalTokens,
+        _aiService.maxSteps,
+        results,
+        failedStrategies,
+      );
+    if (_cancelled)
+      return await _handleCancellation(
+        userGoal,
+        totalTokens,
+        _aiService.maxSteps,
+        results,
+      );
     if (_budgetExpired || totalTokens >= maxTaskTokens) {
-      return await _stopForBudget(totalTokens, _aiService.maxSteps, results, failedStrategies);
+      return await _stopForBudget(
+        totalTokens,
+        _aiService.maxSteps,
+        results,
+        failedStrategies,
+      );
     }
 
     results.add(
@@ -1983,15 +1909,12 @@ Remember:
       'Task may be incomplete.',
     );
 
-    _report(
-      'Reached maximum steps.',
-    );
+    _report('Reached maximum steps.');
 
-    await _notificationService
-        .showTaskCompleteNotification(
+    await _notificationService.showTaskCompleteNotification(
       'Task Stopped',
       'Reached maximum steps '
-      '(${_aiService.maxSteps}).',
+          '(${_aiService.maxSteps}).',
     );
 
     await TaskHistoryLogger.logTask(
@@ -2001,13 +1924,16 @@ Remember:
       _aiService.maxSteps,
       results,
     );
-    await _finishTask(TaskStatus.needsRevision, _aiService.maxSteps,
-        totalTokens, results, failedStrategies);
+    await _finishTask(
+      TaskStatus.needsRevision,
+      _aiService.maxSteps,
+      totalTokens,
+      results,
+      failedStrategies,
+    );
 
     if (await _screenService.isServiceRunning()) {
-      await _screenService.showToast(
-        'Reached maximum steps.',
-      );
+      await _screenService.showToast('Reached maximum steps.');
     }
 
     return 'I could not complete the task within the allowed steps.';
@@ -2023,16 +1949,11 @@ Remember:
     int step,
     List<String> results,
   ) async {
-    results.add(
-      'Task cancelled by user.',
-    );
+    results.add('Task cancelled by user.');
 
-    _report(
-      'Task cancelled.',
-    );
+    _report('Task cancelled.');
 
-    await _notificationService
-        .showTaskCompleteNotification(
+    await _notificationService.showTaskCompleteNotification(
       'Task Cancelled',
       'Task was stopped by the user.',
     );
@@ -2044,24 +1965,37 @@ Remember:
       step,
       results,
     );
-    await _finishTask(TaskStatus.cancelled, step, totalTokens,
-        results, const []);
+    await _finishTask(
+      TaskStatus.cancelled,
+      step,
+      totalTokens,
+      results,
+      const [],
+    );
 
     if (await _screenService.isServiceRunning()) {
-      await _screenService.showToast(
-        'Task Cancelled',
-      );
+      await _screenService.showToast('Task Cancelled');
     }
 
     return 'Task cancelled.';
   }
 
-  Future<String> _handlePause(String userGoal, int totalTokens, int step,
-      List<String> results, List<String> failedStrategies) async {
+  Future<String> _handlePause(
+    String userGoal,
+    int totalTokens,
+    int step,
+    List<String> results,
+    List<String> failedStrategies,
+  ) async {
     results.add('Task paused by user.');
     _report('Task paused. You can resume it from Task History.');
     await _finishTask(
-        TaskStatus.paused, step, totalTokens, results, failedStrategies);
+      TaskStatus.paused,
+      step,
+      totalTokens,
+      results,
+      failedStrategies,
+    );
     return 'Task paused. You can resume it from Task History.';
   }
 
@@ -2078,13 +2012,24 @@ Remember:
     return remaining < _aiService.maxTokens ? remaining : _aiService.maxTokens;
   }
 
-  Future<String> _stopForBudget(int tokens, int step, List<String> results,
-      List<String> failedStrategies) async {
+  Future<String> _stopForBudget(
+    int tokens,
+    int step,
+    List<String> results,
+    List<String> failedStrategies,
+  ) async {
     _remoteCancellation.cancel();
-    const message = 'Task budget exhausted. Results preserved; revision required.';
+    const message =
+        'Task budget exhausted. Results preserved; revision required.';
     results.add(message);
     _report(message);
-    await _finishTask(TaskStatus.needsRevision, step, tokens, results, failedStrategies);
+    await _finishTask(
+      TaskStatus.needsRevision,
+      step,
+      tokens,
+      results,
+      failedStrategies,
+    );
     return message;
   }
 
@@ -2108,23 +2053,50 @@ Remember:
     }
   }
 
-  Future<void> _finishTask(TaskStatus status, int steps, int tokens,
-      List<String> results, List<String> failedStrategies) async {
+  Future<String?> _requestUserAnswer(String question) async {
+    final callback = onUserQuestion;
+    if (callback == null) return null;
+    final stopped = Completer<String?>();
+    final remove = _remoteCancellation.onCancel(() {
+      if (!stopped.isCompleted) stopped.complete(null);
+    });
+    try {
+      final response = Future<String?>.sync(
+        () => callback(question),
+      ).timeout(const Duration(seconds: 90), onTimeout: () => null);
+      return await Future.any([response, stopped.future]);
+    } catch (_) {
+      return null;
+    } finally {
+      remove();
+    }
+  }
+
+  Future<void> _finishTask(
+    TaskStatus status,
+    int steps,
+    int tokens,
+    List<String> results,
+    List<String> failedStrategies,
+  ) async {
     final id = _activeTaskId;
     if (id == null) return;
     final record = await _taskStore.get(id);
     if (record?.execution.inFlight?.mutation == true) {
       status = TaskStatus.needsRevision;
     }
-    await _taskStore.update(id,
-        status: status,
-        progress: status == TaskStatus.completed ? 1 : null,
-        tokens: tokens,
-        results: results.length <= 20
-            ? results
-            : results.sublist(results.length - 20),
-        failedStrategies: failedStrategies.isEmpty
-            ? record?.failedStrategies : failedStrategies);
+    await _taskStore.update(
+      id,
+      status: status,
+      progress: status == TaskStatus.completed ? 1 : null,
+      tokens: tokens,
+      results: results.length <= 20
+          ? results
+          : results.sublist(results.length - 20),
+      failedStrategies: failedStrategies.isEmpty
+          ? record?.failedStrategies
+          : failedStrategies,
+    );
     lastStatus = status;
     _activeTaskId = null;
   }
@@ -2134,27 +2106,21 @@ Remember:
     if (id == null) return;
     final record = await _taskStore.get(id);
     final status = record?.execution.inFlight?.mutation == true
-        ? TaskStatus.needsRevision : TaskStatus.failed;
+        ? TaskStatus.needsRevision
+        : TaskStatus.failed;
     await _taskStore.update(id, status: status);
     lastStatus = status;
     _activeTaskId = null;
   }
 
-  int? _extractHttpStatus(
-    String result,
-  ) {
-    final match =
-        RegExp(
-          r'^HTTP\s+(\d+)',
-        ).firstMatch(result);
+  int? _extractHttpStatus(String result) {
+    final match = RegExp(r'^HTTP\s+(\d+)').firstMatch(result);
 
     if (match == null) {
       return null;
     }
 
-    return int.tryParse(
-      match.group(1)!,
-    );
+    return int.tryParse(match.group(1)!);
   }
 
   // ===========================================================================
@@ -2171,9 +2137,7 @@ Remember:
   // SCROLL
   // ===========================================================================
 
-  Future<bool> _performScroll(
-    String direction,
-  ) async {
+  Future<bool> _performScroll(String direction) async {
     if (_paused || _cancelled || _budgetExpired) return false;
     return _screenService.scroll(direction);
   }
@@ -2189,12 +2153,6 @@ Remember:
     double endY,
   ) async {
     if (_paused || _cancelled || _budgetExpired) return false;
-    return _screenService.swipe(
-      startX,
-      startY,
-      endX,
-      endY,
-    );
+    return _screenService.swipe(startX, startY, endX, endY);
   }
-
 }

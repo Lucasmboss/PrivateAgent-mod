@@ -46,6 +46,7 @@ class ActionHandler {
     void Function(String)? onProgress,
     String? userRequest,
     ToolApprovalCallback? onApproval,
+    TaskUserQuestionCallback? onUserQuestion,
   }) async {
     final generation = _stopGeneration;
     try {
@@ -56,15 +57,26 @@ class ActionHandler {
       if (const ToolPolicy().requiresApproval(call)) {
         onProgress?.call('Waiting for approval: ${call.name}');
       }
-      final decision = await const ToolPolicy().authorize(call, onApproval: onApproval);
+      final decision = await const ToolPolicy().authorize(
+        call,
+        onApproval: onApproval,
+      );
       if (generation != _stopGeneration || !decision.allowed) {
         final details = generation != _stopGeneration
             ? 'Action paused or cancelled before execution.'
             : 'Action denied: ${decision.reason}';
         onProgress?.call(details);
-        return AgentActionResult(actionType: call.name, success: false, details: details);
+        return AgentActionResult(
+          actionType: call.name,
+          success: false,
+          details: details,
+        );
       }
-      action = AgentAction(action: call.name, params: call.params, response: action.response);
+      action = AgentAction(
+        action: call.name,
+        params: call.params,
+        response: action.response,
+      );
       String result;
       bool taskSucceeded = false;
 
@@ -166,11 +178,15 @@ class ActionHandler {
 
         case 'list_files':
           final files = await _files.listFiles(recursive: true);
-          result = files.isEmpty ? 'No files in agent_files.' : files.join('\n');
+          result = files.isEmpty
+              ? 'No files in agent_files.'
+              : files.join('\n');
           break;
 
         case 'read_file':
-          result = await _files.readText(action.params['path'] as String? ?? '');
+          result = await _files.readText(
+            action.params['path'] as String? ?? '',
+          );
           if (result.length > 12000) {
             result = '${result.substring(0, 12000)}\n[File content truncated]';
           }
@@ -212,13 +228,18 @@ class ActionHandler {
         case 'click_text':
           final text = action.params['text'] as String? ?? '';
           final success = await _screenAutomation.clickByText(text);
-          result = success ? 'Clicked "$text"' : 'Could not find "$text" to click';
+          result = success
+              ? 'Clicked "$text"'
+              : 'Could not find "$text" to click';
           break;
 
         case 'type_text':
           final text = action.params['text'] as String? ?? '';
           final hint = action.params['field_hint'] as String?;
-          final success = await _screenAutomation.typeText(text, fieldHint: hint);
+          final success = await _screenAutomation.typeText(
+            text,
+            fieldHint: hint,
+          );
           result = success ? 'Typed "$text"' : 'Could not type into field';
           break;
 
@@ -230,13 +251,20 @@ class ActionHandler {
 
         case 'click_at':
           final success = await _screenAutomation.clickAt(
-              (action.params['x'] as num).toDouble(), (action.params['y'] as num).toDouble());
-          result = success ? 'Clicked screen position.' : 'Could not click screen position.';
+            (action.params['x'] as num).toDouble(),
+            (action.params['y'] as num).toDouble(),
+          );
+          result = success
+              ? 'Clicked screen position.'
+              : 'Could not click screen position.';
           break;
         case 'swipe':
           final success = await _screenAutomation.swipe(
-              (action.params['startX'] as num).toDouble(), (action.params['startY'] as num).toDouble(),
-              (action.params['endX'] as num).toDouble(), (action.params['endY'] as num).toDouble());
+            (action.params['startX'] as num).toDouble(),
+            (action.params['startY'] as num).toDouble(),
+            (action.params['endX'] as num).toDouble(),
+            (action.params['endY'] as num).toDouble(),
+          );
           result = success ? 'Swiped screen.' : 'Could not swipe screen.';
           break;
         case 'press_enter':
@@ -248,7 +276,9 @@ class ActionHandler {
           result = success ? 'Pressed home.' : 'Could not press home.';
           break;
         case 'wait':
-          await Future<void>.delayed(Duration(milliseconds: action.params['milliseconds'] as int));
+          await Future<void>.delayed(
+            Duration(milliseconds: action.params['milliseconds'] as int),
+          );
           result = 'Wait completed.';
           break;
 
@@ -275,6 +305,7 @@ class ActionHandler {
             shizukuService: _shizuku,
             onProgress: onProgress,
             onApproval: onApproval,
+            onUserQuestion: onUserQuestion,
           );
           try {
             result = await _currentExecutor!.executeTask(
@@ -299,12 +330,14 @@ class ActionHandler {
       final requestSucceeded = action.action == 'execute_task'
           ? taskSucceeded
           : action.action == 'web_request'
-              ? WebService.isSuccessfulResponse(result)
-               : action.action == 'run_adb_command'
-                   ? false // No exit-code evidence is available from this adapter.
-                   : !ToolRegistry.isFailureResult(result) &&
-                       !RegExp(r'^(error|could not|cannot|no phone|shizuku |web search error:|ai service not available)', caseSensitive: false)
-                       .hasMatch(result.trim());
+          ? WebService.isSuccessfulResponse(result)
+          : action.action == 'run_adb_command'
+          ? false // No exit-code evidence is available from this adapter.
+          : !ToolRegistry.isFailureResult(result) &&
+                !RegExp(
+                  r'^(error|could not|cannot|no phone|shizuku |web search error:|ai service not available)',
+                  caseSensitive: false,
+                ).hasMatch(result.trim());
 
       return AgentActionResult(
         actionType: action.action,

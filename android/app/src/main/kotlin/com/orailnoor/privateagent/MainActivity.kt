@@ -30,11 +30,18 @@ class MainActivity : FlutterActivity() {
     private var overlayView: View? = null
     private lateinit var googleVoiceEngine: GoogleVoiceEngine
     private var assistantInvocationPending = false
+    private var assistantWindowCompact = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
         assistantInvocationPending =
             intent?.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false) == true
+        if (assistantInvocationPending) {
+            setTheme(R.style.AssistantOverlayTheme)
+        }
+        super.onCreate(savedInstanceState)
+        if (assistantInvocationPending) {
+            setAssistantOverlayExpanded(expanded = false)
+        }
     }
 
     override fun onNewIntent(newIntent: Intent) {
@@ -44,8 +51,14 @@ class MainActivity : FlutterActivity() {
             newIntent.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false)
         assistantInvocationPending = isAssistantInvocation
         if (isAssistantInvocation) {
+            setAssistantOverlayExpanded(expanded = false)
             runOnUiThread {
                 assistantEventSink?.success(mapOf("type" to "invocation"))
+            }
+        } else if (assistantWindowCompact) {
+            setAssistantOverlayExpanded(expanded = true)
+            runOnUiThread {
+                assistantEventSink?.success(mapOf("type" to "openApp"))
             }
         }
     }
@@ -79,7 +92,8 @@ class MainActivity : FlutterActivity() {
                     "initialize" -> result.success(googleVoiceEngine.initialize())
                     "startListening" -> result.success(
                         googleVoiceEngine.startListening(
-                            call.argument<String>("language")
+                            call.argument<String>("language"),
+                            call.argument<Boolean>("holdToTalk") == true
                         )
                     )
                     "stopListening" -> {
@@ -96,6 +110,8 @@ class MainActivity : FlutterActivity() {
                         googleVoiceEngine.stopSpeaking()
                         result.success(true)
                     }
+                    "pauseSpeaking" -> result.success(googleVoiceEngine.pauseSpeaking())
+                    "resumeSpeaking" -> result.success(googleVoiceEngine.resumeSpeaking())
                     "isGoogleVoiceAvailable" -> result.success(
                         googleVoiceEngine.isGoogleVoiceAvailable()
                     )
@@ -120,6 +136,15 @@ class MainActivity : FlutterActivity() {
                     "isDefaultAssistant" -> result.success(isDefaultAssistant())
                     "requestDefaultAssistant" -> result.success(requestDefaultAssistant())
                     "openAssistantSettings" -> result.success(openAssistantSettings())
+                    "setAssistantOverlayExpanded" -> {
+                        val expanded = call.argument<Boolean>("expanded") ?: false
+                        setAssistantOverlayExpanded(expanded)
+                        result.success(true)
+                    }
+                    "dismissAssistant" -> {
+                        result.success(true)
+                        window.decorView.post { finish() }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -169,6 +194,37 @@ class MainActivity : FlutterActivity() {
             googleVoiceEngine.dispose()
         }
         super.onDestroy()
+    }
+
+    private fun setAssistantOverlayExpanded(expanded: Boolean) {
+        assistantWindowCompact = !expanded
+        val params = window.attributes
+        params.width = android.view.WindowManager.LayoutParams.MATCH_PARENT
+        params.height = if (expanded) {
+            android.view.WindowManager.LayoutParams.MATCH_PARENT
+        } else {
+            (420 * resources.displayMetrics.density).toInt()
+        }
+        params.gravity = if (expanded) {
+            android.view.Gravity.CENTER
+        } else {
+            android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL
+        }
+        params.dimAmount = if (expanded) 0f else 0.38f
+        params.flags = if (expanded) {
+            params.flags and android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+        } else {
+            params.flags or android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND
+        }
+        window.attributes = params
+        window.setBackgroundDrawableResource(android.R.color.transparent)
+        window.setSoftInputMode(
+            if (expanded) {
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            } else {
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            }
+        )
     }
 
     private fun isDefaultAssistant(): Boolean {

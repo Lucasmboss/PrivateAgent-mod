@@ -4,8 +4,21 @@ import '../models/chat_message.dart';
 
 class MessageBubble extends StatelessWidget {
   final ChatMessage message;
+  final bool showSpeechControls;
+  final bool isSpeaking;
+  final bool isSpeechPaused;
+  final VoidCallback? onToggleSpeech;
+  final VoidCallback? onStopSpeech;
 
-  const MessageBubble({super.key, required this.message});
+  const MessageBubble({
+    super.key,
+    required this.message,
+    this.showSpeechControls = false,
+    this.isSpeaking = false,
+    this.isSpeechPaused = false,
+    this.onToggleSpeech,
+    this.onStopSpeech,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -37,12 +50,16 @@ class MessageBubble extends StatelessWidget {
           border: isUser
               ? null
               : Border.all(
-                  color: Theme.of(context).colorScheme.onSurface.withOpacity(0.08),
+                  color: Theme.of(
+                    context,
+                  ).colorScheme.onSurface.withOpacity(0.08),
                   width: 1.2,
                 ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(Theme.of(context).brightness == Brightness.dark ? 0.15 : 0.02),
+              color: Colors.black.withOpacity(
+                Theme.of(context).brightness == Brightness.dark ? 0.15 : 0.02,
+              ),
               blurRadius: 8,
               offset: const Offset(0, 3),
             ),
@@ -54,7 +71,10 @@ class MessageBubble extends StatelessWidget {
             // Action result badge
             if (message.actionResult != null) ...[
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 5,
+                ),
                 margin: const EdgeInsets.only(bottom: 8),
                 decoration: BoxDecoration(
                   color: message.actionResult!.success
@@ -82,7 +102,10 @@ class MessageBubble extends StatelessWidget {
                     ),
                     const SizedBox(width: 6),
                     Text(
-                      message.actionResult!.actionType.toUpperCase().replaceAll('_', ' '),
+                      message.actionResult!.actionType.toUpperCase().replaceAll(
+                        '_',
+                        ' ',
+                      ),
                       style: TextStyle(
                         fontSize: 10,
                         color: message.actionResult!.success
@@ -110,17 +133,18 @@ class MessageBubble extends StatelessWidget {
               MarkdownBody(
                 data: message.content,
                 selectable: true,
-                styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
-                  p: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface,
-                    fontSize: 15,
-                    height: 1.45,
-                  ),
-                  listBullet: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurface,
-                    fontSize: 15,
-                  ),
-                ),
+                styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context))
+                    .copyWith(
+                      p: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurface,
+                        fontSize: 15,
+                        height: 1.45,
+                      ),
+                      listBullet: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurface,
+                        fontSize: 15,
+                      ),
+                    ),
               ),
             // Timestamp
             const SizedBox(height: 4),
@@ -129,16 +153,57 @@ class MessageBubble extends StatelessWidget {
               style: TextStyle(
                 fontSize: 11,
                 color: isUser
-                    ? Theme.of(context)
-                        .colorScheme
-                        .onPrimary
-                        .withValues(alpha: 0.6)
-                    : Theme.of(context)
-                        .colorScheme
-                        .onSurface
-                        .withValues(alpha: 0.5),
+                    ? Theme.of(
+                        context,
+                      ).colorScheme.onPrimary.withValues(alpha: 0.6)
+                    : Theme.of(
+                        context,
+                      ).colorScheme.onSurface.withValues(alpha: 0.5),
               ),
             ),
+            if (showSpeechControls) ...[
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: isSpeaking
+                        ? 'Pause reading'
+                        : isSpeechPaused
+                        ? 'Resume reading'
+                        : 'Read aloud',
+                    onPressed: onToggleSpeech,
+                    icon: Icon(
+                      isSpeaking
+                          ? Icons.pause_rounded
+                          : isSpeechPaused
+                          ? Icons.play_arrow_rounded
+                          : Icons.volume_up_rounded,
+                      size: 20,
+                    ),
+                  ),
+                  Text(
+                    isSpeaking
+                        ? 'Reading'
+                        : isSpeechPaused
+                        ? 'Paused'
+                        : 'Read aloud',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  if (isSpeaking || isSpeechPaused)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: 'Stop reading',
+                      onPressed: onStopSpeech,
+                      icon: const Icon(Icons.stop_rounded, size: 20),
+                    ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
