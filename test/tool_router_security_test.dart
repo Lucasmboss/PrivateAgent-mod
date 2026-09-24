@@ -268,7 +268,7 @@ void main() {
 
         final record = (await store.list()).single;
         expect(shizuku.lastCommand, 'uptime; id');
-        expect(record.execution.audit.last.phase, 'success');
+        expect(record.execution.audit.last.phase, 'after');
         expect(record.execution.audit.last.technicalSuccess, isTrue);
         expect(record.execution.inFlight, isNull);
       },
