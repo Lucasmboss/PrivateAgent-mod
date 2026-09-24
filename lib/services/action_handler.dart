@@ -11,6 +11,7 @@ import 'task_executor.dart';
 import 'ai_service.dart';
 import 'web_service.dart';
 import 'web_search_service.dart';
+import 'file_service.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -21,6 +22,7 @@ class ActionHandler {
   final ShizukuService _shizuku = ShizukuService();
   final WebService _web = WebService();
   final WebSearchService _webSearch = WebSearchService();
+  final FileService _files = FileService();
   final ScreenAutomationService _screenAutomation = ScreenAutomationService();
 
   ShizukuService get shizuku => _shizuku;
@@ -133,6 +135,31 @@ class ActionHandler {
           );
           break;
 
+        case 'list_files':
+          final files = await _files.listFiles(recursive: true);
+          result = files.isEmpty ? 'No files in agent_files.' : files.join('\n');
+          break;
+
+        case 'read_file':
+          result = await _files.readText(action.params['path'] as String? ?? '');
+          if (result.length > 12000) {
+            result = '${result.substring(0, 12000)}\n[File content truncated]';
+          }
+          break;
+
+        case 'write_file':
+          await _files.writeText(
+            action.params['path'] as String? ?? '',
+            action.params['content'] as String? ?? '',
+          );
+          result = 'File written to agent_files.';
+          break;
+
+        case 'delete_file':
+          await _files.delete(action.params['path'] as String? ?? '');
+          result = 'File deleted from agent_files.';
+          break;
+
         case 'send_email':
           result = await _communication.sendEmail(
             to: action.params['to'] as String? ?? '',
@@ -192,8 +219,14 @@ class ActionHandler {
             shizukuService: _shizuku,
             onProgress: onProgress,
           );
-          result = await _currentExecutor!.executeTask(goal);
-          _currentExecutor = null;
+          try {
+            result = await _currentExecutor!.executeTask(
+              goal,
+              resumeTaskId: action.params['resume_task_id'] as String?,
+            );
+          } finally {
+            _currentExecutor = null;
+          }
           break;
 
         default:
@@ -202,7 +235,8 @@ class ActionHandler {
 
       final requestSucceeded = action.action == 'web_request'
           ? WebService.isSuccessfulResponse(result)
-          : true;
+          : !result.startsWith('Web search error:') &&
+              !result.startsWith('AI service not available');
 
       return AgentActionResult(
         actionType: action.action,
