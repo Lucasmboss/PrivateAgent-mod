@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import '../models/task_record.dart';
 import '../services/task_history_logger.dart';
+import '../services/task_store.dart';
 
 class TaskHistoryScreen extends StatefulWidget {
   const TaskHistoryScreen({super.key});
@@ -11,8 +13,10 @@ class TaskHistoryScreen extends StatefulWidget {
 
 class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
   List<Map<String, dynamic>> _history = [];
+  List<TaskRecord> _records = [];
   Map<String, dynamic>? _analytics;
   bool _isLoading = true;
+  final TaskStore _taskStore = TaskStore();
 
   @override
   void initState() {
@@ -22,9 +26,12 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
 
   Future<void> _loadHistory() async {
     setState(() => _isLoading = true);
+    final records = await _taskStore.list();
     final history = await TaskHistoryLogger.readHistory();
     final analytics = await TaskHistoryLogger.getAnalytics();
+    if (!mounted) return;
     setState(() {
+      _records = records;
       _history = history;
       _analytics = analytics;
       _isLoading = false;
@@ -86,7 +93,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Task History (${_history.length})'),
+        title: Text('Task History (${_history.length + _records.length})'),
         actions: [
           IconButton(
             icon: const Icon(Icons.delete),
@@ -96,7 +103,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : _history.isEmpty
+          : _history.isEmpty && _records.isEmpty
               ? const Center(child: Text('No task history found.'))
               : Column(
                   children: [
@@ -120,10 +127,14 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                       ),
                     Expanded(
                       child: ListView.builder(
-                        itemCount: _history.length,
+                        itemCount: _records.length + _history.length,
                         padding: const EdgeInsets.all(16),
                         itemBuilder: (context, index) {
-                          final task = _history[index];
+                          if (index < _records.length) {
+                            return _buildRecordCard(_records[index]);
+                          }
+                          final legacyIndex = index - _records.length;
+                          final task = _history[legacyIndex];
                           final date = DateTime.tryParse(task['timestamp'] ?? '');
                           final dateStr = date != null
                               ? DateFormat('MMM d, y h:mm a').format(date)
@@ -236,6 +247,178 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                 ),
     );
   }
+
+  Color _recordStatusColor(TaskStatus status) {
+    switch (status) {
+      case TaskStatus.completed:
+        return Colors.green;
+      case TaskStatus.failed:
+        return Colors.red;
+      case TaskStatus.cancelled:
+        return Colors.orange;
+      case TaskStatus.paused:
+      case TaskStatus.needsRevision:
+        return Colors.amber.shade800;
+      case TaskStatus.running:
+        return Colors.blue;
+    }
+  }
+
+  IconData _recordStatusIcon(TaskStatus status) {
+    switch (status) {
+      case TaskStatus.completed:
+        return Icons.check_circle;
+      case TaskStatus.failed:
+        return Icons.cancel;
+      case TaskStatus.cancelled:
+        return Icons.stop_circle;
+      case TaskStatus.paused:
+        return Icons.pause_circle;
+      case TaskStatus.needsRevision:
+        return Icons.edit_note;
+      case TaskStatus.running:
+        return Icons.timelapse;
+    }
+  }
+
+  String _recordDate(DateTime value) =>
+      DateFormat('MMM d, y h:mm a').format(value);
+
+  Widget _buildRecordCard(TaskRecord record) {
+    final color = _recordStatusColor(record.status);
+    final resumable = record.status == TaskStatus.paused ||
+        record.status == TaskStatus.cancelled ||
+        record.status == TaskStatus.needsRevision ||
+        record.status == TaskStatus.failed;
+    final results = record.results;
+    final resultItems = results is List
+        ? results.reversed.take(5).toList().reversed.toList()
+        : <dynamic>[];
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      child: ExpansionTile(
+        leading: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.12),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(_recordStatusIcon(record.status), color: color),
+        ),
+        title: Text(record.goal,
+            style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Wrap(
+            spacing: 10,
+            runSpacing: 4,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              Text(_recordDate(record.updatedAt),
+                  style: const TextStyle(fontSize: 12)),
+              Text('${record.tokens} tokens',
+                  style: const TextStyle(fontSize: 12)),
+              _recordStatusChip(record.status, color),
+            ],
+          ),
+        ),
+        trailing: resumable
+            ? TextButton(
+                onPressed: () => Navigator.pop(context, record),
+                child: const Text('Resume'),
+              )
+            : null,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Wrap(
+                  spacing: 18,
+                  runSpacing: 8,
+                  children: [
+                    _recordDetail('Created', _recordDate(record.createdAt)),
+                    _recordDetail('Updated', _recordDate(record.updatedAt)),
+                    if (record.startedAt != null)
+                      _recordDetail('Started', _recordDate(record.startedAt!)),
+                    if (record.completedAt != null)
+                      _recordDetail(
+                          'Completed', _recordDate(record.completedAt!)),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    const Text('Progress',
+                        style: TextStyle(fontWeight: FontWeight.w600)),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: LinearProgressIndicator(
+                        value: record.progress.clamp(0.0, 1.0).toDouble(),
+                        minHeight: 7,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Text('${(record.progress * 100).round()}%'),
+                  ],
+                ),
+                if (results != null) ...[
+                  const SizedBox(height: 14),
+                  const Text('Recent results',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  if (resultItems.isNotEmpty)
+                    ...resultItems.map((item) => _recordLine(item.toString()))
+                  else
+                    _recordLine(results.toString()),
+                ],
+                if (record.failedStrategies.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  const Text('Failed strategies',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 6),
+                  ...record.failedStrategies.map(_recordLine),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _recordStatusChip(TaskStatus status, Color color) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.12),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Text(status.name.toUpperCase(),
+            style: TextStyle(
+                color: color, fontSize: 10, fontWeight: FontWeight.w800)),
+      );
+
+  Widget _recordDetail(String label, String value) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: const TextStyle(fontSize: 11)),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ],
+      );
+
+  Widget _recordLine(String value) => Container(
+        width: double.infinity,
+        margin: const EdgeInsets.only(bottom: 5),
+        padding: const EdgeInsets.all(9),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(7),
+        ),
+        child: Text(value, style: const TextStyle(fontSize: 12)),
+      );
 
   Widget _buildStatColumn(String label, String value, {Color? color, required bool isDark}) {
     return Container(
