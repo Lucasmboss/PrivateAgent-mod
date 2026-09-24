@@ -36,6 +36,7 @@ class ActionHandler {
     AgentAction action, {
     AiService? aiService,
     void Function(String)? onProgress,
+    String? userRequest,
   }) async {
     try {
       String result;
@@ -156,6 +157,12 @@ class ActionHandler {
           break;
 
         case 'delete_file':
+          if (userRequest == null ||
+              !RegExp(r'\b(delete|remove|borrar|eliminar)\b',
+                      caseSensitive: false)
+                  .hasMatch(userRequest)) {
+            throw StateError('Deleting a file requires an explicit user request.');
+          }
           await _files.delete(action.params['path'] as String? ?? '');
           result = 'File deleted from agent_files.';
           break;
@@ -212,6 +219,9 @@ class ActionHandler {
             result = 'AI service not available for task execution.';
             break;
           }
+          if (_currentExecutor != null) {
+            throw StateError('A task is already running.');
+          }
           _currentExecutor = TaskExecutor(
             aiService: aiService,
             screenService: _screenAutomation,
@@ -224,6 +234,9 @@ class ActionHandler {
               goal,
               resumeTaskId: action.params['resume_task_id'] as String?,
             );
+          } catch (error) {
+            await _currentExecutor!.failUnexpected(error);
+            rethrow;
           } finally {
             _currentExecutor = null;
           }
@@ -255,5 +268,9 @@ class ActionHandler {
   /// Cancel the currently running task
   void cancelTask() {
     _currentExecutor?.cancel();
+  }
+
+  void pauseTask() {
+    _currentExecutor?.pause();
   }
 }
