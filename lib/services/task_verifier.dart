@@ -13,6 +13,7 @@ class TaskVerifier {
   static String verify(TaskExecutionState state) {
     if (state.inFlight != null) return 'uncertain';
     if (state.unverifiedMutations.isNotEmpty) return 'partial';
+    if (state.pendingAssistance.isNotEmpty) return 'partial';
     if (state.plan.isEmpty) return 'unverified';
     final evidence = {for (final e in state.audit)
       if (e.phase == 'after' && e.technicalSuccess && e.revision == state.revision)

@@ -27,11 +27,85 @@ void main() {
     await store.beginAction('t', 'press_enter', mutation: true);
     final fresh = TaskStore(directory: directory);
     await fresh.recoverInterrupted();
-    expect((await fresh.get('t'))!.status, TaskStatus.needsRevision);
-    expect(fresh.claim('t', 'Find source'), throwsStateError);
+    final recovered = (await fresh.get('t'))!;
+    expect(recovered.status, TaskStatus.needsRevision);
+    expect(recovered.execution.inFlight, isNull);
+    expect(recovered.execution.unverifiedMutations, [1]);
+    expect(recovered.execution.audit.last.phase, 'uncertain');
     expect(fresh.clear(), throwsStateError);
-    await fresh.resolveUncertainAction('t', userConfirmedSuccess: true);
+    await fresh.resolveUncertainAuditAction(
+      't',
+      sequence: 1,
+      userConfirmedSuccess: true,
+    );
     expect((await fresh.claim('t', 'Find source')).status, TaskStatus.running);
+  });
+
+  test('an independently verified failed mutation is not recorded as success',
+      () async {
+    await store.beginAction('t', 'write_file', mutation: true);
+    await store.endAction(
+      't',
+      technicalSuccess: false,
+      uncertain: true,
+      continueAfterUncertain: true,
+    );
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.resolveUncertainAuditAction(
+      't',
+      sequence: 1,
+      userConfirmedSuccess: false,
+    );
+
+    final resolved = (await store.get('t'))!;
+    expect(resolved.execution.unverifiedMutations, isEmpty);
+    expect(resolved.execution.audit.last.outcome, 'userConfirmedFailure');
+    expect(resolved.execution.audit.last.technicalSuccess, isFalse);
+  });
+
+  test('same-chat checkpoint keeps its session and completed step count', () async {
+    await store.create(
+      goal: 'Continue a draft',
+      identifier: 'same-chat',
+      chatSessionId: 'chat-session-1',
+    );
+    await store.update(
+      'same-chat',
+      status: TaskStatus.paused,
+      stepsCompleted: 6,
+    );
+
+    final restarted = TaskStore(directory: directory);
+    await restarted.recoverInterrupted();
+    final loaded = (await restarted.get('same-chat'))!;
+    expect(loaded.chatSessionId, 'chat-session-1');
+    expect(loaded.stepsCompleted, 6);
+
+    final resumed = await restarted.claim('same-chat', 'Continue a draft');
+    expect(resumed.chatSessionId, 'chat-session-1');
+    expect(resumed.stepsCompleted, 6);
+  });
+
+  test('queued human assistance prevents completion until resolved', () async {
+    await store.addPendingAssistance(
+      't',
+      const PendingAssistanceRequest(
+        id: 'assist-1',
+        question: 'Complete sign-in directly in the app',
+        blockerType: 'sign_in',
+        evidence: 'The destination requested human sign-in',
+      ),
+    );
+    final partial = await store.verifyCompletion('t', const {});
+    expect(partial.execution.verification, 'partial');
+    expect(
+      store.update('t', status: TaskStatus.completed),
+      throwsStateError,
+    );
+
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.resolvePendingAssistance('t', {'assist-1'});
+    expect((await store.get('t'))!.execution.pendingAssistance, isEmpty);
   });
 
   test('technical mutation success does not establish outcome', () async {

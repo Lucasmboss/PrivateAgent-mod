@@ -20,7 +20,9 @@ import 'task_store.dart';
 import '../models/task_record.dart';
 import '../models/saved_skill.dart';
 
-typedef TaskUserQuestionCallback = Future<String?> Function(String question);
+typedef TaskUserQuestionCallback = Future<Set<String>?> Function(
+  List<TaskAssistanceItem> items,
+);
 
 /// Executes autonomous multi-step tasks using multiple strategies.
 ///
@@ -63,6 +65,7 @@ class TaskExecutor {
   final TaskStore _taskStore;
   String? _activeTaskId;
   TaskStatus? lastStatus;
+  String? lastTaskId;
 
   final WebSearchService _webSearchService = WebSearchService();
 
@@ -70,6 +73,7 @@ class TaskExecutor {
   final void Function(String message)? onProgress;
   final ToolApprovalCallback? onApproval;
   final TaskUserQuestionCallback? onUserQuestion;
+  final String? chatSessionId;
   final int maxTaskTokens;
   final Duration maxTaskDuration;
   RemoteCancellationToken _remoteCancellation = RemoteCancellationToken();
@@ -80,6 +84,7 @@ class TaskExecutor {
   bool _cancelled = false;
   bool _paused = false;
   bool _actionInFlight = false;
+  bool _assistanceBatchShown = false;
 
   Completer<void>? _cancelCompleter;
   bool get isActionInFlight => _actionInFlight;
@@ -92,6 +97,7 @@ class TaskExecutor {
     this.onProgress,
     this.onApproval,
     this.onUserQuestion,
+    this.chatSessionId,
     this.maxTaskTokens = 100000,
     this.maxTaskDuration = const Duration(minutes: 30),
     TaskStore? taskStore,
@@ -420,6 +426,8 @@ GENERAL RULES:
     _remoteCancellation = RemoteCancellationToken();
     _cancelCompleter = null;
     lastStatus = null;
+    lastTaskId = null;
+    _assistanceBatchShown = false;
     await ScreenAutomationService.logToNative(
       '[TaskExecutor] executeTask() started',
     );
@@ -428,10 +436,14 @@ GENERAL RULES:
         : await _taskStore.get(resumeTaskId);
     final task = previousTask == null
         ? resumeTaskId == null
-              ? await _taskStore.create(goal: userGoal)
+              ? await _taskStore.create(
+                  goal: userGoal,
+                  chatSessionId: chatSessionId,
+                )
               : throw StateError('Task not found')
         : await _taskStore.claim(resumeTaskId!, userGoal);
     _activeTaskId = task.identifier;
+    lastTaskId = task.identifier;
     // Wall-clock lifetime is cumulative across resumes, including time paused.
     final remainingTime =
         maxTaskDuration - DateTime.now().difference(task.createdAt);
@@ -452,8 +464,8 @@ GENERAL RULES:
     results.add('Starting task: $userGoal');
     if (previousTask != null) {
       results.insertAll(0, [
-        'Resuming task. Previous results: ${previousTask.results}',
-        'Previously failed strategies: ${previousTask.failedStrategies.join(', ')}',
+        'Resuming from saved checkpoint at step ${previousTask.stepsCompleted}.',
+        'The durable plan and action audit are restored. Raw tool output is not stored.',
       ]);
     }
 
@@ -465,19 +477,27 @@ GENERAL RULES:
     int sameActionCount = 0;
 
     int consecutiveFailures = 0;
-    int userQuestionsAsked = 0;
-    bool userQuestionTimedOut = false;
-
     String lastFailedAction = '';
 
-    final List<String> failedStrategies = List<String>.from(
-      previousTask?.failedStrategies ?? const [],
-    );
+    final List<String> failedStrategies = [
+      for (final event in previousTask?.execution.audit ?? const <ActionAudit>[])
+        if (event.mutation &&
+            event.phase == 'uncertain' &&
+            (previousTask?.execution.unverifiedMutations.contains(
+                  event.sequence,
+                ) ??
+                false))
+          '${event.action}: prior external effect remains unverified; do not replay',
+    ];
 
     int totalTokens = previousTask?.tokens ?? 0;
 
     final List<ActionStep> executedSteps = [];
     final attemptedActions = <String>{};
+    attemptedActions.addAll(
+      previousTask?.execution.audit.map((event) => event.action) ??
+          const <String>[],
+    );
     for (final result in results) {
       const attemptPrefix = 'Attempted actions so far: ';
       if (result.startsWith(attemptPrefix)) {
@@ -508,7 +528,8 @@ GENERAL RULES:
     // MAIN AGENT LOOP
     // -------------------------------------------------------------------------
 
-    for (int step = 0; step < _aiService.maxSteps; step++) {
+    var consecutiveVerifierGaps = 0;
+    for (int step = task.stepsCompleted; step < _aiService.maxSteps; step++) {
       // -----------------------------------------------------------------------
       // Cancellation
       // -----------------------------------------------------------------------
@@ -539,6 +560,7 @@ GENERAL RULES:
         progress: (previousTask?.progress ?? 0) > step / _aiService.maxSteps
             ? previousTask!.progress
             : step / _aiService.maxSteps,
+        stepsCompleted: step,
         tokens: totalTokens,
         results: results.length <= 20
             ? results
@@ -764,6 +786,7 @@ Remember:
           step,
           results,
         );
+
         await _finishTask(
           TaskStatus.failed,
           step,
@@ -882,6 +905,7 @@ Remember:
             step,
             results,
           );
+
           await _finishTask(
             TaskStatus.failed,
             step,
@@ -1041,7 +1065,7 @@ Remember:
             }
           }
         }
-        final verified = await _taskStore.verifyCompletion(
+        var verified = await _taskStore.verifyCompletion(
           _activeTaskId!,
           references,
         );
@@ -1067,22 +1091,187 @@ Remember:
             results,
             failedStrategies,
           );
-        if (verified.execution.verification != 'verified') {
-          const message =
-              'Task stopped with partial or unverified results. '
-              'Completion criteria lack verified evidence; successful tool execution '
-              'does not confirm the requested outcome.';
-          results.add(message);
-          await _finishTask(
-            TaskStatus.needsRevision,
-            step,
-            totalTokens,
-            results,
-            failedStrategies,
-          );
-          _report(message);
-          return message;
+        final missingEvidence = _completionEvidenceGaps(verified.execution);
+        final assistanceItems = _assistanceItems(verified.execution);
+        if (verified.execution.verification != 'verified' ||
+            assistanceItems.isNotEmpty) {
+          if (verified.execution.verification != 'verified') {
+            consecutiveVerifierGaps++;
+          }
+          final readyForBatch =
+              missingEvidence.isEmpty || consecutiveVerifierGaps >= 2;
+          if (!_assistanceBatchShown &&
+              readyForBatch &&
+              assistanceItems.isNotEmpty) {
+            _assistanceBatchShown = true;
+            await _taskStore.update(
+              _activeTaskId!,
+              status: TaskStatus.needsRevision,
+            );
+            _report(
+              'Autonomous work is complete. Reviewing all remaining human-only '
+              'steps and outcomes together.',
+            );
+            final selectedIds = await _requestUserAnswer(assistanceItems);
+            if (_paused) {
+              return await _handlePause(
+                userGoal,
+                totalTokens,
+                step,
+                results,
+                failedStrategies,
+              );
+            }
+            if (_cancelled) {
+              return await _handleCancellation(
+                userGoal,
+                totalTokens,
+                step,
+                results,
+              );
+            }
+            if (_budgetExpired || totalTokens >= maxTaskTokens) {
+              return await _stopForBudget(
+                totalTokens,
+                step,
+                results,
+                failedStrategies,
+              );
+            }
+            if (selectedIds == null) {
+              const message =
+                  'Task checkpoint saved. The combined review request timed out '
+                  'or was declined; resume it from this chat when ready.';
+              results.add(message);
+              await _finishTask(
+                TaskStatus.needsRevision,
+                step,
+                totalTokens,
+                results,
+                failedStrategies,
+              );
+              _report(message);
+              return message;
+            }
+
+            final allowedIds = assistanceItems.map((item) => item.id).toSet();
+            final acceptedIds = selectedIds.intersection(allowedIds);
+            final resolvedHumanIds = assistanceItems
+                .where(
+                  (item) =>
+                      item.kind == TaskAssistanceKind.humanStep &&
+                      acceptedIds.contains(item.id),
+                )
+                .map((item) => item.id)
+                .toSet();
+            if (resolvedHumanIds.isNotEmpty) {
+              await _taskStore.resolvePendingAssistance(
+                _activeTaskId!,
+                resolvedHumanIds,
+              );
+            }
+
+            var current = (await _taskStore.get(_activeTaskId!))!;
+            for (final item in assistanceItems) {
+              if (!acceptedIds.contains(item.id)) continue;
+              if (item.kind == TaskAssistanceKind.criterionReview &&
+                  item.subtaskId != null &&
+                  item.criterion != null) {
+                await _taskStore.confirmCriterion(
+                  _activeTaskId!,
+                  expectedRevision: current.execution.revision,
+                  subtaskId: item.subtaskId!,
+                  criterion: item.criterion!,
+                  confirmed: true,
+                );
+                current = (await _taskStore.get(_activeTaskId!))!;
+              } else if (item.kind == TaskAssistanceKind.mutationReview &&
+                  item.actionSequence != null) {
+                final event = current.execution.audit.lastWhere(
+                  (entry) =>
+                      entry.sequence == item.actionSequence &&
+                      entry.mutation &&
+                      entry.phase != 'before',
+                );
+                if (event.phase == 'uncertain') {
+                  await _taskStore.resolveUncertainAuditAction(
+                    _activeTaskId!,
+                    sequence: event.sequence,
+                    userConfirmedSuccess: true,
+                  );
+                } else if (event.technicalSuccess) {
+                  await _taskStore.confirmActionOutcome(
+                    _activeTaskId!,
+                    event.sequence,
+                  );
+                }
+                current = (await _taskStore.get(_activeTaskId!))!;
+              }
+            }
+            verified = await _taskStore.verifyCompletion(
+              _activeTaskId!,
+              const {},
+            );
+            if (resolvedHumanIds.isNotEmpty) {
+              await _taskStore.update(
+                _activeTaskId!,
+                status: TaskStatus.running,
+              );
+              previousResult =
+                  'The user completed one or more queued human-only steps. '
+                  'Re-read the current state and continue the original goal. '
+                  'Do not replay unresolved mutations.';
+              screenContent = '';
+              continue;
+            }
+            if (verified.execution.verification != 'verified' ||
+                verified.execution.pendingAssistance.isNotEmpty) {
+              const message =
+                  'Task checkpoint saved. Some outcomes still need independent '
+                  'review or human-only steps remain incomplete.';
+              results.add(message);
+              await _finishTask(
+                TaskStatus.needsRevision,
+                step,
+                totalTokens,
+                results,
+                failedStrategies,
+              );
+              _report(message);
+              return message;
+            }
+          }
+
+          if (verified.execution.verification != 'verified' ||
+              verified.execution.pendingAssistance.isNotEmpty) {
+            if (_assistanceBatchShown) {
+              const message =
+                  'Task checkpoint saved. Remaining criteria or human-only steps '
+                  'are listed for review; continue from this chat when ready.';
+              results.add(message);
+              await _finishTask(
+                TaskStatus.needsRevision,
+                step,
+                totalTokens,
+                results,
+                failedStrategies,
+              );
+              _report(message);
+              return message;
+            }
+            previousResult = missingEvidence.isEmpty
+                ? 'Completion is not verified. Gather new evidence or complete '
+                      'another useful independent step; do not repeat done.'
+                : 'Completion evidence is missing for: '
+                      '${missingEvidence.join('; ')}. Continue with a different '
+                      'strategy or another independent subtask. Do not stop yet.';
+            results.add(
+              'Completion check found gaps; the planner will continue autonomously.',
+            );
+            continue;
+          }
         }
+        consecutiveVerifierGaps = 0;
         final finalText = reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
 
         results.add('Task complete: $finalText');
@@ -1101,6 +1290,7 @@ Remember:
           step,
           results,
         );
+
         await _finishTask(
           TaskStatus.completed,
           step,
@@ -1143,12 +1333,6 @@ Remember:
       }
 
       if (action == 'ask_user') {
-        if (userQuestionTimedOut || userQuestionsAsked >= 3) {
-          previousResult =
-              'No further user questions are available. Choose a '
-              'safe default or alternative, or explain the remaining blocker.';
-          continue;
-        }
         final question = params['question'] as String;
         final eligibility = const UserAssistancePolicy().evaluate(
           question: question,
@@ -1173,49 +1357,44 @@ Remember:
           consecutiveFailures++;
           continue;
         }
-        userQuestionsAsked++;
-        _report('Waiting for your help (up to 5 minutes).');
-        final reply = await _requestUserAnswer(question);
-        if (_paused) {
-          return await _handlePause(
-            userGoal,
-            totalTokens,
-            step,
-            results,
-            failedStrategies,
-          );
-        }
-        if (_cancelled) {
-          return await _handleCancellation(
-            userGoal,
-            totalTokens,
-            step,
-            results,
-          );
-        }
-        if (_budgetExpired || totalTokens >= maxTaskTokens) {
-          return await _stopForBudget(
-            totalTokens,
-            step,
-            results,
-            failedStrategies,
-          );
-        }
-        if (reply == UserAssistancePolicy.completedReply) {
-          previousResult =
-              'The user completed the required human-only step. This does not '
-              'authorize actions outside the original task. Read the screen '
-              'again before continuing.';
-          screenContent = '';
-        } else {
-          userQuestionTimedOut = true;
-          previousResult =
-              'The user did not complete the human-only step, the wait expired, '
-              'or replies are unavailable. Choose a safe alternative or report '
-              'the blocker. Never request credentials or bypass authentication '
-              'or Android security.';
-        }
-        // Only a fixed completion signal is accepted; no free-text data is saved.
+        final requestId =
+            'assist-${DateTime.now().microsecondsSinceEpoch}';
+        await _taskStore.addPendingAssistance(
+          _activeTaskId!,
+          PendingAssistanceRequest(
+            id: requestId,
+            question: question,
+            blockerType: params['blocker_type'] as String,
+            evidence: params['evidence'] as String,
+          ),
+        );
+        _assistanceBatchShown = false;
+        previousResult =
+            'A verified human-only step was queued. Continue all independent '
+            'work; the user will receive one combined request at the end.';
+        results.add('ask_user: human-only step queued for end-of-task review.');
+        continue;
+      }
+
+      final durableBeforeDispatch = await _taskStore.get(_activeTaskId!);
+      final unresolvedMutationSequences =
+          durableBeforeDispatch?.execution.unverifiedMutations.toSet() ??
+              const <int>{};
+      final unresolvedPriorAction = durableBeforeDispatch?.execution.audit.any(
+            (event) =>
+                event.mutation &&
+                event.phase == 'uncertain' &&
+                unresolvedMutationSequences.contains(event.sequence) &&
+                event.action == action,
+          ) ??
+          false;
+      if (call.mutation != ToolMutation.readOnly && unresolvedPriorAction) {
+        previousResult =
+            'Refused to repeat $action because a prior effect is still uncertain. '
+            'Use a read-only observation or another independent strategy.';
+        results.add('$action: not replayed; prior mutation needs review.');
+        failedStrategies.add('$action: prior effect remains unverified');
+        consecutiveFailures++;
         continue;
       }
 
@@ -1227,6 +1406,7 @@ Remember:
       _actionInFlight = true;
       bool toolSucceeded = false;
       bool toolThrew = false;
+      bool toolNeedsReview = false;
       try {
         if (_paused || _cancelled || _budgetExpired) {
           // Clear the just-created checkpoint as not executed, then the loop's
@@ -1454,7 +1634,9 @@ Remember:
             consecutiveFailures = 0;
             toolSucceeded = true;
           } catch (error) {
-            toolThrew = call.mutation != ToolMutation.readOnly;
+            toolThrew =
+                call.mutation != ToolMutation.readOnly &&
+                error is! FileServiceException;
             previousResult = '$action failed: $error';
             results.add(previousResult);
             consecutiveFailures++;
@@ -1586,6 +1768,7 @@ Remember:
 
             toolSucceeded = commandResult.succeeded;
             toolThrew = commandResult.uncertain;
+            toolNeedsReview = commandResult.mayHavePartialEffects;
             if (commandResult.succeeded) {
               consecutiveFailures = 0;
             } else {
@@ -1594,6 +1777,7 @@ Remember:
           } catch (e) {
             previousResult = 'ERROR executing command: $e';
             toolThrew = true;
+            toolNeedsReview = true;
 
             consecutiveFailures++;
           }
@@ -1851,14 +2035,21 @@ Remember:
             '$actionResult. Re-observe and choose a recovery action.';
         screenContent = '';
         continue;
-      } catch (_) {
+      } catch (error) {
         if (call.mutation == ToolMutation.readOnly) {
-          previousResult = 'ERROR: $action failed before returning a result.';
+          previousResult =
+              'ERROR: $action failed before returning a result: $error';
           results.add('$action: $previousResult');
           consecutiveFailures++;
         } else {
           toolThrew = true;
-          rethrow;
+          toolNeedsReview = true;
+          previousResult =
+              '$action may have had partial effects. Do not repeat it; '
+              'inspect the current state or continue with an independent strategy.';
+          results.add('$action: outcome saved for review; trying alternatives.');
+          failedStrategies.add('$action: outcome uncertain; do not replay');
+          consecutiveFailures++;
         }
       } finally {
         // Dart runs finally on every continue and return in the dispatch.
@@ -1872,13 +2063,15 @@ Remember:
             _activeTaskId!,
             technicalSuccess:
                 classification == ToolResultClassification.succeeded,
-            uncertain: toolThrew,
+            uncertain: toolThrew || toolNeedsReview,
+            continueAfterUncertain: true,
           );
         } finally {
           _actionInFlight = false;
         }
-        if (toolThrew) {
-          throw ToolOutcomeUncertainException(action);
+        if (toolSucceeded) {
+          consecutiveVerifierGaps = 0;
+          _assistanceBatchShown = false;
         }
       }
     }
@@ -1931,6 +2124,7 @@ Remember:
       _aiService.maxSteps,
       results,
     );
+
     await _finishTask(
       TaskStatus.needsRevision,
       _aiService.maxSteps,
@@ -1958,7 +2152,7 @@ Remember:
   ) async {
     results.add('Task cancelled by user.');
 
-    _report('Task cancelled.');
+    _report('Task cancelled. Its checkpoint remains available in this chat.');
 
     await _notificationService.showTaskCompleteNotification(
       'Task Cancelled',
@@ -1972,6 +2166,7 @@ Remember:
       step,
       results,
     );
+
     await _finishTask(
       TaskStatus.cancelled,
       step,
@@ -1984,7 +2179,7 @@ Remember:
       await _screenService.showToast('Task Cancelled');
     }
 
-    return 'Task cancelled.';
+    return 'Task cancelled. Its checkpoint remains available in this chat.';
   }
 
   Future<String> _handlePause(
@@ -1995,7 +2190,7 @@ Remember:
     List<String> failedStrategies,
   ) async {
     results.add('Task paused by user.');
-    _report('Task paused. You can resume it from Task History.');
+    _report('Task paused. You can resume it from this chat.');
     await _finishTask(
       TaskStatus.paused,
       step,
@@ -2003,7 +2198,7 @@ Remember:
       results,
       failedStrategies,
     );
-    return 'Task paused. You can resume it from Task History.';
+    return 'Task paused. You can resume it from this chat.';
   }
 
   // ===========================================================================
@@ -2027,7 +2222,7 @@ Remember:
   ) async {
     _remoteCancellation.cancel();
     const message =
-        'Task budget exhausted. Results preserved; revision required.';
+        'Task budget exhausted. The checkpoint is saved; continue it from this chat.';
     results.add(message);
     _report(message);
     await _finishTask(
@@ -2060,16 +2255,18 @@ Remember:
     }
   }
 
-  Future<String?> _requestUserAnswer(String question) async {
+  Future<Set<String>?> _requestUserAnswer(
+    List<TaskAssistanceItem> items,
+  ) async {
     final callback = onUserQuestion;
     if (callback == null) return null;
-    final stopped = Completer<String?>();
+    final stopped = Completer<Set<String>?>();
     final remove = _remoteCancellation.onCancel(() {
       if (!stopped.isCompleted) stopped.complete(null);
     });
     try {
-      final response = Future<String?>.sync(
-        () => callback(question),
+      final response = Future<Set<String>?>.sync(
+        () => callback(items),
       ).timeout(UserAssistancePolicy.timeLimit, onTimeout: () => null);
       return await Future.any([response, stopped.future]);
     } catch (_) {
@@ -2077,6 +2274,98 @@ Remember:
     } finally {
       remove();
     }
+  }
+
+  List<String> _completionEvidenceGaps(TaskExecutionState state) {
+    if (state.plan.isEmpty) return const ['The task has no saved completion plan.'];
+    final evidence = {
+      for (final event in state.audit)
+        if (event.phase == 'after' &&
+            event.technicalSuccess &&
+            event.revision == state.revision)
+          event.evidenceId: event,
+    };
+    final gaps = <String>[];
+    for (final subtask in state.plan) {
+      for (final criterion in subtask.criteria) {
+        final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
+        final valid = refs.isNotEmpty &&
+            refs.every(evidence.containsKey) &&
+            refs.any((ref) => evidence[ref]!.action != 'wait');
+        if (!valid) gaps.add('${subtask.objective}: $criterion');
+      }
+    }
+    return gaps;
+  }
+
+  List<TaskAssistanceItem> _assistanceItems(TaskExecutionState state) {
+    final items = <TaskAssistanceItem>[
+      for (final request in state.pendingAssistance)
+        TaskAssistanceItem(
+          id: request.id,
+          kind: TaskAssistanceKind.humanStep,
+          title: request.question,
+          details: 'Observed blocker: ${request.evidence}',
+        ),
+    ];
+    final evidence = {
+      for (final event in state.audit)
+        if (event.phase == 'after' &&
+            event.technicalSuccess &&
+            event.revision == state.revision)
+          event.evidenceId: event,
+    };
+    var reviewIndex = 0;
+    for (final subtask in state.plan) {
+      for (final criterion in subtask.criteria) {
+        final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
+        final supported = refs.isNotEmpty &&
+            refs.every(evidence.containsKey) &&
+            refs.any((ref) => evidence[ref]!.action != 'wait');
+        final confirmed = state.criterionConfirmations.any(
+          (confirmation) =>
+              confirmation.revision == state.revision &&
+              confirmation.subtaskId == subtask.id &&
+              confirmation.criterion == criterion,
+        );
+        if (!supported || confirmed) continue;
+        items.add(
+          TaskAssistanceItem(
+            id: 'criterion-review-$reviewIndex',
+            kind: TaskAssistanceKind.criterionReview,
+            title: 'Verify: $criterion',
+            details:
+                'Subtask: ${subtask.objective}\nSupporting evidence: ${refs.join(', ')}',
+            subtaskId: subtask.id,
+            criterion: criterion,
+          ),
+        );
+        reviewIndex++;
+      }
+    }
+    for (final sequence in state.unverifiedMutations) {
+      final matching = state.audit.where(
+        (event) => event.sequence == sequence && event.mutation,
+      );
+      if (matching.isEmpty) continue;
+      final event = matching.last;
+      if (event.outcome == 'userConfirmed' || event.outcome == 'observed') {
+        continue;
+      }
+      items.add(
+        TaskAssistanceItem(
+          id: 'mutation-review-$sequence',
+          kind: TaskAssistanceKind.mutationReview,
+          title: 'Verify the effect of ${event.action}',
+          details:
+              'Action ${event.evidenceId} may have changed the destination. '
+              'Inspect its current state; only mark it verified if the requested '
+              'effect is present.',
+          actionSequence: sequence,
+        ),
+      );
+    }
+    return items;
   }
 
   Future<void> _finishTask(
@@ -2096,6 +2385,7 @@ Remember:
       id,
       status: status,
       progress: status == TaskStatus.completed ? 1 : null,
+      stepsCompleted: steps,
       tokens: tokens,
       results: results.length <= 20
           ? results
@@ -2112,9 +2402,20 @@ Remember:
     final id = _activeTaskId;
     if (id == null) return;
     final record = await _taskStore.get(id);
-    final status = record?.execution.inFlight?.mutation == true
-        ? TaskStatus.needsRevision
-        : TaskStatus.failed;
+    var status = TaskStatus.failed;
+    final pending = record?.execution.inFlight;
+    if (pending != null) {
+      final uncertainMutation = pending.mutation;
+      await _taskStore.endAction(
+        id,
+        technicalSuccess: false,
+        uncertain: uncertainMutation,
+        continueAfterUncertain: true,
+      );
+      if (uncertainMutation) status = TaskStatus.needsRevision;
+    } else if (record?.execution.unverifiedMutations.isNotEmpty == true) {
+      status = TaskStatus.needsRevision;
+    }
     await _taskStore.update(id, status: status);
     lastStatus = status;
     _activeTaskId = null;

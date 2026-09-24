@@ -19,7 +19,10 @@ class ShizukuCommandResult {
   final String? error;
 
   bool get succeeded => wasDispatched && exitCode == 0;
-  bool get uncertain => wasDispatched && exitCode != 0;
+  bool get uncertain => wasDispatched && exitCode == null;
+  bool get knownFailure =>
+      wasDispatched && exitCode != null && exitCode != 0;
+  bool get mayHavePartialEffects => uncertain || knownFailure;
 
   factory ShizukuCommandResult.fromPlatformMap(Map<dynamic, dynamic> values) {
     final rawExitCode = values['exitCode'];
@@ -39,7 +42,7 @@ class ShizukuCommandResult {
     if (stderr.trim().isNotEmpty) sections.add('stderr:\n${stderr.trim()}');
     if (exitCode != null) sections.add('Exit code: $exitCode');
     if (error != null) sections.add('Command error: $error');
-    if (uncertain) {
+    if (mayHavePartialEffects) {
       sections.add(
         'The command may have had partial effects. Review device state before retrying.',
       );

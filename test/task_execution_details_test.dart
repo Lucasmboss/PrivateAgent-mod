@@ -10,7 +10,7 @@ void main() {
     createdAt: date, updatedAt: date, progress: .5, execution: execution);
 
   Future<void> render(WidgetTester tester, TaskRecord task,
-      {VoidCallback? review, ValueChanged<int>? confirm,
+      {ValueChanged<int>? review, ValueChanged<int>? confirm,
       void Function(TaskSubtask, String, bool)? criterionReview,
       VoidCallback? finalize}) async {
     await tester.pumpWidget(MaterialApp(home: Scaffold(
@@ -109,9 +109,41 @@ void main() {
     expect(button.onPressed, isNull);
     expect(find.textContaining('Technical result: not yet recorded'), findsOneWidget);
     var reviews = 0;
-    await render(tester, task, review: () => reviews++);
+    await render(tester, task, review: (sequence) {
+      reviews++;
+      expect(sequence, 4);
+    });
     expect(reviews, 0);
     await tester.tap(find.text('Review uncertain action'));
     expect(reviews, 1);
+  });
+
+  testWidgets('recovered uncertain audit remains independently reviewable',
+      (tester) async {
+    final uncertain = ActionAudit(
+      sequence: 7,
+      action: 'write_file',
+      phase: 'uncertain',
+      timestamp: date,
+      mutation: true,
+      revision: 0,
+      technicalSuccess: false,
+    );
+    int? reviewedSequence;
+    await render(
+      tester,
+      record(
+        TaskExecutionState(
+          audit: [uncertain],
+          unverifiedMutations: const [7],
+          verification: 'uncertain',
+        ),
+      ),
+      review: (sequence) => reviewedSequence = sequence,
+    );
+    const label = 'Review uncertain action-7 outcome';
+    await tester.ensureVisible(find.text(label));
+    await tester.tap(find.text(label));
+    expect(reviewedSequence, 7);
   });
 }

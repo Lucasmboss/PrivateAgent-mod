@@ -42,6 +42,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   late final TelegramService _telegramService;
 
   final List<ChatMessage> _messages = [];
+  List<TaskRecord> _resumableTasks = [];
   bool _isLoading = false;
   bool _isListening = false;
   bool _isAssistantCompact = false;
@@ -94,13 +95,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (dialog != null && dialog.mounted) Navigator.of(dialog).pop();
   }
 
-  Future<String?> _requestTaskUserAnswer(String question) async {
+  Future<Set<String>?> _requestTaskUserAnswer(
+    List<TaskAssistanceItem> items,
+  ) async {
     if (!mounted || _appLifecycleState != AppLifecycleState.resumed)
       return null;
     Timer? timeout;
+    final selected = <String>{};
     setState(() => _taskStateLabel = 'Waiting for your help');
     try {
-      return await showDialog<String>(
+      return await showDialog<Set<String>>(
         context: context,
         barrierDismissible: false,
         builder: (dialogContext) {
@@ -109,48 +113,69 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             UserAssistancePolicy.timeLimit,
             _dismissUserQuestion,
           );
-          return AlertDialog(
-            title: const Text('The task needs a step only you can do'),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(question),
-                  const SizedBox(height: 14),
-                  const Text(
-                    'Complete it directly in the target app or Android Settings, '
-                    'then return here. Do not enter passwords, codes, or private '
-                    'details in PrivateAgent. The app only receives a completion '
-                    'signal, not your data.',
-                    style: TextStyle(fontSize: 12),
-                  ),
-                  const SizedBox(height: 10),
-                  const Text(
-                    'This request expires after 5 minutes.',
-                    style: TextStyle(fontSize: 12),
-                  ),
-                ],
+          return StatefulBuilder(
+            builder: (context, setDialogState) => AlertDialog(
+              title: const Text('Review the remaining steps'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'The agent has finished its available independent work. '
+                      'Complete human-only steps or verify outcomes below. '
+                      'Do not enter passwords, codes, or private details here.',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                    const SizedBox(height: 12),
+                    for (final item in items)
+                      CheckboxListTile(
+                        value: selected.contains(item.id),
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        title: Text(item.title),
+                        subtitle: Text(item.details),
+                        onChanged: (checked) {
+                          setDialogState(() {
+                            if (checked == true) {
+                              selected.add(item.id);
+                            } else {
+                              selected.remove(item.id);
+                            }
+                          });
+                        },
+                      ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Only checked items are sent back as completion or review '
+                      'signals. No free-text answer is collected.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'This request expires after 5 minutes.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
               ),
+              actions: [
+                TextButton(
+                  onPressed: () =>
+                      Navigator.of(dialogContext).pop(<String>{}),
+                  child: const Text('Not now'),
+                ),
+                TextButton(
+                  onPressed: () => _stopActiveTask(pause: true),
+                  child: const Text('Pause task'),
+                ),
+                FilledButton(
+                  onPressed: () =>
+                      Navigator.of(dialogContext).pop(Set<String>.from(selected)),
+                  child: const Text('Continue'),
+                ),
+              ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(
-                  dialogContext,
-                ).pop(UserAssistancePolicy.declinedReply),
-                child: const Text('Not now'),
-              ),
-              TextButton(
-                onPressed: () => _stopActiveTask(pause: true),
-                child: const Text('Pause task'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(
-                  dialogContext,
-                ).pop(UserAssistancePolicy.completedReply),
-                child: const Text('I completed the step'),
-              ),
-            ],
           );
         },
       );
@@ -206,6 +231,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     _servicesReady = true;
     if (!mounted) return;
+    await _refreshResumableTasks();
 
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -368,6 +394,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await ChatHistoryService.saveSession(session);
   }
 
+  Future<void> _refreshResumableTasks() async {
+    try {
+      final records = await TaskStore().list();
+      final resumable = records
+          .where(
+            (record) =>
+                record.chatSessionId == _sessionId &&
+                record.status != TaskStatus.running &&
+                record.status != TaskStatus.completed,
+          )
+          .toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      if (mounted) setState(() => _resumableTasks = resumable);
+    } catch (error) {
+      developer.log(
+        'Could not refresh resumable tasks: $error',
+        name: 'PrivateAgent',
+      );
+    }
+  }
+
   Future<void> _sendMessage(String text) async {
     if (!mounted || _isLoading || text.trim().isEmpty) return;
     final generation = _taskGeneration;
@@ -475,6 +522,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           aiService: _aiService,
           onUserQuestion: _requestTaskUserAnswer,
           userRequest: text.trim(),
+          chatSessionId: _sessionId,
           onProgress: (msg) {
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
@@ -547,6 +595,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           );
         }
         await _saveSession();
+        await _refreshResumableTasks();
       } else {
         if (_voiceOutputEnabled) {
           unawaited(_speakVoiceResponse(accumulated));
@@ -591,6 +640,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _resumeTask(TaskRecord task) async {
     if (_isLoading) return;
+    if (task.chatSessionId != null && task.chatSessionId != _sessionId) {
+      final originatingSession = await ChatHistoryService.getSession(
+        task.chatSessionId!,
+      );
+      if (originatingSession == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'The original chat is unavailable. Reopen it before continuing this task.',
+              ),
+            ),
+          );
+        }
+        return;
+      }
+      _loadChatSession(originatingSession);
+    }
     _stopRequested = false;
     _lastStopWasPause = false;
     setState(() {
@@ -599,6 +666,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _taskStateLabel = 'Resuming task...';
     });
     try {
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            role: 'assistant',
+            content: 'Continuing from the saved task checkpoint.',
+          ),
+        );
+      });
+      await _saveSession();
       final result = await _actionHandler.execute(
         AgentAction(
           action: 'execute_task',
@@ -607,6 +683,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         aiService: _aiService,
         onUserQuestion: _requestTaskUserAnswer,
+        chatSessionId: task.chatSessionId ?? _sessionId,
         onProgress: (message) {
           if (mounted) {
             setState(() {
@@ -636,6 +713,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         );
         await _saveSession();
+        await _refreshResumableTasks();
         if (_voiceOutputEnabled) {
           unawaited(_speakVoiceResponse(result.details ?? 'Task stopped.'));
         }
@@ -833,6 +911,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _messages.clear();
       _aiService.clearHistory();
     });
+    unawaited(_refreshResumableTasks());
   }
 
   void _loadChatSession(ChatSession session) {
@@ -851,6 +930,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
     });
     _scrollToBottom();
+    unawaited(_refreshResumableTasks());
+  }
+
+  Future<void> _openResumableTasks() async {
+    final task = await Navigator.push<TaskRecord>(
+      context,
+      MaterialPageRoute(builder: (_) => const TaskHistoryScreen()),
+    );
+    if (task != null && mounted) await _resumeTask(task);
   }
 
   @override
@@ -1123,6 +1211,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ),
 
               // Chat content area
+              if (_resumableTasks.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                  child: Column(
+                    children: [
+                      for (final task in _resumableTasks.take(2))
+                        Card(
+                          margin: const EdgeInsets.only(bottom: 6),
+                          child: ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.restore_rounded),
+                            title: Text(
+                              task.goal,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            subtitle: Text(
+                              'Saved checkpoint · ${task.status.name}',
+                            ),
+                            trailing: TextButton(
+                              onPressed: _isLoading
+                                  ? null
+                                  : () => unawaited(_resumeTask(task)),
+                              child: const Text('Resume'),
+                            ),
+                          ),
+                        ),
+                      if (_resumableTasks.length > 2)
+                        TextButton(
+                          onPressed: () => unawaited(_openResumableTasks()),
+                          child: Text(
+                            'View ${_resumableTasks.length - 2} more saved tasks',
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
               Expanded(
                 child: _messages.isEmpty
                     ? _buildEmptyState(isDark)
@@ -1462,7 +1587,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               color: isDark ? Colors.grey[400] : Colors.grey[600],
               size: 20,
             ),
-            title: Text('Task History', style: textStyle),
+            title: Text('Resumable tasks', style: textStyle),
             onTap: () async {
               Navigator.pop(context);
               final task = await Navigator.push<TaskRecord>(

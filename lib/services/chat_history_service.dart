@@ -137,6 +137,15 @@ class ChatHistoryService {
   static Future<List<ChatSession>> loadSessions() =>
       _runSerialized(_loadSessions);
 
+  static Future<ChatSession?> getSession(String id) =>
+      _runSerialized(() async {
+        final sessions = await _loadSessions();
+        for (final session in sessions) {
+          if (session.id == id) return session;
+        }
+        return null;
+      });
+
   static Future<List<ChatSession>> _loadSessions() async {
     if (!await isPersistenceEnabled()) return [];
     final file = await _localFile;

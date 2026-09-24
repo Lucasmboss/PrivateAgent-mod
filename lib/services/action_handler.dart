@@ -48,6 +48,7 @@ class ActionHandler {
     AiService? aiService,
     void Function(String)? onProgress,
     String? userRequest,
+    String? chatSessionId,
     ToolApprovalCallback? onApproval,
     TaskUserQuestionCallback? onUserQuestion,
   }) async {
@@ -83,6 +84,7 @@ class ActionHandler {
       String result;
       bool taskSucceeded = false;
       ShizukuCommandResult? adbCommandOutcome;
+      String? resumableTaskId;
 
       _directActionInFlight = true;
       switch (action.action) {
@@ -312,6 +314,7 @@ class ActionHandler {
             onProgress: onProgress,
             onApproval: onApproval,
             onUserQuestion: onUserQuestion,
+            chatSessionId: chatSessionId,
           );
           try {
             result = await _currentExecutor!.executeTask(
@@ -320,12 +323,19 @@ class ActionHandler {
             );
             taskSucceeded =
                 _currentExecutor!.lastStatus == TaskStatus.completed;
+            if (!taskSucceeded) {
+              resumableTaskId = _currentExecutor!.lastTaskId;
+            }
           } on ToolOutcomeUncertainException catch (error) {
             result = error.userMessage;
             taskSucceeded = false;
+            resumableTaskId = _currentExecutor!.lastTaskId;
           } catch (error) {
+            resumableTaskId = _currentExecutor!.lastTaskId;
             await _currentExecutor!.failUnexpected(error);
-            rethrow;
+            result =
+                'Task stopped unexpectedly. Its safe checkpoint is saved in this chat.';
+            taskSucceeded = false;
           } finally {
             _currentExecutor = null;
           }
@@ -352,6 +362,7 @@ class ActionHandler {
         actionType: action.action,
         success: requestSucceeded,
         details: result,
+        taskId: action.action == 'execute_task' ? resumableTaskId : null,
       );
     } catch (e) {
       _directActionInFlight = false;

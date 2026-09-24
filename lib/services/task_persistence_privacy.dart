@@ -26,6 +26,34 @@ class TaskPersistencePrivacy {
     json['originalGoal'] = goalText(record.originalGoal);
     final state = Map<String, dynamic>.from(json['execution']);
     state['revisions'] = record.execution.revisions.map(goalText).toList();
+    state['pendingAssistance'] = record.execution.pendingAssistance
+        .take(20)
+        .map((request) => {
+          'id': RegExp(r'^assist-[A-Za-z0-9_-]{1,80}$').hasMatch(request.id)
+              ? request.id
+              : 'assist-${record.execution.pendingAssistance.indexOf(request)}',
+          'question': _credentials(request.question).substring(
+            0,
+            _credentials(request.question).length > 320
+                ? 320
+                : _credentials(request.question).length,
+          ),
+          'blockerType': const {
+            'sign_in',
+            'private_data',
+            'system_permission',
+            'human_verification',
+          }.contains(request.blockerType)
+              ? request.blockerType
+              : 'human_verification',
+          'evidence': _credentials(request.evidence).substring(
+            0,
+            _credentials(request.evidence).length > 120
+                ? 120
+                : _credentials(request.evidence).length,
+          ),
+        })
+        .toList();
     state['plan'] = record.execution.plan.map((s) => {
       'id': goalText(s.id), 'objective': goalText(s.objective),
       'dependencies': s.dependencies.map(goalText).toList(),
@@ -40,7 +68,12 @@ class TaskPersistencePrivacy {
       ...e.toJson(),
       'action': RegExp(r'^[a-z_]{1,40}$').hasMatch(e.action) ? e.action : 'unknown',
       'phase': {'before', 'after', 'uncertain'}.contains(e.phase) ? e.phase : 'uncertain',
-      'outcome': {'unverified', 'userConfirmed', 'observed'}.contains(e.outcome)
+      'outcome': {
+        'unverified',
+        'userConfirmed',
+        'userConfirmedFailure',
+        'observed',
+      }.contains(e.outcome)
           ? e.outcome : 'unverified',
     };
     final entries = record.execution.audit;
@@ -51,6 +84,14 @@ class TaskPersistencePrivacy {
     state['verification'] = {'verified', 'unverified', 'partial', 'uncertain'}
         .contains(record.execution.verification) ? record.execution.verification : 'unverified';
     json['execution'] = state;
+    final sessionId = record.chatSessionId;
+    json['chatSessionId'] = sessionId != null &&
+            RegExp(r'^[A-Za-z0-9_-]{1,128}$').hasMatch(sessionId)
+        ? sessionId
+        : null;
+    json['stepsCompleted'] = record.stepsCompleted < 0
+        ? 0
+        : record.stepsCompleted;
     final verification = TaskVerifier.verify(TaskExecutionState.fromJson(state));
     state['verification'] = verification;
     if (record.status == TaskStatus.completed && verification != 'verified') {

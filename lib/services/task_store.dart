@@ -55,6 +55,8 @@ class TaskStore {
           goal: goal,
           execution: _revised(current, goal).copyWith(clearInFlight: true),
           status: TaskStatus.running,
+          stepsCompleted: goal == current.goal ? current.stepsCompleted : 0,
+          progress: goal == current.goal ? current.progress : 0,
           updatedAt: DateTime.now(),
         );
         records[index] = claimed;
@@ -87,6 +89,7 @@ class TaskStore {
   Future<TaskRecord> create({
     required String goal,
     String? identifier,
+    String? chatSessionId,
     TaskStatus status = TaskStatus.running,
     DateTime? now,
     double progress = 0,
@@ -101,6 +104,7 @@ class TaskStore {
         final record = TaskRecord(
           identifier: identifier ?? _newIdentifier(timestamp, records),
           goal: goal,
+          chatSessionId: chatSessionId,
           execution: TaskExecutionState(plan: [
             TaskSubtask(id: 'goal', objective: goal, criteria: [goal]),
           ]),
@@ -138,6 +142,7 @@ class TaskStore {
     TaskStatus? status,
     DateTime? now,
     double? progress,
+    int? stepsCompleted,
     int? tokens,
     dynamic results,
     List<String>? failedStrategies,
@@ -149,6 +154,7 @@ class TaskStore {
         if (index < 0) throw StateError('Task not found');
         final current = records[index];
         final nextStatus = status ?? current.status;
+        final goalChanged = goal != null && goal != current.goal;
         final nextExecution = goal == null ? current.execution : _revised(current, goal!);
         if (nextStatus == TaskStatus.completed &&
             TaskVerifier.verify(nextExecution) != 'verified') {
@@ -164,7 +170,8 @@ class TaskStore {
               ? (current.startedAt ?? timestamp)
               : current.startedAt,
           completedAt: nextStatus == TaskStatus.completed ? timestamp : null,
-          progress: progress,
+          progress: goalChanged ? 0 : progress,
+          stepsCompleted: goalChanged ? 0 : stepsCompleted,
           tokens: tokens,
           results: results,
           failedStrategies: failedStrategies == null
@@ -194,9 +201,44 @@ class TaskStore {
         final recovered = records.map((record) {
           if (record.status != TaskStatus.running) return record;
           changed = true;
+          final pending = record.execution.inFlight;
+          final recoveredExecution = pending == null
+              ? record.execution
+              : record.execution.copyWith(
+                  clearInFlight: true,
+                  lastResult: ActionAudit(
+                    sequence: pending.sequence,
+                    action: pending.action,
+                    phase: pending.mutation ? 'uncertain' : 'after',
+                    timestamp: DateTime.now(),
+                    mutation: pending.mutation,
+                    revision: pending.revision,
+                    technicalSuccess: false,
+                  ),
+                  audit: _append(
+                    record.execution.audit,
+                    ActionAudit(
+                      sequence: pending.sequence,
+                      action: pending.action,
+                      phase: pending.mutation ? 'uncertain' : 'after',
+                      timestamp: DateTime.now(),
+                      mutation: pending.mutation,
+                      revision: pending.revision,
+                      technicalSuccess: false,
+                    ),
+                  ),
+                  unverifiedMutations: pending.mutation
+                      ? [...record.execution.unverifiedMutations, pending.sequence]
+                          .toSet()
+                          .toList()
+                      : record.execution.unverifiedMutations,
+                  verification: pending.mutation ? 'uncertain' : 'unverified',
+                );
           return record.copyWith(
-            status: record.execution.inFlight?.mutation == true
-                ? TaskStatus.needsRevision : TaskStatus.paused,
+            execution: recoveredExecution,
+            status: pending?.mutation == true
+                ? TaskStatus.needsRevision
+                : TaskStatus.paused,
             updatedAt: DateTime.now(),
           );
         }).toList();
@@ -262,7 +304,8 @@ class TaskStore {
   });
 
   Future<TaskRecord> endAction(String id, {required bool technicalSuccess,
-      bool uncertain = false}) => _mutate(id, (record) {
+      bool uncertain = false, bool continueAfterUncertain = false}) =>
+      _mutate(id, (record) {
     final state = record.execution;
     final pending = state.inFlight;
     if (pending == null) throw StateError('No pending action');
@@ -271,14 +314,52 @@ class TaskStore {
       mutation: pending.mutation, revision: pending.revision,
       technicalSuccess: technicalSuccess);
     return record.copyWith(
-      status: uncertain && pending.mutation ? TaskStatus.needsRevision : null,
-      execution: state.copyWith(clearInFlight: !uncertain || !pending.mutation,
+      status: uncertain && pending.mutation && !continueAfterUncertain
+          ? TaskStatus.needsRevision
+          : null,
+      execution: state.copyWith(
+        clearInFlight:
+            !uncertain || !pending.mutation || continueAfterUncertain,
         unverifiedMutations: pending.mutation && (technicalSuccess || uncertain)
             ? [...state.unverifiedMutations, pending.sequence].toSet().toList()
             : state.unverifiedMutations,
         lastResult: event, audit: _append(state.audit, event),
         verification: uncertain ? 'uncertain' : 'unverified'));
   });
+
+  Future<TaskRecord> addPendingAssistance(
+    String id,
+    PendingAssistanceRequest request,
+  ) => _mutate(id, (record) {
+    if (!RegExp(r'^assist-[A-Za-z0-9_-]{1,80}$').hasMatch(request.id) ||
+        request.question.trim().isEmpty ||
+        request.question.length > 320 ||
+        request.evidence.trim().length < 4 ||
+        request.evidence.length > 120) {
+      throw const FormatException('Invalid pending assistance request');
+    }
+    final pending = [...record.execution.pendingAssistance];
+    if (pending.any((item) => item.id == request.id)) return record;
+    if (pending.length >= 20) {
+      throw StateError('The task already has the maximum pending requests');
+    }
+    return record.copyWith(
+      execution: record.execution.copyWith(
+        pendingAssistance: [...pending, request],
+      ),
+    );
+  });
+
+  Future<TaskRecord> resolvePendingAssistance(
+    String id,
+    Set<String> resolvedIds,
+  ) => _mutate(id, (record) => record.copyWith(
+    execution: record.execution.copyWith(
+      pendingAssistance: record.execution.pendingAssistance
+          .where((item) => !resolvedIds.contains(item.id))
+          .toList(),
+    ),
+  ));
 
   /// Only trusted user-review UI may call this; never expose it as an AI tool.
   /// Resolves ambiguous execution without replaying the operation.
@@ -291,12 +372,54 @@ class TaskStore {
     final event = ActionAudit(sequence: pending.sequence, action: pending.action,
       phase: 'after', timestamp: DateTime.now(), mutation: pending.mutation,
       revision: pending.revision, technicalSuccess: userConfirmedSuccess,
-      outcome: userConfirmedSuccess ? 'userConfirmed' : 'unverified');
+      outcome: userConfirmedSuccess
+          ? 'userConfirmed'
+          : 'userConfirmedFailure');
     return record.copyWith(status: TaskStatus.needsRevision,
       execution: state.copyWith(clearInFlight: true, lastResult: event,
         unverifiedMutations: state.unverifiedMutations
             .where((s) => s != pending.sequence).toList(),
         audit: _append(state.audit, event), verification: 'unverified'));
+  });
+
+  Future<TaskRecord> resolveUncertainAuditAction(
+    String id, {
+    required int sequence,
+    required bool userConfirmedSuccess,
+  }) => _mutate(id, (record) {
+    if (record.status == TaskStatus.running) {
+      throw StateError('Stop task before review');
+    }
+    final state = record.execution;
+    final event = state.audit.lastWhere(
+      (item) =>
+          item.sequence == sequence &&
+          item.phase == 'uncertain' &&
+          item.mutation,
+    );
+    final resolved = ActionAudit(
+      sequence: event.sequence,
+      action: event.action,
+      phase: 'after',
+      timestamp: DateTime.now(),
+      mutation: true,
+      revision: event.revision,
+      technicalSuccess: userConfirmedSuccess,
+      outcome: userConfirmedSuccess
+          ? 'userConfirmed'
+          : 'userConfirmedFailure',
+    );
+    return record.copyWith(
+      status: TaskStatus.needsRevision,
+      execution: state.copyWith(
+        lastResult: resolved,
+        audit: _append(state.audit, resolved),
+        unverifiedMutations: state.unverifiedMutations
+            .where((item) => item != sequence)
+            .toList(),
+        verification: 'unverified',
+      ),
+    );
   });
 
   /// New criteria invalidate old evidence by advancing the revision.

@@ -25,6 +25,7 @@ class TaskRecord {
   final String goal;
   final String? _originalGoal;
   String get originalGoal => _originalGoal ?? goal;
+  final String? chatSessionId;
   final TaskExecutionState execution;
   final TaskStatus status;
   final DateTime createdAt;
@@ -32,6 +33,7 @@ class TaskRecord {
   final DateTime? startedAt;
   final DateTime? completedAt;
   final double progress;
+  final int stepsCompleted;
   final int tokens;
   final dynamic results;
   final List<String> failedStrategies;
@@ -40,6 +42,7 @@ class TaskRecord {
     required this.identifier,
     required this.goal,
     String? originalGoal,
+    this.chatSessionId,
     this.execution = const TaskExecutionState(),
     required this.status,
     required this.createdAt,
@@ -47,6 +50,7 @@ class TaskRecord {
     this.startedAt,
     this.completedAt,
     this.progress = 0,
+    this.stepsCompleted = 0,
     this.tokens = 0,
     this.results,
     this.failedStrategies = const [],
@@ -55,6 +59,7 @@ class TaskRecord {
   TaskRecord copyWith({
     String? identifier,
     String? goal,
+    String? chatSessionId,
     TaskExecutionState? execution,
     TaskStatus? status,
     DateTime? createdAt,
@@ -62,6 +67,7 @@ class TaskRecord {
     DateTime? startedAt,
     DateTime? completedAt,
     double? progress,
+    int? stepsCompleted,
     int? tokens,
     dynamic results,
     List<String>? failedStrategies,
@@ -70,6 +76,7 @@ class TaskRecord {
         identifier: identifier ?? this.identifier,
         goal: goal ?? this.goal,
         originalGoal: originalGoal,
+        chatSessionId: chatSessionId ?? this.chatSessionId,
         execution: execution ?? this.execution,
         status: status ?? this.status,
         createdAt: createdAt ?? this.createdAt,
@@ -77,6 +84,7 @@ class TaskRecord {
         startedAt: startedAt ?? this.startedAt,
         completedAt: completedAt ?? this.completedAt,
         progress: progress ?? this.progress,
+        stepsCompleted: stepsCompleted ?? this.stepsCompleted,
         tokens: tokens ?? this.tokens,
         results: results ?? this.results,
         failedStrategies: failedStrategies ?? this.failedStrategies,
@@ -86,6 +94,7 @@ class TaskRecord {
         'identifier': identifier,
         'goal': goal,
         'originalGoal': originalGoal,
+        'chatSessionId': chatSessionId,
         'execution': execution.toJson(),
         'status': status.name,
         'createdAt': createdAt.toIso8601String(),
@@ -93,6 +102,7 @@ class TaskRecord {
         'startedAt': startedAt?.toIso8601String(),
         'completedAt': completedAt?.toIso8601String(),
         'progress': progress,
+        'stepsCompleted': stepsCompleted,
         'tokens': tokens,
         'results': results,
         'failedStrategies': failedStrategies,
@@ -115,6 +125,7 @@ class TaskRecord {
       identifier: json['identifier'] as String,
       goal: json['goal'] as String,
       originalGoal: json['originalGoal'] as String?,
+      chatSessionId: json['chatSessionId'] as String?,
       execution: json['execution'] == null ? const TaskExecutionState()
           : TaskExecutionState.fromJson(Map<String, dynamic>.from(json['execution'])),
       status: taskStatusFromJson(json['status']),
@@ -123,6 +134,7 @@ class TaskRecord {
       startedAt: optionalDate('startedAt'),
       completedAt: optionalDate('completedAt'),
       progress: (json['progress'] as num?)?.toDouble() ?? 0,
+      stepsCompleted: (json['stepsCompleted'] as num?)?.toInt() ?? 0,
       tokens: (json['tokens'] as num?)?.toInt() ?? 0,
       results: json['results'],
       failedStrategies: failed == null

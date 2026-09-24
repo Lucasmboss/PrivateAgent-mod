@@ -109,8 +109,29 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
 
   Future<void> _review(TaskRecord record, {int? sequence}) async {
     final pending = record.execution.inFlight;
-    final uncertain = sequence == null;
-    final id = uncertain ? pending!.evidenceId : 'action-$sequence';
+    final unresolvedUncertain = record.execution.audit
+        .where(
+          (event) =>
+              event.phase == 'uncertain' &&
+              record.execution.unverifiedMutations.contains(event.sequence),
+        )
+        .toList();
+    final reviewSequence =
+        sequence ?? pending?.sequence ??
+        (unresolvedUncertain.isEmpty ? null : unresolvedUncertain.last.sequence);
+    if (reviewSequence == null) return;
+    final auditEvent = pending?.sequence == reviewSequence
+        ? pending!
+        : record.execution.audit.lastWhere(
+            (event) =>
+                event.sequence == reviewSequence && event.phase != 'before',
+          );
+    final uncertain =
+        (pending?.sequence == reviewSequence && pending!.mutation) ||
+        auditEvent.phase == 'uncertain';
+    final id = pending?.sequence == reviewSequence
+        ? pending!.evidenceId
+        : auditEvent.evidenceId;
     final decision = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -120,10 +141,10 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
           'You must independently verify the effects in the destination app, '
           'file, or service before confirming. A tool success message or an AI '
           'claim is not proof of the intended outcome.\n\n'
-          '${uncertain ? 'This action may already have changed external state. '
-              'Resolving it does not replay or undo it. Only mark “did not succeed” '
-              'if you verified that outcome; if unsure, keep it unresolved. '
-              'A later resume could attempt the operation again.' : 'Confirm only if you personally verified the intended outcome.'}\n\n'
+           '${uncertain ? 'This action may already have changed external state. '
+               'Resolving it does not replay or undo it. Only mark “did not succeed” '
+               'if you verified that outcome; if unsure, keep it unresolved. '
+               'The executor will not automatically replay this action.' : 'Confirm only if you personally verified the intended outcome.'}\n\n'
           'This records your attestation, not independent automated verification '
           'of the entire goal.',
         )),
@@ -142,14 +163,29 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
     await _perform(() async {
       final current = await _store.get(record.identifier);
       if (current == null || current.status == TaskStatus.running ||
-          (uncertain && current.execution.inFlight?.sequence != pending!.sequence)) {
+          (uncertain &&
+              (pending?.sequence == reviewSequence
+                  ? current.execution.inFlight?.sequence != reviewSequence
+                  : !current.execution.unverifiedMutations.contains(
+                      reviewSequence,
+                    )))) {
         throw StateError('Task changed during review. Refresh and review the current action.');
       }
       if (uncertain) {
-        await _store.resolveUncertainAction(record.identifier,
-            userConfirmedSuccess: decision);
+        if (pending?.sequence == reviewSequence) {
+          await _store.resolveUncertainAction(
+            record.identifier,
+            userConfirmedSuccess: decision,
+          );
+        } else {
+          await _store.resolveUncertainAuditAction(
+            record.identifier,
+            sequence: reviewSequence,
+            userConfirmedSuccess: decision,
+          );
+        }
       } else {
-        await _store.confirmActionOutcome(record.identifier, sequence);
+        await _store.confirmActionOutcome(record.identifier, reviewSequence);
       }
     });
   }
@@ -297,7 +333,8 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                               _reviewCriterion(record, subtask, criterion, confirmed),
                       onFinalize: _busy || _loading ? null : () => _finalize(record),
                       onReviewUncertain: _busy || _loading ||
-                          record.status == TaskStatus.running ? null : () => _review(record),
+                          record.status == TaskStatus.running ? null :
+                          (sequence) => _review(record, sequence: sequence),
                       onConfirmOutcome: _busy || _loading ||
                           record.status == TaskStatus.running ? null :
                           (sequence) => _review(record, sequence: sequence)),

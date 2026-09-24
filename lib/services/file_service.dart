@@ -58,20 +58,49 @@ class FileService {
   }
 
   Future<Directory> _root() async {
-    final root = (await _directoryProvider()).absolute;
-    await _rejectLinks(root.path);
-    return root;
+    final requestedRoot = (await _directoryProvider()).absolute;
+    if (await FileSystemEntity.type(
+          requestedRoot.path,
+          followLinks: false,
+        ) ==
+        FileSystemEntityType.link) {
+      throw FileServiceException(
+        'The private files directory cannot be a symlink.',
+      );
+    }
+    await requestedRoot.create(recursive: true);
+    if (await FileSystemEntity.type(
+          requestedRoot.path,
+          followLinks: false,
+        ) ==
+        FileSystemEntityType.link) {
+      throw FileServiceException(
+        'The private files directory cannot be a symlink.',
+      );
+    }
+    return Directory(await requestedRoot.resolveSymbolicLinks());
   }
 
-  /// Check with lstat semantics, including dangling links. Never create a
-  /// directory through an unchecked parent.
-  Future<void> _rejectLinks(String path) async {
-    final entity = File(path).absolute;
-    final parent = entity.parent;
-    if (parent.path != entity.path) await _rejectLinks(parent.path);
-    if (await FileSystemEntity.type(entity.path, followLinks: false) ==
-        FileSystemEntityType.link) {
-      throw FileServiceException('Symlinks are not allowed in private file paths.');
+  /// Check with lstat semantics, including dangling links, but only below the
+  /// canonical private root. Platform-owned ancestors may legitimately be
+  /// symlink aliases (for example, Android's app data directory).
+  Future<void> _rejectLinksWithin(String rootPath, String path) async {
+    final root = _normalise(Directory(rootPath).absolute.path);
+    final target = _normalise(File(path).absolute.path);
+    if (target != root && !target.startsWith('$root/')) {
+      throw FileServiceException('Path is outside the private directory.');
+    }
+    if (target == root) return;
+
+    var current = root;
+    for (final segment in target.substring(root.length + 1).split('/')) {
+      current = '$current/$segment';
+      if (await FileSystemEntity.type(current, followLinks: false) ==
+          FileSystemEntityType.link) {
+        throw FileServiceException(
+          'Symlinks are not allowed inside the private files directory.',
+        );
+      }
     }
   }
 
@@ -82,6 +111,11 @@ class FileService {
 
     final result = <String>[];
     await for (final entity in root.list(recursive: recursive, followLinks: false)) {
+      if (entity is Link) {
+        throw FileServiceException(
+          'Symlinks are not allowed inside the private files directory.',
+        );
+      }
       if (entity is File) {
         result.add(_relativePath(root.path, entity.path));
       }
@@ -118,7 +152,7 @@ class FileService {
     try {
       final staged = File('${staging.path}/content');
       await staged.writeAsBytes(bytes, flush: true);
-      await _rejectLinks(staging.path);
+      await _rejectLinksWithin(root.path, staging.path);
       final checked = await _fileInsideRoot(relativePath, forWrite: true);
       if (checked.path != file.path) {
         throw FileServiceException('The private files directory changed.');
@@ -154,9 +188,8 @@ class FileService {
     final relative = _validateRelativePath(value);
     final root = await _root();
     final file = File('${root.path}/$relative');
-    await _rejectLinks(file.path);
-    await root.create(recursive: true);
-    final rootCanonical = await root.resolveSymbolicLinks();
+    await _rejectLinksWithin(root.path, file.path);
+    final rootCanonical = root.path;
 
     if (await file.exists()) {
       if (await FileSystemEntity.type(file.path, followLinks: false) !=
@@ -172,7 +205,7 @@ class FileService {
     // pre-existing symlinked directory from escaping the private directory.
     final parent = file.parent;
     if (forWrite) await parent.create(recursive: true);
-    await _rejectLinks(file.path);
+    await _rejectLinksWithin(root.path, file.path);
     final parentCanonical = await parent.resolveSymbolicLinks();
     _ensureContained(rootCanonical, parentCanonical);
     return file;

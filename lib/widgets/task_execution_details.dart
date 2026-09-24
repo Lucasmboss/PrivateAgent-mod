@@ -4,7 +4,7 @@ import '../models/task_record.dart';
 /// Read-only durable metadata with explicit, caller-owned trusted review actions.
 class TaskExecutionDetails extends StatelessWidget {
   final TaskRecord record;
-  final VoidCallback? onReviewUncertain;
+  final ValueChanged<int>? onReviewUncertain;
   final ValueChanged<int>? onConfirmOutcome;
   final void Function(TaskSubtask subtask, String criterion, bool confirmed)?
       onReviewCriterion;
@@ -74,12 +74,24 @@ class TaskExecutionDetails extends StatelessWidget {
             'Started ${pending.timestamp.toLocal()}'),
         const Text('Do not replay blindly. Independently check the destination '
             'before resolving this action.'),
-        OutlinedButton(onPressed: onReviewUncertain,
+        OutlinedButton(
+            onPressed: onReviewUncertain == null
+                ? null
+                : () => onReviewUncertain!(pending.sequence),
             child: const Text('Review uncertain action')),
       ],
       if (state.unverifiedMutations.isNotEmpty)
         SelectableText('Unverified mutations: '
             '${state.unverifiedMutations.map((s) => 'action-$s').join(', ')}'),
+      ...state.audit.where((event) =>
+          event.phase == 'uncertain' &&
+          state.unverifiedMutations.contains(event.sequence) &&
+          event.sequence != pending?.sequence).map((event) => OutlinedButton(
+            onPressed: onReviewUncertain == null
+                ? null
+                : () => onReviewUncertain!(event.sequence),
+            child: Text('Review uncertain ${event.evidenceId} outcome'),
+          )),
       _heading('Persistent plan'),
       if (state.plan.isEmpty) const Text('No persistent plan recorded.'),
       ...state.plan.map((task) => Padding(

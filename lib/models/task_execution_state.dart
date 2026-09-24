@@ -61,8 +61,60 @@ class CriterionConfirmation {
       confirmedAt: DateTime.parse(j['confirmedAt'] as String));
 }
 
+class PendingAssistanceRequest {
+  final String id;
+  final String question;
+  final String blockerType;
+  final String evidence;
+
+  const PendingAssistanceRequest({
+    required this.id,
+    required this.question,
+    required this.blockerType,
+    required this.evidence,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'question': question,
+    'blockerType': blockerType,
+    'evidence': evidence,
+  };
+
+  factory PendingAssistanceRequest.fromJson(Map<String, dynamic> json) =>
+      PendingAssistanceRequest(
+        id: json['id'] as String,
+        question: json['question'] as String,
+        blockerType: json['blockerType'] as String,
+        evidence: json['evidence'] as String,
+      );
+}
+
+enum TaskAssistanceKind { humanStep, criterionReview, mutationReview }
+
+class TaskAssistanceItem {
+  final String id;
+  final TaskAssistanceKind kind;
+  final String title;
+  final String details;
+  final String? subtaskId;
+  final String? criterion;
+  final int? actionSequence;
+
+  const TaskAssistanceItem({
+    required this.id,
+    required this.kind,
+    required this.title,
+    required this.details,
+    this.subtaskId,
+    this.criterion,
+    this.actionSequence,
+  });
+}
+
 class TaskExecutionState {
   final List<CriterionConfirmation> criterionConfirmations;
+  final List<PendingAssistanceRequest> pendingAssistance;
   final List<String> revisions;
   final List<TaskSubtask> plan;
   final List<ActionAudit> audit;
@@ -74,25 +126,29 @@ class TaskExecutionState {
   const TaskExecutionState({this.revisions = const [], this.plan = const [],
     this.audit = const [], this.nextSequence = 1, this.inFlight,
     this.lastResult, this.verification = 'unverified',
-    this.unverifiedMutations = const [], this.criterionConfirmations = const []});
+    this.unverifiedMutations = const [], this.criterionConfirmations = const [],
+    this.pendingAssistance = const []});
   int get revision => revisions.length;
   TaskExecutionState copyWith({List<String>? revisions, List<TaskSubtask>? plan,
     List<ActionAudit>? audit, int? nextSequence, ActionAudit? inFlight,
     bool clearInFlight = false, ActionAudit? lastResult, String? verification,
-    List<int>? unverifiedMutations, List<CriterionConfirmation>? criterionConfirmations}) =>
+     List<int>? unverifiedMutations, List<CriterionConfirmation>? criterionConfirmations,
+     List<PendingAssistanceRequest>? pendingAssistance}) =>
     TaskExecutionState(revisions: revisions ?? this.revisions, plan: plan ?? this.plan,
       audit: audit ?? this.audit, nextSequence: nextSequence ?? this.nextSequence,
       inFlight: clearInFlight ? null : inFlight ?? this.inFlight,
       lastResult: lastResult ?? this.lastResult,
       unverifiedMutations: unverifiedMutations ?? this.unverifiedMutations,
       criterionConfirmations: criterionConfirmations ?? this.criterionConfirmations,
+      pendingAssistance: pendingAssistance ?? this.pendingAssistance,
       verification: verification ?? this.verification);
   Map<String, dynamic> toJson() => {'revisions': revisions,
     'plan': plan.map((e) => e.toJson()).toList(),
     'audit': audit.map((e) => e.toJson()).toList(), 'nextSequence': nextSequence,
     'inFlight': inFlight?.toJson(), 'lastResult': lastResult?.toJson(),
     'verification': verification, 'unverifiedMutations': unverifiedMutations,
-    'criterionConfirmations': criterionConfirmations.map((e) => e.toJson()).toList()};
+    'criterionConfirmations': criterionConfirmations.map((e) => e.toJson()).toList(),
+    'pendingAssistance': pendingAssistance.map((e) => e.toJson()).toList()};
   factory TaskExecutionState.fromJson(Map<String, dynamic> j) => TaskExecutionState(
     revisions: List<String>.from(j['revisions'] ?? []),
     plan: (j['plan'] as List? ?? []).map((e) => TaskSubtask.fromJson(Map<String, dynamic>.from(e))).toList(),
@@ -103,5 +159,7 @@ class TaskExecutionState {
     verification: j['verification'] as String? ?? 'unverified',
     unverifiedMutations: List<int>.from(j['unverifiedMutations'] ?? []),
     criterionConfirmations: (j['criterionConfirmations'] as List? ?? [])
-      .map((e) => CriterionConfirmation.fromJson(Map<String, dynamic>.from(e))).toList());
+      .map((e) => CriterionConfirmation.fromJson(Map<String, dynamic>.from(e))).toList(),
+    pendingAssistance: (j['pendingAssistance'] as List? ?? [])
+      .map((e) => PendingAssistanceRequest.fromJson(Map<String, dynamic>.from(e))).toList());
 }

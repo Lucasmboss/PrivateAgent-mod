@@ -34,22 +34,26 @@ class AgentActionResult {
   final String actionType;
   final bool success;
   final String? details;
+  final String? taskId;
 
   AgentActionResult({
     required this.actionType,
     required this.success,
     this.details,
+    this.taskId,
   });
 
   Map<String, dynamic> toJson() => {
         'actionType': actionType,
         'success': success,
         'details': details,
+        'taskId': taskId,
       };
 
   factory AgentActionResult.fromJson(Map<String, dynamic> json) => AgentActionResult(
         actionType: json['actionType'] as String,
         success: json['success'] as bool,
         details: json['details'] as String?,
+        taskId: json['taskId'] as String?,
       );
 }
