@@ -150,7 +150,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ).pop(UserAssistancePolicy.completedReply),
                 child: const Text('I completed the step'),
               ),
-            ),
+            ],
           );
         },
       );
