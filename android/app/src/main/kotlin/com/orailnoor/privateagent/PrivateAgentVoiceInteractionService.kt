@@ -7,8 +7,8 @@ import android.service.voice.VoiceInteractionService
 /**
  * Entry point Android uses when PrivateAgent is selected as the default assistant.
  *
- * The service itself does not perform actions or bypass approvals. It only lets
- * Android create a voice session that opens the normal, audited Agent UI.
+ * The service does not perform task actions itself. It opens the normal Agent UI,
+ * which uses the shared task executor and outcome verification.
  */
 class PrivateAgentVoiceInteractionService : VoiceInteractionService() {
     override fun onReady() {

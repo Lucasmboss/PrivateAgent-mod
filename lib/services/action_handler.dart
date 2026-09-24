@@ -54,8 +54,8 @@ class ActionHandler {
       if (call.name == 'plan' || call.name == 'done') {
         throw StateError('Internal planning actions require an active task.');
       }
-      if (const ToolPolicy().requiresApproval(call)) {
-        onProgress?.call('Waiting for approval: ${call.name}');
+      if (onApproval != null && const ToolPolicy().isMutation(call)) {
+        onProgress?.call('Checking host policy: ${call.name}');
       }
       final decision = await const ToolPolicy().authorize(
         call,

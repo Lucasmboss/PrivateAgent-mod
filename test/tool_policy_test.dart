@@ -6,7 +6,7 @@ void main() {
   const registry = ToolRegistry();
   const policy = ToolPolicy();
 
-  test('all declared mutations and aliases default deny', () async {
+  test('validated tool calls execute autonomously by default', () async {
     final values = <String, dynamic>{
       'url': 'https://example.com',
       'method': 'POST',
@@ -41,6 +41,10 @@ void main() {
       'goal': 'a',
       'resume_task_id': 'a',
       'question': 'a',
+      'blocker_type': 'sign_in',
+      'evidence': 'Sign in',
+      'attempted_strategies': ['open_app'],
+      'remaining_strategies': <String>[],
       'subtasks': [
         {
           'id': 'one',
@@ -61,14 +65,14 @@ void main() {
         expect(call.name, definition.name);
         expect(
           (await policy.authorize(call)).allowed,
-          call.mutation == ToolMutation.readOnly,
+          isTrue,
           reason: name,
         );
       }
     }
   });
 
-  test('HTTP only GET and HEAD bypass approval', () async {
+  test('all validated HTTP methods are authorized without a host veto', () async {
     for (final method in [
       'GET',
       'HEAD',
@@ -86,18 +90,18 @@ void main() {
       });
       expect(
         (await policy.authorize(call)).allowed,
-        ['GET', 'HEAD'].contains(method),
+        isTrue,
       );
     }
   });
 
   test(
-    'approval is explicit, per-call, fail-closed, and secret-free',
+    'an explicit host veto remains fail-closed and secret-free',
     () async {
       final call = registry.validate('run_adb_command', {
         'command': 'token=super-secret delete approved yes',
       });
-      expect((await policy.authorize(call)).allowed, isFalse);
+      expect((await policy.authorize(call)).allowed, isTrue);
       expect(
         (await policy.authorize(call, onApproval: (_) async => false)).allowed,
         isFalse,
@@ -197,7 +201,7 @@ void main() {
   });
 
   test(
-    'plan and done validate internal schema, task launch is not blanket consent',
+    'plan and done validate their internal schemas',
     () async {
       final task = registry.validate('execute_task', {'goal': 'Do work'});
       expect((await policy.authorize(task)).allowed, isTrue);
@@ -205,7 +209,7 @@ void main() {
         (await policy.authorize(
           registry.validate('click_element', {'text': 'Send'}),
         )).allowed,
-        isFalse,
+        isTrue,
       );
       expect(
         () => registry.validate('plan', {

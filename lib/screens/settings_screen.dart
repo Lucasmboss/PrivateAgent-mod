@@ -657,7 +657,10 @@ class _SettingsScreenState extends State<SettingsScreen>
               ),
               const SizedBox(height: 4),
               const Text(
-                'Android always asks for your confirmation. The assistant opens Agent mode and keeps the existing per-action approval rules.',
+                'Choose PrivateAgent in Android’s default-assistant prompt. '
+                'Tasks run validated actions without per-action approvals; '
+                'sign-in, private data, and Android permissions remain yours '
+                'to complete directly.',
                 style: TextStyle(fontSize: 11),
               ),
               const SizedBox(height: 4),

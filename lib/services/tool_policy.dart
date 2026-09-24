@@ -30,27 +30,34 @@ class ToolPolicyDecision {
 class ToolPolicy {
   const ToolPolicy();
 
-  bool requiresApproval(ValidatedToolCall call) =>
+  bool isMutation(ValidatedToolCall call) =>
       call.mutation != ToolMutation.readOnly;
 
-  /// Approval is scoped to this immutable call only. Never cache consent by
-  /// name, reuse it for a changed argument, or treat task approval as approval
-  /// for its child calls. Check cancellation again after this future returns.
+  /// A user's task request authorizes its validated tool calls. An optional
+  /// host callback may still explicitly veto a call on channels that cannot
+  /// execute autonomously. Check cancellation again after this future returns.
   Future<ToolPolicyDecision> authorize(
     ValidatedToolCall call, {ToolApprovalCallback? onApproval}
   ) async {
-    if (!requiresApproval(call)) {
+    if (!isMutation(call)) {
       return const ToolPolicyDecision(true, 'Read-only operation.');
     }
     if (onApproval == null) {
-      return const ToolPolicyDecision(false, 'User approval is required.');
+      return const ToolPolicyDecision(
+        true,
+        'The user task authorizes this validated operation.',
+      );
     }
     try {
-      final approved = await onApproval(ToolApprovalRequest._(call));
-      return ToolPolicyDecision(approved,
-          approved ? 'User approved this operation.' : 'User denied this operation.');
+      final allowed = await onApproval(ToolApprovalRequest._(call));
+      return ToolPolicyDecision(
+        allowed,
+        allowed
+            ? 'The host allowed this operation.'
+            : 'The host denied this operation.',
+      );
     } catch (_) {
-      return const ToolPolicyDecision(false, 'Approval could not be obtained.');
+      return const ToolPolicyDecision(false, 'The host policy could not be applied.');
     }
   }
 

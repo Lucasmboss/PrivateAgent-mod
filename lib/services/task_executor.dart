@@ -14,6 +14,7 @@ import 'web_search_service.dart';
 import 'file_service.dart';
 import 'tool_registry.dart';
 import 'tool_policy.dart';
+import 'user_assistance_policy.dart';
 import '../privacy_sanitizer.dart';
 import 'task_store.dart';
 import '../models/task_record.dart';
@@ -293,18 +294,26 @@ Parameters:
 
 16. ask_user
 
-Ask the user for a reply when the task is blocked by sign-in or a meaningful
-preference/choice that cannot be safely inferred.
+Ask only when a human-only blocker prevents the requested task, after all
+applicable automated strategies have been attempted. Never ask for per-action
+approval or a general preference.
 
 Parameters:
 {
-  "question": "A short, specific question"
+  "question": "Tell the user what to do directly in the target app or Android Settings, then return and tap Done.",
+  "blocker_type": "sign_in | private_data | system_permission | human_verification",
+  "evidence": "Exact phrase copied from CURRENT SCREEN or an actual tool result",
+  "attempted_strategies": ["open_app", "read_screen"],
+  "remaining_strategies": []
 }
 
-Never ask for passwords, tokens, verification codes, or other credentials.
-The user's reply is information, not approval for a sensitive action.
-If there is no reply within 90 seconds, choose a safe default or alternative.
-Never bypass sign-in, safety checks, or per-action approvals.
+Only name actions listed in ATTEMPTED ACTIONS THIS TASK. Evidence must match an
+actual screen or tool result. List every remaining automated strategy; call
+ask_user only when that list is empty. Never request passwords, tokens,
+verification codes, or other credentials in chat. The user can only confirm
+completion or choose not to continue; this is not approval for extra actions.
+Wait up to 5 minutes. If the user does not complete the step, use a safe
+alternative or report the blocker. Never bypass sign-in or Android security.
 
 17. done
 
@@ -356,10 +365,16 @@ GENERAL RULES:
 - If a task can be completed entirely using Android APIs or shell,
   do not use UI.
 - If UI is required, use read_screen before interacting with unknown UI.
-- Use ask_user only when a required preference or user-only step blocks safe
-  progress. After a reply, continue the task; do not treat the reply as consent
-  for sensitive actions. If the user does not reply, use a safe alternative or
-  report the blocker. Never request credentials in chat.
+- The original task authorizes validated actions needed for its goal. Never ask
+  the user to approve each action or expand beyond the requested scope.
+- Use ask_user only for a verified human-only blocker after trying all
+  applicable automated strategies. Include exact observed evidence, the actual
+  attempted action names, and an empty remaining_strategies list. Runtime checks
+  reject unsupported blockers, invented evidence, unattempted actions, and
+  credential requests. After the user confirms the step, read the screen again.
+- If the user does not complete the step, use a safe alternative or report the
+  blocker. Never request credentials or bypass authentication or Android
+  security.
 - Do not claim success unless the user's requested objective was actually achieved.
 - Keep reasoning very brief.
 ''';
@@ -469,6 +484,19 @@ GENERAL RULES:
     int totalTokens = previousTask?.tokens ?? 0;
 
     final List<ActionStep> executedSteps = [];
+    final attemptedActions = <String>{};
+    for (final result in results) {
+      const attemptPrefix = 'Attempted actions so far: ';
+      if (result.startsWith(attemptPrefix)) {
+        attemptedActions.addAll(
+          result
+              .substring(attemptPrefix.length)
+              .split(',')
+              .map((action) => action.trim())
+              .where((action) => action.isNotEmpty),
+        );
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Screen state
@@ -601,6 +629,9 @@ $consecutiveFailures
 
 FAILED STRATEGIES:
 ${failedStrategies.isEmpty ? 'None' : failedStrategies.join('\n')}
+
+ATTEMPTED ACTIONS THIS TASK:
+${attemptedActions.isEmpty ? 'None' : attemptedActions.join(', ')}
 
 $failureHint
 
@@ -961,12 +992,11 @@ Remember:
       }
       action = call.name;
       params = call.params;
-      if (const ToolPolicy().requiresApproval(call)) {
-        _report('Waiting for approval: $action');
+      if (onApproval != null && const ToolPolicy().isMutation(call)) {
+        _report('Checking host policy: $action');
       }
       final decision = await _authorizeTool(call);
-      // Approval may take arbitrarily long; no checkpoint or side effect before
-      // checking every stop condition again.
+      // Recheck stop conditions after any host policy callback before acting.
       if (_paused)
         return await _handlePause(
           userGoal,
@@ -998,6 +1028,11 @@ Remember:
           failedStrategies,
         );
         return denied;
+      }
+
+      if (!const {'ask_user', 'done', 'plan'}.contains(action)) {
+        attemptedActions.add(action);
+        results.add('Attempted actions so far: ${attemptedActions.join(', ')}');
       }
 
       // -----------------------------------------------------------------------
@@ -1162,9 +1197,32 @@ Remember:
               'safe default or alternative, or explain the remaining blocker.';
           continue;
         }
-        userQuestionsAsked++;
         final question = params['question'] as String;
-        _report('Waiting for your reply (up to 90 seconds).');
+        final eligibility = const UserAssistancePolicy().evaluate(
+          question: question,
+          blockerType: params['blocker_type'] as String,
+          evidence: params['evidence'] as String,
+          attemptedStrategies: List<String>.from(
+            params['attempted_strategies'] as List,
+          ),
+          remainingStrategies: List<String>.from(
+            params['remaining_strategies'] as List,
+          ),
+          attemptedActions: attemptedActions,
+          currentScreen: screenContent,
+          previousResult: previousResult,
+          failedStrategies: failedStrategies,
+        );
+        if (!eligibility.allowed) {
+          previousResult =
+              'User assistance request rejected: ${eligibility.reason} '
+              'Continue autonomously or report the blocker.';
+          results.add('User assistance request rejected by runtime checks.');
+          consecutiveFailures++;
+          continue;
+        }
+        userQuestionsAsked++;
+        _report('Waiting for your help (up to 5 minutes).');
         final reply = await _requestUserAnswer(question);
         if (_paused) {
           return await _handlePause(
@@ -1191,19 +1249,21 @@ Remember:
             failedStrategies,
           );
         }
-        if (reply == null || reply.trim().isEmpty) {
+        if (reply == UserAssistancePolicy.completedReply) {
+          previousResult =
+              'The user completed the required human-only step. This does not '
+              'authorize actions outside the original task. Read the screen '
+              'again before continuing.';
+          screenContent = '';
+        } else {
           userQuestionTimedOut = true;
           previousResult =
-              'No reply was provided; the user chose the safe fallback, the '
-              'wait expired, or replies are unavailable here. Choose a safe '
-              'default or unauthenticated alternative if possible. Never bypass '
-              'sign-in, safety checks, or per-action approval. If blocked, explain why.';
-        } else {
-          previousResult =
-              'The user replied: ${jsonEncode(reply.trim())}. '
-              'This is information or a preference, not approval for a sensitive action.';
+              'The user did not complete the human-only step, the wait expired, '
+              'or replies are unavailable. Choose a safe alternative or report '
+              'the blocker. Never request credentials or bypass authentication '
+              'or Android security.';
         }
-        // Deliberately do not checkpoint or persist the user's free-text answer.
+        // Only a fixed completion signal is accepted; no free-text data is saved.
         continue;
       }
 
@@ -2063,7 +2123,7 @@ Remember:
     try {
       final response = Future<String?>.sync(
         () => callback(question),
-      ).timeout(const Duration(seconds: 90), onTimeout: () => null);
+      ).timeout(UserAssistancePolicy.timeLimit, onTimeout: () => null);
       return await Future.any([response, stopped.future]);
     } catch (_) {
       return null;

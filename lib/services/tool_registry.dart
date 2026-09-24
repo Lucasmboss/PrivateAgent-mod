@@ -282,7 +282,13 @@ class ToolRegistry {
       ToolCapability.orchestration,
       ToolMutation.readOnly,
       ToolRisk.low,
-      {'question': 'text!'},
+      {
+        'question': 'string!',
+        'blocker_type': 'string!',
+        'evidence': 'string!',
+        'attempted_strategies': 'string_list!',
+        'remaining_strategies': 'string_list!',
+      },
     ),
     ToolDefinition(
       'plan',
@@ -340,6 +346,9 @@ class ToolRegistry {
         'text' => value is String,
         'int' => value is int,
         'number' => value is num && value.isFinite,
+        'string_list' =>
+          value is List &&
+              value.every((item) => item is String && item.trim().isNotEmpty),
         'headers' =>
           value is Map &&
               value.entries.every((e) => e.key is String && e.value is String),

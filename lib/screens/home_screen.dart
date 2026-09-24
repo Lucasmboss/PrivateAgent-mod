@@ -9,7 +9,7 @@ import '../models/agent_action.dart';
 import '../models/task_record.dart';
 import '../services/ai_service.dart';
 import '../services/action_handler.dart';
-import '../services/tool_policy.dart';
+import '../services/user_assistance_policy.dart';
 import '../privacy_sanitizer.dart';
 import '../services/task_store.dart';
 import '../services/voice_service.dart';
@@ -56,18 +56,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   RemoteCancellationToken? _activeResponseCancellation;
   StreamSubscription<dynamic>? _assistantInvocationSubscription;
   String _taskStateLabel = 'Thinking...';
-  int _approvalGeneration = 0;
-  BuildContext? _approvalDialogContext;
+  int _taskGeneration = 0;
   BuildContext? _userQuestionDialogContext;
   bool _voiceOutputEnabled = false;
   VoicePlaybackState _voicePlaybackState = VoicePlaybackState.idle;
   StreamSubscription<VoicePlaybackState>? _voicePlaybackSubscription;
-  static const Duration _userQuestionTimeout = Duration(seconds: 90);
 
   void _stopActiveTask({required bool pause}) {
     if (_stopRequested) return;
     final canPause = pause && _isTaskExecutorActive;
-    _approvalGeneration++;
+    _taskGeneration++;
     _stopRequested = true;
     _lastStopWasPause = canPause;
     _activeResponseCancellation?.cancel();
@@ -76,7 +74,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } else {
       _actionHandler.cancelTask();
     }
-    _dismissApproval();
     _dismissUserQuestion();
     if (mounted) {
       setState(() {
@@ -91,141 +88,68 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _dismissApproval() {
-    final dialog = _approvalDialogContext;
-    _approvalDialogContext = null;
-    if (dialog != null && dialog.mounted) Navigator.of(dialog).pop(false);
-  }
-
   void _dismissUserQuestion() {
     final dialog = _userQuestionDialogContext;
     _userQuestionDialogContext = null;
     if (dialog != null && dialog.mounted) Navigator.of(dialog).pop();
   }
 
-  Future<bool> _requestToolApproval(ToolApprovalRequest request) async {
-    if (!mounted || _appLifecycleState != AppLifecycleState.resumed)
-      return false;
-    final generation = _approvalGeneration;
-    setState(() => _taskStateLabel = 'Waiting for approval');
-    final approved = await showDialog<bool>(
-      context: context,
-      barrierDismissible: true,
-      builder: (dialogContext) {
-        _approvalDialogContext = dialogContext;
-        return AlertDialog(
-          title: const Text('Approve this action?'),
-          content: SingleChildScrollView(
-            child: Text(
-              '${request.summary}\n\n${request.preview}\n\n'
-              'Approval applies only to this action. When unsure, deny.',
-            ),
-          ),
-          actions: [
-            TextButton(
-              autofocus: true,
-              onPressed: () => Navigator.of(dialogContext).pop(false),
-              child: const Text('Deny'),
-            ),
-            TextButton(
-              onPressed: () => _stopActiveTask(pause: _isTaskExecutorActive),
-              child: Text(
-                _isTaskExecutorActive ? 'Pause task' : 'Stop request',
-              ),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(dialogContext).pop(true),
-              child: const Text('Approve once'),
-            ),
-          ],
-        );
-      },
-    );
-    _approvalDialogContext = null;
-    final allowed =
-        approved == true &&
-        mounted &&
-        generation == _approvalGeneration &&
-        _appLifecycleState == AppLifecycleState.resumed;
-    if (mounted && generation == _approvalGeneration) {
-      setState(
-        () => _taskStateLabel = allowed
-            ? 'Running approved action'
-            : 'Approval denied',
-      );
-    }
-    return allowed;
-  }
-
   Future<String?> _requestTaskUserAnswer(String question) async {
     if (!mounted || _appLifecycleState != AppLifecycleState.resumed)
       return null;
-    final controller = TextEditingController();
     Timer? timeout;
-    setState(() => _taskStateLabel = 'Waiting for your reply');
+    setState(() => _taskStateLabel = 'Waiting for your help');
     try {
       return await showDialog<String>(
         context: context,
         barrierDismissible: false,
         builder: (dialogContext) {
           _userQuestionDialogContext = dialogContext;
-          timeout ??= Timer(_userQuestionTimeout, _dismissUserQuestion);
-          return StatefulBuilder(
-            builder: (context, setDialogState) => AlertDialog(
-              title: const Text('I need your input'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(question),
-                    const SizedBox(height: 14),
-                    TextField(
-                      controller: controller,
-                      autofocus: true,
-                      minLines: 1,
-                      maxLines: 4,
-                      textInputAction: TextInputAction.done,
-                      decoration: const InputDecoration(
-                        labelText: 'Your reply',
-                        border: OutlineInputBorder(),
-                      ),
-                      onChanged: (_) => setDialogState(() {}),
-                      onSubmitted: (value) {
-                        final reply = value.trim();
-                        if (reply.isNotEmpty) {
-                          Navigator.of(dialogContext).pop(reply);
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 10),
-                    const Text(
-                      'Reply within 90 seconds. Do not enter passwords, '
-                      'tokens, or verification codes here. If sign-in is '
-                      'needed, complete it directly in the relevant app or page.',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                  ],
-                ),
+          timeout ??= Timer(
+            UserAssistancePolicy.timeLimit,
+            _dismissUserQuestion,
+          );
+          return AlertDialog(
+            title: const Text('The task needs a step only you can do'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(question),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Complete it directly in the target app or Android Settings, '
+                    'then return here. Do not enter passwords, codes, or private '
+                    'details in PrivateAgent. The app only receives a completion '
+                    'signal, not your data.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'This request expires after 5 minutes.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Use safe fallback'),
-                ),
-                TextButton(
-                  onPressed: () => _stopActiveTask(pause: true),
-                  child: const Text('Pause task'),
-                ),
-                FilledButton(
-                  onPressed: controller.text.trim().isEmpty
-                      ? null
-                      : () => Navigator.of(
-                          dialogContext,
-                        ).pop(controller.text.trim()),
-                  child: const Text('Reply'),
-                ),
-              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(
+                  dialogContext,
+                ).pop(UserAssistancePolicy.declinedReply),
+                child: const Text('Not now'),
+              ),
+              TextButton(
+                onPressed: () => _stopActiveTask(pause: true),
+                child: const Text('Pause task'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(
+                  dialogContext,
+                ).pop(UserAssistancePolicy.completedReply),
+                child: const Text('I completed the step'),
+              ),
             ),
           );
         },
@@ -233,7 +157,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } finally {
       timeout?.cancel();
       _userQuestionDialogContext = null;
-      controller.dispose();
       if (mounted && !_stopRequested) {
         setState(() => _taskStateLabel = 'Continuing task...');
       }
@@ -441,7 +364,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _sendMessage(String text) async {
     if (!mounted || _isLoading || text.trim().isEmpty) return;
-    final generation = _approvalGeneration;
+    final generation = _taskGeneration;
     final responseCancellation = RemoteCancellationToken();
     _activeResponseCancellation = responseCancellation;
     _stopRequested = false;
@@ -517,7 +440,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // Check if it's an action
       final action = _aiService.parseAction(accumulated);
       if (!mounted) return;
-      if (generation != _approvalGeneration) {
+      if (generation != _taskGeneration) {
         if (_stopRequested) showStoppedMessage();
         return;
       }
@@ -531,7 +454,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
         await _showTaskProgressOverlay('Starting: ${text.trim()}');
         if (!mounted) return;
-        if (generation != _approvalGeneration) {
+        if (generation != _taskGeneration) {
           if (_stopRequested) showStoppedMessage();
           return;
         }
@@ -544,16 +467,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
-          onApproval: _requestToolApproval,
           onUserQuestion: _requestTaskUserAnswer,
           userRequest: text.trim(),
           onProgress: (msg) {
-            if (msg.contains('budget exhausted') ||
-                msg.startsWith('Task paused') ||
-                msg.startsWith('Task cancelled') ||
-                msg.startsWith('Action denied')) {
-              _dismissApproval();
-            }
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
             if (mounted) {
@@ -574,7 +490,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           },
         );
         _isTaskExecutorActive = false;
-        _dismissApproval();
         if (!mounted) return;
 
         String finalResponse;
@@ -685,15 +600,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           response: '',
         ),
         aiService: _aiService,
-        onApproval: _requestToolApproval,
         onUserQuestion: _requestTaskUserAnswer,
         onProgress: (message) {
-          if (message.contains('budget exhausted') ||
-              message.startsWith('Task paused') ||
-              message.startsWith('Task cancelled') ||
-              message.startsWith('Action denied')) {
-            _dismissApproval();
-          }
           if (mounted) {
             setState(() {
               if (message.startsWith('Task paused')) {
@@ -711,7 +619,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           }
         },
       );
-      _dismissApproval();
       if (mounted) {
         setState(
           () => _messages.add(
@@ -942,7 +849,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
-    _approvalGeneration++;
+    _taskGeneration++;
     _actionHandler.cancelTask();
     WidgetsBinding.instance.removeObserver(this);
     _overlayHistoryTimer?.cancel();
@@ -957,10 +864,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed && _approvalDialogContext != null) {
-      _approvalGeneration++;
-      _dismissApproval();
-    }
     setState(() {
       _appLifecycleState = state;
     });
