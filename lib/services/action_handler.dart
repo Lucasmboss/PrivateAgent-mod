@@ -12,6 +12,7 @@ import 'ai_service.dart';
 import 'web_service.dart';
 import 'web_search_service.dart';
 import 'file_service.dart';
+import '../models/task_record.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -40,6 +41,7 @@ class ActionHandler {
   }) async {
     try {
       String result;
+      bool taskSucceeded = false;
 
       switch (action.action) {
         case 'open_app':
@@ -234,6 +236,8 @@ class ActionHandler {
               goal,
               resumeTaskId: action.params['resume_task_id'] as String?,
             );
+            taskSucceeded =
+                _currentExecutor!.lastStatus == TaskStatus.completed;
           } catch (error) {
             await _currentExecutor!.failUnexpected(error);
             rethrow;
@@ -246,10 +250,12 @@ class ActionHandler {
           result = action.response;
       }
 
-      final requestSucceeded = action.action == 'web_request'
-          ? WebService.isSuccessfulResponse(result)
-          : !result.startsWith('Web search error:') &&
-              !result.startsWith('AI service not available');
+      final requestSucceeded = action.action == 'execute_task'
+          ? taskSucceeded
+          : action.action == 'web_request'
+              ? WebService.isSuccessfulResponse(result)
+              : !result.startsWith('Web search error:') &&
+                  !result.startsWith('AI service not available');
 
       return AgentActionResult(
         actionType: action.action,
