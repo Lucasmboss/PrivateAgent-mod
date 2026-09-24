@@ -35,12 +35,9 @@ class MainActivity : FlutterActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         assistantInvocationPending =
             intent?.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false) == true
-        if (assistantInvocationPending) {
-            setTheme(R.style.AssistantOverlayTheme)
-        }
         super.onCreate(savedInstanceState)
         if (assistantInvocationPending) {
-            setAssistantOverlayExpanded(expanded = false)
+            setAssistantOverlayExpanded(expanded = true)
         }
     }
 
@@ -51,7 +48,7 @@ class MainActivity : FlutterActivity() {
             newIntent.getBooleanExtra(EXTRA_ASSISTANT_INVOCATION, false)
         assistantInvocationPending = isAssistantInvocation
         if (isAssistantInvocation) {
-            setAssistantOverlayExpanded(expanded = false)
+            setAssistantOverlayExpanded(expanded = true)
             runOnUiThread {
                 assistantEventSink?.success(mapOf("type" to "invocation"))
             }
@@ -228,37 +225,46 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun isDefaultAssistant(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val roleManager = getSystemService(RoleManager::class.java)
-            return roleManager?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true
-        }
-        val configured = Settings.Secure.getString(
+        val roleHeld = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            getSystemService(RoleManager::class.java)
+                ?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true
+        val configuredComponent = Settings.Secure.getString(
             contentResolver,
             "voice_interaction_service"
+        )?.let { ComponentName.unflattenFromString(it) }
+        val privateAgentComponent = ComponentName(
+            this,
+            PrivateAgentVoiceInteractionService::class.java
         )
-        return configured == ComponentName(this, PrivateAgentVoiceInteractionService::class.java)
-            .flattenToString()
+        return roleHeld || configuredComponent == privateAgentComponent
     }
 
     private fun requestDefaultAssistant(): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val roleManager = getSystemService(RoleManager::class.java)
-                if (roleManager?.isRoleAvailable(RoleManager.ROLE_ASSISTANT) == true) {
-                    startActivity(roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT))
-                    true
-                } else {
-                    openAssistantSettings()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = getSystemService(RoleManager::class.java)
+            if (roleManager?.isRoleAvailable(RoleManager.ROLE_ASSISTANT) == true) {
+                try {
+                    startActivity(
+                        roleManager.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
+                    )
+                    return true
+                } catch (_: Exception) {
+                    // Fall through to Android's default-apps settings.
                 }
-            } else {
-                openAssistantSettings()
             }
-        } catch (_: Exception) {
-            false
         }
+        return openAssistantSettings()
     }
 
     private fun openAssistantSettings(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+                return true
+            } catch (_: Exception) {
+                // Older or customized Android builds may not expose this page.
+            }
+        }
         return try {
             startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
             true

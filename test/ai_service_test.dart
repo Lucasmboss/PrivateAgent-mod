@@ -25,4 +25,26 @@ void main() {
     expect(AiService.nvidiaDefaultModel, 'z-ai/glm-5.2');
     expect(AiService.nvidiaFreeChatModels.first, 'z-ai/glm-5.2');
   });
+
+  test('recovers an execute_task with a top-level goal and trailing response', () {
+    const goal = 'Check the available network settings on this device.';
+    final action = AiService().parseAction(
+      '{"action":"execute_task","goal":"$goal"}, '
+      '"response":"I will check what is available."}',
+    );
+
+    expect(action?.action, 'execute_task');
+    expect(action?.params['goal'], goal);
+  });
+
+  test('preserves standard nested action parameters', () {
+    final action = AiService().parseAction(
+      '{"action":"open_app","params":{"app_name":"Settings"},'
+      '"response":"Opening Settings."}',
+    );
+
+    expect(action?.action, 'open_app');
+    expect(action?.params, {'app_name': 'Settings'});
+    expect(action?.response, 'Opening Settings.');
+  });
 }

@@ -94,6 +94,7 @@ INTERNET ACTIONS:
 
 MULTI-STEP TASK:
 - execute_task: {"goal": "description of the full task"} - Automatically plans and executes a complex task using the available tools, including web_search, web_request, Android actions, Shizuku/shell, and screen automation.
+- In the output JSON, always put execute_task's goal inside "params": {"goal": "..."}; never put "goal" beside "action".
 
 CRITICAL RULES:
 1. If the user request contains "and" or involves MULTIPLE steps, use execute_task.
@@ -372,44 +373,106 @@ Rules:
 
   /// Parse the AI response to check if it's an action or plain text
   AgentAction? parseAction(String response) {
-    // Try to parse as JSON action
+    var candidate = response.trim();
+    if (candidate.startsWith('```')) {
+      final firstLineBreak = candidate.indexOf('\n');
+      if (firstLineBreak >= 0) {
+        candidate = candidate.substring(firstLineBreak + 1);
+      }
+      final closingFence = candidate.lastIndexOf('```');
+      if (closingFence >= 0) {
+        candidate = candidate.substring(0, closingFence).trim();
+      }
+    }
+
+    Map<String, dynamic>? actionJson;
     try {
-      final trimmed = response.trim();
-      // Handle if the response is wrapped in code fences
-      String jsonStr = trimmed;
-      if (trimmed.startsWith('```')) {
-        final lines = trimmed.split('\n');
-        lines.removeAt(0); // Remove opening fence
-        if (lines.isNotEmpty && lines.last.trim() == '```') {
-          lines.removeLast(); // Remove closing fence
+      final decoded = jsonDecode(candidate);
+      if (decoded is Map) {
+        actionJson = Map<String, dynamic>.from(decoded);
+      }
+    } on FormatException {
+      // Some models append response text outside the action object.
+    }
+    actionJson ??= _findFirstActionObject(candidate);
+    if (actionJson == null) return null;
+
+    final actionName = actionJson['action'] ?? actionJson['tool'];
+    if (actionName is! String || actionName.trim().isEmpty) return null;
+
+    final params = <String, dynamic>{};
+    final rawParams = actionJson['params'];
+    if (rawParams is Map) {
+      params.addAll(Map<String, dynamic>.from(rawParams));
+    } else {
+      const metadataKeys = {
+        'action',
+        'tool',
+        'params',
+        'response',
+        'reasoning',
+        'is_complete',
+        'isComplete',
+        'complete',
+      };
+      for (final entry in actionJson.entries) {
+        if (!metadataKeys.contains(entry.key)) {
+          params[entry.key] = entry.value;
         }
-        jsonStr = lines.join('\n').trim();
       }
+    }
 
-      // If it looks like JSON but is missing a closing brace (common with some local models)
-      if (jsonStr.startsWith('{') && !jsonStr.endsWith('}')) {
-        jsonStr += '\n}';
-      }
+    return AgentAction(
+      action: actionName.trim(),
+      params: params,
+      response: actionJson['response'] is String
+          ? actionJson['response'] as String
+          : '',
+    );
+  }
 
-      if (jsonStr.startsWith('{') && jsonStr.contains('"action"')) {
-        try {
-          final json = jsonDecode(jsonStr) as Map<String, dynamic>;
-          if (json.containsKey('action')) {
-            return AgentAction.fromJson(json);
+  Map<String, dynamic>? _findFirstActionObject(String text) {
+    for (var start = 0; start < text.length; start++) {
+      if (text[start] != '{') continue;
+
+      var depth = 0;
+      var inString = false;
+      var escaped = false;
+      for (var end = start; end < text.length; end++) {
+        final character = text[end];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+          } else if (character == r'\') {
+            escaped = true;
+          } else if (character == '"') {
+            inString = false;
           }
-        } catch (e) {
-          // If it still fails, it might be deeply truncated, try adding another brace
-          if (e.toString().contains('Unexpected end of input')) {
-            jsonStr += '\n}';
-            final json = jsonDecode(jsonStr) as Map<String, dynamic>;
-            if (json.containsKey('action')) {
-              return AgentAction.fromJson(json);
+          continue;
+        }
+
+        if (character == '"') {
+          inString = true;
+        } else if (character == '{') {
+          depth++;
+        } else if (character == '}') {
+          depth--;
+          if (depth == 0) {
+            try {
+              final decoded = jsonDecode(text.substring(start, end + 1));
+              if (decoded is Map) {
+                final object = Map<String, dynamic>.from(decoded);
+                if (object['action'] is String || object['tool'] is String) {
+                  return object;
+                }
+              }
+            } on FormatException {
+              // Keep searching; a later object may be the actual tool call.
             }
+            break;
           }
         }
       }
-    } catch (_) {
-      // Not JSON, it's plain text conversation
     }
     return null;
   }

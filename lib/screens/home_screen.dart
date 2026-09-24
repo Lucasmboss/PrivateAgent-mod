@@ -246,11 +246,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _mode = 'agent';
-      _isAssistantCompact = true;
+      _isAssistantCompact = false;
       _assistantTranscript = '';
       _assistantVoiceError = null;
     });
-    await AssistantPlatformService.setAssistantOverlayExpanded(false);
+    await AssistantPlatformService.setAssistantOverlayExpanded(true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_isLoading && !_isListening) {
+        unawaited(_toggleVoice());
+      }
+    });
   }
 
   String get _latestAssistantResponse {

@@ -3,6 +3,7 @@ package com.orailnoor.privateagent
 import android.content.Intent
 import android.os.Bundle
 import android.service.voice.VoiceInteractionService
+import android.util.Log
 
 /**
  * Entry point Android uses when PrivateAgent is selected as the default assistant.
@@ -38,11 +39,28 @@ private class PrivateAgentVoiceInteractionSession(
             .putExtra(MainActivity.EXTRA_ASSISTANT_INVOCATION, true)
             .putExtra(MainActivity.EXTRA_FORCE_AGENT_MODE, true)
             .addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or
                     Intent.FLAG_ACTIVITY_CLEAR_TOP
             )
-        startVoiceActivity(intent)
-        finish()
+        try {
+            startVoiceActivity(intent)
+        } catch (error: RuntimeException) {
+            Log.e("PrivateAgent", "Voice activity launch failed; opening the app.", error)
+            try {
+                hostContext.startActivity(
+                    Intent(hostContext, MainActivity::class.java)
+                        .setAction(Intent.ACTION_ASSIST)
+                        .putExtra(MainActivity.EXTRA_ASSISTANT_INVOCATION, true)
+                        .putExtra(MainActivity.EXTRA_FORCE_AGENT_MODE, true)
+                        .addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+                    )
+            } catch (fallbackError: RuntimeException) {
+                Log.e("PrivateAgent", "Fallback assistant launch failed.", fallbackError)
+            }
+        }
     }
 }
