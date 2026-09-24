@@ -187,11 +187,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
 
         try {
+          if (!result.success) {
+            finalResponse = result.details ?? 'Task did not complete.';
+          } else {
           finalResponse = await _aiService.interpretToolResult(
             userRequest: text.trim(),
             toolName: action.action,
             toolResult: result.details ?? 'Done.',
           );
+          }
         } catch (e) {
           developer.log(
             'Tool result interpretation failed: $e',
