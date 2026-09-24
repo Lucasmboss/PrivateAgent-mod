@@ -164,6 +164,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
+          userRequest: text.trim(),
           onProgress: (msg) {
             developer.log('Task progress: $msg', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
@@ -201,11 +202,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ? (result.details ?? 'Done.')
               : '? ${result.details ?? 'Unknown error'}';
         }
-
-        developer.log(
-          'INTERPRETATION END: $finalResponse',
-          name: 'PrivateAgent',
-        );
 
 setState(() {
   _messages.add(
@@ -723,11 +719,13 @@ setState(() {
                       ),
                       const SizedBox(width: 8),
                       TextButton.icon(
+                        onPressed: () => _actionHandler.pauseTask(),
+                        icon: const Icon(Icons.pause_circle_outline, size: 16),
+                        label: const Text('Pause'),
+                      ),
+                      TextButton.icon(
                         onPressed: () {
                           _actionHandler.cancelTask();
-                          setState(() {
-                            _isLoading = false;
-                          });
                         },
                         icon: const Icon(
                           Icons.stop_circle_rounded,
