@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_agent/models/agent_action.dart';
 import 'package:private_agent/models/task_record.dart';
@@ -13,6 +14,7 @@ import 'package:private_agent/services/task_executor.dart';
 import 'package:private_agent/services/task_store.dart';
 import 'package:private_agent/services/telegram_service.dart';
 import 'package:private_agent/services/tool_policy.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class _Planner extends AiService {
   final Future<AiResponse> Function(RemoteCancellationToken?, int?) answer;
@@ -63,11 +65,44 @@ void main() {
   group('checkpointed executor gates', () {
     late Directory directory;
     late TaskStore store;
+    // Cancellation persists task history and shows an Android notification.
+    const notificationsChannel = MethodChannel(
+      'dexterous.com/flutter/local_notifications',
+    );
+    const pathProviderChannel = MethodChannel(
+      'plugins.flutter.io/path_provider',
+    );
+
     setUp(() async {
       directory = await Directory.systemTemp.createTemp('router-security-');
       store = TaskStore(directory: directory);
+      SharedPreferences.setMockInitialValues({});
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(notificationsChannel, (call) async {
+            switch (call.method) {
+              case 'initialize':
+                return true;
+              case 'show':
+                return null;
+              default:
+                return true;
+            }
+          });
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(pathProviderChannel, (call) async {
+            if (call.method == 'getApplicationDocumentsDirectory') {
+              return directory.path;
+            }
+            return null;
+          });
     });
-    tearDown(() => directory.delete(recursive: true));
+    tearDown(() async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(notificationsChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(pathProviderChannel, null);
+      await directory.delete(recursive: true);
+    });
 
     TaskExecutor executor(AiService ai, {ToolApprovalCallback? approve,
         int tokens = 100, Duration duration = const Duration(minutes: 1)}) =>
