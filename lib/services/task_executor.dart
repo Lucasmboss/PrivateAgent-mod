@@ -6,7 +6,6 @@ import 'ai_service.dart';
 import 'screen_automation_service.dart';
 import 'app_launcher_service.dart';
 import 'notification_service.dart';
-import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
 import 'web_service.dart';
@@ -411,7 +410,13 @@ GENERAL RULES:
     try {
       return await _executeTask(userGoal, resumeTaskId: resumeTaskId);
     } catch (error) {
-      await failUnexpected(error);
+      if (error is ToolOutcomeUncertainException) {
+        lastStatus = TaskStatus.needsRevision;
+        _activeTaskId = null;
+        _report(error.userMessage);
+      } else {
+        await failUnexpected(error);
+      }
       rethrow;
     } finally {
       _cancelCompleter = null;
@@ -779,14 +784,6 @@ Remember:
           'AI encountered an error.',
         );
 
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Failed',
-          totalTokens,
-          step,
-          results,
-        );
-
         await _finishTask(
           TaskStatus.failed,
           step,
@@ -896,14 +893,6 @@ Remember:
           await _notificationService.showTaskCompleteNotification(
             'Task Error',
             'AI formatting error.',
-          );
-
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Failed',
-            totalTokens,
-            step,
-            results,
           );
 
           await _finishTask(
@@ -1281,14 +1270,6 @@ Remember:
         await _notificationService.showTaskCompleteNotification(
           'Task Completed',
           finalText,
-        );
-
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Success',
-          totalTokens,
-          step,
-          results,
         );
 
         await _finishTask(
@@ -2053,6 +2034,9 @@ Remember:
         }
       } finally {
         // Dart runs finally on every continue and return in the dispatch.
+        final needsIndependentReview =
+            (toolThrew || toolNeedsReview) &&
+            call.mutation != ToolMutation.readOnly;
         final classification = ToolRegistry.classifyResult(
           succeeded:
               toolSucceeded && !ToolRegistry.isFailureResult(previousResult),
@@ -2064,10 +2048,13 @@ Remember:
             technicalSuccess:
                 classification == ToolResultClassification.succeeded,
             uncertain: toolThrew || toolNeedsReview,
-            continueAfterUncertain: true,
+            continueAfterUncertain: !needsIndependentReview,
           );
         } finally {
           _actionInFlight = false;
+        }
+        if (needsIndependentReview) {
+          throw ToolOutcomeUncertainException(action);
         }
         if (toolSucceeded) {
           consecutiveVerifierGaps = 0;
@@ -2117,14 +2104,6 @@ Remember:
           '(${_aiService.maxSteps}).',
     );
 
-    await TaskHistoryLogger.logTask(
-      userGoal,
-      'Failed',
-      totalTokens,
-      _aiService.maxSteps,
-      results,
-    );
-
     await _finishTask(
       TaskStatus.needsRevision,
       _aiService.maxSteps,
@@ -2157,14 +2136,6 @@ Remember:
     await _notificationService.showTaskCompleteNotification(
       'Task Cancelled',
       'Task was stopped by the user.',
-    );
-
-    await TaskHistoryLogger.logTask(
-      userGoal,
-      'Cancelled',
-      totalTokens,
-      step,
-      results,
     );
 
     await _finishTask(
@@ -2410,7 +2381,7 @@ Remember:
         id,
         technicalSuccess: false,
         uncertain: uncertainMutation,
-        continueAfterUncertain: true,
+        continueAfterUncertain: false,
       );
       if (uncertainMutation) status = TaskStatus.needsRevision;
     } else if (record?.execution.unverifiedMutations.isNotEmpty == true) {
