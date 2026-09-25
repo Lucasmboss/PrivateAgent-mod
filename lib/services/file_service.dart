@@ -141,6 +141,7 @@ class FileService {
     if (bytes.length > maxWriteBytes) {
       throw FileSizeLimitException(maxWriteBytes);
     }
+    final root = await _root();
     final file = await _fileInsideRoot(relativePath, forWrite: true);
     final type = await FileSystemEntity.type(file.path, followLinks: false);
     if (type != FileSystemEntityType.notFound && type != FileSystemEntityType.file) {

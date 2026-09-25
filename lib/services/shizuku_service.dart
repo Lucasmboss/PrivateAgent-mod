@@ -19,7 +19,7 @@ class ShizukuCommandResult {
   final String? error;
 
   bool get succeeded => wasDispatched && exitCode == 0;
-  bool get uncertain => wasDispatched && exitCode == null;
+  bool get uncertain => wasDispatched && exitCode != 0;
   bool get knownFailure =>
       wasDispatched && exitCode != null && exitCode != 0;
   bool get mayHavePartialEffects => uncertain || knownFailure;

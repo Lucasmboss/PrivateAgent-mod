@@ -251,8 +251,11 @@ class TaskStore {
       });
 
   Future<void> clear() => _serialized(() async {
-        if ((await _read()).any((r) => r.status == TaskStatus.running ||
-            r.execution.inFlight != null)) {
+        if ((await _read()).any((r) =>
+            r.status == TaskStatus.running ||
+            r.execution.inFlight != null ||
+            r.execution.unverifiedMutations.isNotEmpty ||
+            r.execution.pendingAssistance.isNotEmpty)) {
           throw StateError('Cannot clear active or unresolved tasks');
         }
         final file = await _file();
