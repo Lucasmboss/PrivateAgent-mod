@@ -371,14 +371,6 @@ void main() {
     test(
       'safe failed subtask gets one final alternative before partial checkpoint',
       () async {
-        final shizuku = _FakeShizukuService(
-          const ShizukuCommandResult(
-            stdout: '',
-            stderr: 'command failed',
-            exitCode: 1,
-            wasDispatched: true,
-          ),
-        );
         var calls = 0;
         final engine = executor(
           _Planner((_, __) async {
@@ -393,12 +385,13 @@ void main() {
                     '"criteria":["Step 3 completed"]}'
                     ']}}',
               2 =>
-                '{"action":"run_adb_command","command":"echo first-approach",'
-                    '"subtask_id":"step-2","reasoning":"Try the first safe approach"}',
+                '{"action":"web_request","params":{"method":"GET",'
+                    '"url":"not-a-valid-http-url"},"subtask_id":"step-2",'
+                    '"reasoning":"Try a read-only request"}',
               3 =>
                 '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
                     '"failure_code":"strategies_exhausted",'
-                    '"attempted_strategies":["run_adb_command"],'
+                    '"attempted_strategies":["web_request"],'
                     '"remaining_strategies":[]}}',
               4 => '{"action":"done","params":{}}',
               5 =>
@@ -407,12 +400,11 @@ void main() {
               6 =>
                 '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
                     '"failure_code":"strategies_exhausted",'
-                    '"attempted_strategies":["run_adb_command","read_screen"],'
+                    '"attempted_strategies":["web_request","read_screen"],'
                     '"remaining_strategies":[]}}',
               _ => '{"action":"done","params":{}}',
             }, 1);
           }),
-          shizuku: shizuku,
         );
 
         await engine.executeTask('Complete step 2, then step 3');
@@ -422,7 +414,6 @@ void main() {
           for (final subtask in record.execution.plan) subtask.id: subtask,
         };
         expect(calls, 7);
-        expect(shizuku.lastCommand, 'echo first-approach');
         expect(engine.lastStatus, TaskStatus.needsRevision);
         expect(record.status, TaskStatus.needsRevision);
         expect(record.execution.unverifiedMutations, isEmpty);
@@ -430,7 +421,7 @@ void main() {
           record.execution.audit
               .where(
                 (event) =>
-                    event.action == 'run_adb_command' &&
+                    event.action == 'web_request' &&
                     event.phase == 'after' &&
                     event.subtaskId == 'step-2',
               )
