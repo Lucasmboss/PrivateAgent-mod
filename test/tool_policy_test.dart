@@ -45,6 +45,7 @@ void main() {
       'attempted_strategies': ['open_app'],
       'remaining_strategies': <String>[],
       'failure_code': 'strategies_exhausted',
+      'subtask_id': 'one',
       'subtasks': [
         {
           'id': 'one',
