@@ -988,6 +988,7 @@ Remember:
         plannerFailures++;
         previousResult = '$plannerFailure Retry $plannerFailures.';
         results.add(previousResult);
+        _report(previousResult);
         consecutiveFailures++;
         await _waitForRetry(plannerFailures);
         continue;
@@ -1532,6 +1533,26 @@ Remember:
               _report(report);
               return report;
             }
+          }
+
+          if (verified.execution.verification != 'verified' &&
+              missingEvidence.isEmpty &&
+              assistanceItems.isEmpty) {
+            final outcome = await _subtaskOutcomeReport();
+            final message =
+                'Task checkpoint saved. Completion criteria need independent '
+                'review in Task History before the task can be marked complete.\n'
+                '$outcome';
+            results.add(message);
+            await _finishTask(
+              TaskStatus.needsRevision,
+              step,
+              totalTokens,
+              results,
+              failedStrategies,
+            );
+            _report(message);
+            return message;
           }
 
           if (verified.execution.verification != 'verified' ||
@@ -2542,6 +2563,7 @@ Remember:
   }
 
   Future<void> _waitForRetry(int attempt) async {
+    if (_cancelled || _paused || _budgetExpired) return;
     final cancellation = _cancelCompleter ??= Completer<void>();
     await Future.any<void>([
       Future<void>.delayed(_retryDelay(attempt)),

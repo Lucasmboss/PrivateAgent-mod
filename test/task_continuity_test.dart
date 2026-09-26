@@ -200,7 +200,7 @@ void main() {
       needsReview.execution.audit
           .firstWhere((event) => event.sequence == 1 && event.phase == 'after')
           .outcome,
-      isNull,
+      'unverified',
     );
   });
 
@@ -463,7 +463,7 @@ void main() {
     await store.beginAction('t', 'read_screen', mutation: false);
     await store.endAction('t', technicalSuccess: true);
     final refs = {'goal': {'Find source': ['action-1']}};
-    expect((await store.verifyCompletion('t', refs)).execution.verification, 'unverified');
+    expect((await store.verifyCompletion('t', refs)).execution.verification, 'partial');
     expect(store.update('t', status: TaskStatus.completed), throwsStateError);
     await store.update('t', status: TaskStatus.needsRevision);
     await store.confirmCriterion('t', expectedRevision: 0, subtaskId: 'goal',

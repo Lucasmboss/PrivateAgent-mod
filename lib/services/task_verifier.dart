@@ -1,7 +1,7 @@
 import '../models/task_record.dart';
 
-/// A model's completion claim is not evidence. References must resolve to
-/// successful observations in the current criteria revision.
+/// Model-selected references are supporting information, not proof.
+/// Completion requires trusted confirmation for every current criterion.
 class TaskVerifier {
   static bool isMutation(String action, Map<String, dynamic> params) {
     if (action == 'web_request') {
@@ -110,6 +110,18 @@ class TaskVerifier {
     };
   }
 
+  static bool _criterionConfirmed(
+    TaskExecutionState state,
+    TaskSubtask task,
+    String criterion,
+  ) =>
+      state.criterionConfirmations.any(
+        (confirmation) =>
+            confirmation.revision == state.revision &&
+            confirmation.subtaskId == task.id &&
+            confirmation.criterion == criterion,
+      );
+
   static String verify(TaskExecutionState state) {
     if (state.inFlight != null) return 'uncertain';
     if (state.unverifiedMutations.isNotEmpty) return 'partial';
@@ -131,8 +143,8 @@ class TaskVerifier {
     for (final task in state.plan) {
       if (!completed.containsAll(task.dependencies) || task.criteria.isEmpty) return 'partial';
       for (final criterion in task.criteria) {
-        if (!hasValidCriterionEvidence(task, criterion, evidence)) {
-          return 'partial';
+        if (!_criterionConfirmed(state, task, criterion)) {
+          return evidence.isEmpty ? 'unverified' : 'partial';
         }
       }
       completed.add(task.id);
@@ -140,10 +152,9 @@ class TaskVerifier {
     return 'verified';
   }
 
-  /// Returns only subtasks whose trusted criterion review and evidence refs
-  /// independently pass. A separate unresolved subtask must not hide progress.
+  /// Returns subtasks with trusted criterion review and resolved mutations.
+  /// A separate unresolved subtask must not hide safe independent progress.
   static Set<String> verifiedSubtaskIds(TaskExecutionState state) {
-    final evidence = _successfulEvidence(state);
     if (hasUnscopedUnresolvedMutation(state)) return {};
     final unresolvedMutationSubtasks =
         unresolvedMutationSubtaskIds(state);
@@ -161,7 +172,7 @@ class TaskVerifier {
       }
       var valid = true;
       for (final criterion in task.criteria) {
-        if (!hasValidCriterionEvidence(task, criterion, evidence)) {
+        if (!_criterionConfirmed(state, task, criterion)) {
           valid = false;
           break;
         }

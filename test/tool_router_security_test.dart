@@ -178,7 +178,7 @@ void main() {
         requested = max;
         return AiResponse('{"action":"read_screen","params":{}}', 5);
       }), tokens: 5);
-      expect(await engine.executeTask('Read'), contains('budget exhausted'));
+      expect(await engine.executeTask('Read'), contains('configured task budget was reached'));
       expect(requested, 5);
       final record = (await store.list()).single;
       expect(record.tokens, 5);
@@ -192,7 +192,7 @@ void main() {
         calls++;
         return AiResponse('{}', 1);
       }), duration: Duration.zero);
-      expect(await engine.executeTask('Read'), contains('budget exhausted'));
+      expect(await engine.executeTask('Read'), contains('configured task budget was reached'));
       expect(calls, 0);
       expect((await store.list()).single.status, TaskStatus.needsRevision);
     });
@@ -383,7 +383,7 @@ void main() {
     );
 
     test(
-      'verified completion report names its read-only evidence',
+      'planner completion requires trusted criterion review before success',
       () async {
         var calls = 0;
         final engine = executor(_Planner((_, __) async {
@@ -412,12 +412,32 @@ void main() {
         expect(calls, 3);
         expect(
           result,
+          contains('Completion criteria need independent review in Task History'),
+        );
+        var record = (await store.list()).single;
+        expect(record.status, TaskStatus.needsRevision);
+        expect(record.execution.verification, 'partial');
+        await store.confirmCriterion(
+          record.identifier,
+          expectedRevision: record.execution.revision,
+          subtaskId: 'files',
+          criterion: 'The private file list was observed',
+          confirmed: true,
+        );
+
+        final resumedResult = await engine.executeTask(
+          'List private agent files',
+          resumeTaskId: record.identifier,
+        );
+        expect(calls, 4);
+        expect(
+          resumedResult,
           contains(
             'Evidence check: 1 criteria across 1 subtasks, supported by '
             '1 successful read-only observation (list_files).',
           ),
         );
-        final record = (await store.list()).single;
+        record = (await store.list()).single;
         expect(record.status, TaskStatus.completed);
         expect(record.execution.verification, 'verified');
       },
@@ -718,12 +738,15 @@ void main() {
           subtaskId: 'read-status',
         );
         await store.endAction(task.identifier, technicalSuccess: false);
-        await store.markSubtaskFailed(
-          task.identifier,
-          subtaskId: 'read-status',
-          failureCode: 'strategies_exhausted',
-          attemptedStrategies: ['read_screen'],
-          remainingStrategies: const [],
+        expect(
+          store.markSubtaskFailed(
+            task.identifier,
+            subtaskId: 'read-status',
+            failureCode: 'strategies_exhausted',
+            attemptedStrategies: ['read_screen'],
+            remainingStrategies: const [],
+          ),
+          throwsStateError,
         );
 
         final reopened = await store.reopenSafeFailedSubtasksForRetry(
@@ -736,7 +759,7 @@ void main() {
         expect(checkpoint.execution.unverifiedMutations, isNotEmpty);
         expect(
           checkpoint.execution.plan.single.status,
-          TaskSubtaskStatus.failed,
+          TaskSubtaskStatus.needsReview,
         );
         expect(
           checkpoint.execution.audit
