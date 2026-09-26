@@ -122,6 +122,11 @@ class TaskVerifier {
             confirmation.criterion == criterion,
       );
 
+  static bool hasUnconfirmedCriteria(TaskExecutionState state) => state.plan
+      .any((task) => task.criteria.any(
+            (criterion) => !_criterionConfirmed(state, task, criterion),
+          ));
+
   static String verify(TaskExecutionState state) {
     if (state.inFlight != null) return 'uncertain';
     if (state.unverifiedMutations.isNotEmpty) return 'partial';

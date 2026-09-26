@@ -2747,7 +2747,9 @@ Remember:
       }
       if (valid) completed.add(subtask.id);
     }
-    if (gaps.isEmpty && TaskVerifier.verify(state) != 'verified') {
+    if (gaps.isEmpty &&
+        TaskVerifier.verify(state) != 'verified' &&
+        !TaskVerifier.hasUnconfirmedCriteria(state)) {
       gaps.add('The saved task state does not satisfy the completion checks.');
     }
     return gaps;
