@@ -130,7 +130,9 @@ class TaskVerifier {
   static bool isReadyForCriterionReview(TaskExecutionState state) {
     if (state.inFlight != null ||
         state.unverifiedMutations.isNotEmpty ||
-        state.pendingAssistance.isNotEmpty ||
+        state.pendingAssistance.any(
+          (item) => item.kind != TaskAssistanceKind.criterionReview,
+        ) ||
         state.plan.isEmpty ||
         !hasUnconfirmedCriteria(state) ||
         hasUnscopedUnresolvedMutation(state) ||

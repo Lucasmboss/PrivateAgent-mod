@@ -1367,6 +1367,27 @@ Remember:
           );
         final missingEvidence = _completionEvidenceGaps(verified.execution);
         final assistanceItems = _assistanceItems(verified.execution);
+        if (verified.execution.verification != 'verified' &&
+            TaskVerifier.isReadyForCriterionReview(verified.execution) &&
+            assistanceItems.every(
+              (item) => item.kind == TaskAssistanceKind.criterionReview,
+            )) {
+          final outcome = await _subtaskOutcomeReport();
+          final message =
+              'Task checkpoint saved. Completion criteria need independent '
+              'review in Task History before the task can be marked complete.\n'
+              '$outcome';
+          results.add(message);
+          await _finishTask(
+            TaskStatus.needsRevision,
+            step,
+            totalTokens,
+            results,
+            failedStrategies,
+          );
+          _report(message);
+          return message;
+        }
         if (verified.execution.verification != 'verified' ||
             assistanceItems.isNotEmpty) {
           if (verified.execution.verification != 'verified') {
@@ -1533,26 +1554,6 @@ Remember:
               _report(report);
               return report;
             }
-          }
-
-          if (verified.execution.verification != 'verified' &&
-              TaskVerifier.isReadyForCriterionReview(verified.execution) &&
-              assistanceItems.isEmpty) {
-            final outcome = await _subtaskOutcomeReport();
-            final message =
-                'Task checkpoint saved. Completion criteria need independent '
-                'review in Task History before the task can be marked complete.\n'
-                '$outcome';
-            results.add(message);
-            await _finishTask(
-              TaskStatus.needsRevision,
-              step,
-              totalTokens,
-              results,
-              failedStrategies,
-            );
-            _report(message);
-            return message;
           }
 
           if (verified.execution.verification != 'verified' ||
