@@ -385,13 +385,13 @@ void main() {
                     '"criteria":["Step 3 completed"]}'
                     ']}}',
               2 =>
-                '{"action":"web_request","params":{"method":"GET",'
-                    '"url":"not-a-valid-http-url"},"subtask_id":"step-2",'
-                    '"reasoning":"Try a read-only request"}',
+                '{"action":"read_file","params":{"path":'
+                    '"missing-final-retry.txt"},"subtask_id":"step-2",'
+                    '"reasoning":"Try a read-only file lookup"}',
               3 =>
                 '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
                     '"failure_code":"strategies_exhausted",'
-                    '"attempted_strategies":["web_request"],'
+                    '"attempted_strategies":["read_file"],'
                     '"remaining_strategies":[]}}',
               4 => '{"action":"done","params":{}}',
               5 =>
@@ -400,7 +400,7 @@ void main() {
               6 =>
                 '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
                     '"failure_code":"strategies_exhausted",'
-                    '"attempted_strategies":["web_request","read_screen"],'
+                    '"attempted_strategies":["read_file","read_screen"],'
                     '"remaining_strategies":[]}}',
               _ => '{"action":"done","params":{}}',
             }, 1);
@@ -421,7 +421,7 @@ void main() {
           record.execution.audit
               .where(
                 (event) =>
-                    event.action == 'web_request' &&
+                    event.action == 'read_file' &&
                     event.phase == 'after' &&
                     event.subtaskId == 'step-2',
               )
