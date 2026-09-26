@@ -1536,7 +1536,7 @@ Remember:
           }
 
           if (verified.execution.verification != 'verified' &&
-              missingEvidence.isEmpty &&
+              TaskVerifier.isReadyForCriterionReview(verified.execution) &&
               assistanceItems.isEmpty) {
             final outcome = await _subtaskOutcomeReport();
             final message =

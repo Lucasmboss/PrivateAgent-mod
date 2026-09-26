@@ -127,6 +127,42 @@ class TaskVerifier {
             (criterion) => !_criterionConfirmed(state, task, criterion),
           ));
 
+  static bool isReadyForCriterionReview(TaskExecutionState state) {
+    if (state.inFlight != null ||
+        state.unverifiedMutations.isNotEmpty ||
+        state.pendingAssistance.isNotEmpty ||
+        state.plan.isEmpty ||
+        !hasUnconfirmedCriteria(state) ||
+        hasUnscopedUnresolvedMutation(state) ||
+        unresolvedMutationSubtaskIds(state).isNotEmpty ||
+        state.plan.any((task) => const {
+              TaskSubtaskStatus.failed,
+              TaskSubtaskStatus.blocked,
+              TaskSubtaskStatus.needsReview,
+            }.contains(task.status) ||
+            task.criteria.isEmpty)) {
+      return false;
+    }
+    final evidence = _successfulEvidence(state).values;
+    if (evidence.isEmpty ||
+        evidence.any(
+          (event) =>
+              event.mutation &&
+              event.outcome != 'userConfirmed' &&
+              event.outcome != 'observed',
+        )) {
+      return false;
+    }
+    return state.plan.every(
+      (task) => evidence.any(
+        (event) =>
+            event.subtaskId == task.id &&
+            !event.mutation &&
+            isObservationAction(event.action),
+      ),
+    );
+  }
+
   static String verify(TaskExecutionState state) {
     if (state.inFlight != null) return 'uncertain';
     if (state.unverifiedMutations.isNotEmpty) return 'partial';
