@@ -503,11 +503,9 @@ GENERAL RULES:
         if (lastStatus == TaskStatus.completed ||
             lastStatus == TaskStatus.cancelled ||
             lastStatus == TaskStatus.paused ||
-            lastStatus == TaskStatus.failed ||
-            lastStatus == TaskStatus.needsRevision) {
+            lastStatus == TaskStatus.failed) {
           if (lastStatus == TaskStatus.paused ||
-              lastStatus == TaskStatus.failed ||
-              lastStatus == TaskStatus.needsRevision) {
+              lastStatus == TaskStatus.failed) {
             await _notifyTaskCheckpoint(lastStatus!);
           }
           return result;
@@ -519,7 +517,10 @@ GENERAL RULES:
         if (checkpoint.status == TaskStatus.completed ||
             checkpoint.status == TaskStatus.cancelled ||
             checkpoint.status == TaskStatus.paused ||
-            checkpoint.status == TaskStatus.needsRevision ||
+            (checkpoint.status == TaskStatus.needsRevision &&
+                TaskVerifier.isReadyForCriterionReview(
+                  checkpoint.execution,
+                )) ||
             checkpoint.execution.pendingAssistance.isNotEmpty ||
             _blockedByHostPolicy ||
             _blockedByProviderConfiguration ||
