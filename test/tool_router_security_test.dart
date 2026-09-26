@@ -13,7 +13,6 @@ import 'package:private_agent/services/screen_automation_service.dart';
 import 'package:private_agent/services/shizuku_service.dart';
 import 'package:private_agent/services/task_executor.dart';
 import 'package:private_agent/services/task_store.dart';
-import 'package:private_agent/services/task_verifier.dart';
 import 'package:private_agent/services/task_history_logger.dart';
 import 'package:private_agent/services/telegram_service.dart';
 import 'package:private_agent/services/tool_policy.dart';
@@ -386,21 +385,9 @@ void main() {
     test(
       'planner completion requires trusted criterion review before success',
       () async {
-        var readinessDiagnostic = 'not captured before planner returned';
         var calls = 0;
         final engine = executor(_Planner((_, __) async {
           calls++;
-          if (calls == 4) {
-            final record = (await store.list()).single;
-            final state = record.execution;
-            final planSummary = state.plan.map((subtask) =>
-              '${subtask.id}:${subtask.status.name}:criteria=${subtask.criteria}:attempts=${subtask.attempts}'
-            ).join('; ');
-            final auditSummary = state.audit.map((event) =>
-              '${event.sequence}:${event.action}:${event.phase}:rev=${event.revision}:ok=${event.technicalSuccess}:mutation=${event.mutation}:outcome=${event.outcome}:subtask=${event.subtaskId}'
-            ).join('; ');
-            readinessDiagnostic = 'task=${record.status.name}; ready=${TaskVerifier.isReadyForCriterionReview(state)}; verification=${state.verification}; revision=${state.revision}; inFlight=${state.inFlight?.action}; unverifiedMutations=${state.unverifiedMutations}; pendingAssistance=${state.pendingAssistance.length}; confirmations=${state.criterionConfirmations.length}; plan=$planSummary; audit=$auditSummary';
-          }
           return AiResponse(
             switch (calls) {
               1 =>
@@ -418,13 +405,11 @@ void main() {
             },
             1,
           );
-        }),
-          duration: const Duration(seconds: 8),
-        );
+        }));
 
         final result = await engine.executeTask('List private agent files');
 
-        expect(calls, 3, reason: readinessDiagnostic);
+        expect(calls, 3);
         expect(
           result,
           contains('Completion criteria need independent review in Task History'),

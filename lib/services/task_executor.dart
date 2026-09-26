@@ -1367,11 +1367,7 @@ Remember:
           );
         final missingEvidence = _completionEvidenceGaps(verified.execution);
         final assistanceItems = _assistanceItems(verified.execution);
-        if (verified.execution.verification != 'verified' &&
-            TaskVerifier.isReadyForCriterionReview(verified.execution) &&
-            assistanceItems.every(
-              (item) => item.kind == TaskAssistanceKind.criterionReview,
-            )) {
+        if (TaskVerifier.isReadyForCriterionReview(verified.execution)) {
           final outcome = await _subtaskOutcomeReport();
           final message =
               'Task checkpoint saved. Completion criteria need independent '
