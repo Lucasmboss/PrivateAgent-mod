@@ -114,6 +114,7 @@ void main() {
     TaskExecutor executor(
       AiService ai, {
       ToolApprovalCallback? approve,
+      void Function(String)? onProgress,
       ShizukuService? shizuku,
       int tokens = 100,
       Duration duration = const Duration(minutes: 1),
@@ -125,6 +126,7 @@ void main() {
       notificationService: _NoopNotificationService(),
       taskStore: store,
       onApproval: approve,
+      onProgress: onProgress,
       maxTaskTokens: tokens,
       maxTaskDuration: duration,
     );
@@ -290,10 +292,6 @@ void main() {
         engine = executor(
           _Planner((_, __) async {
             calls++;
-            if (calls == 6) {
-              engine.pause();
-              return AiResponse('{"action":"done","params":{}}', 1);
-            }
             return AiResponse(switch (calls) {
               1 =>
                 '{"action":"plan","params":{"subtasks":['
@@ -319,12 +317,15 @@ void main() {
             }, 1);
           }),
           shizuku: shizuku,
+          onProgress: (message) {
+            if (message.contains('bounded final retry')) engine.pause();
+          },
         );
 
         final message = await engine.executeTask('Change device state');
 
         final record = (await store.list()).single;
-        expect(calls, 6);
+        expect(calls, 5);
         expect(message, isNotEmpty);
         expect(record.status, TaskStatus.paused);
         expect(record.execution.inFlight, isNull);
@@ -521,6 +522,71 @@ void main() {
         expect(checkpoint.execution.plan[0].status, TaskSubtaskStatus.completed);
         expect(checkpoint.execution.plan[1].status, TaskSubtaskStatus.pending);
         expect(await store.runnableSubtaskId(task.identifier), 'step-3');
+      },
+    );
+
+    test(
+      'unscoped uncertain mutation blocks automatic final retries',
+      () async {
+        final task = await store.create(
+          goal: 'Read the required status',
+          status: TaskStatus.running,
+        );
+        await store.setPlan(task.identifier, const [
+          TaskSubtask(
+            id: 'read-status',
+            objective: 'Read the required status',
+            criteria: ['Status was read'],
+          ),
+        ]);
+        await store.beginAction(
+          task.identifier,
+          'run_adb_command',
+          mutation: true,
+        );
+        await store.endAction(
+          task.identifier,
+          technicalSuccess: false,
+          uncertain: true,
+          continueAfterUncertain: true,
+        );
+        await store.beginAction(
+          task.identifier,
+          'read_screen',
+          mutation: false,
+          subtaskId: 'read-status',
+        );
+        await store.endAction(task.identifier, technicalSuccess: false);
+        await store.markSubtaskFailed(
+          task.identifier,
+          subtaskId: 'read-status',
+          failureCode: 'strategies_exhausted',
+          attemptedStrategies: ['read_screen'],
+          remainingStrategies: const [],
+        );
+
+        final reopened = await store.reopenSafeFailedSubtasksForRetry(
+          task.identifier,
+          alreadyRetriedSubtaskIds: const {},
+        );
+
+        expect(reopened, isEmpty);
+        final checkpoint = (await store.get(task.identifier))!;
+        expect(checkpoint.execution.unverifiedMutations, isNotEmpty);
+        expect(
+          checkpoint.execution.plan.single.status,
+          TaskSubtaskStatus.failed,
+        );
+        expect(
+          checkpoint.execution.audit
+              .where(
+                (event) =>
+                    event.action == 'run_adb_command' &&
+                    event.phase == 'uncertain',
+              )
+              .length,
+          1,
+        );
       },
     );
 

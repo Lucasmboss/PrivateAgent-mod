@@ -747,9 +747,21 @@ class TaskStore {
       return const <String>[];
     }
 
+    final hasUnscopedRiskyMutation = state.audit.any(
+      (event) =>
+          event.subtaskId == null &&
+          event.mutation &&
+          (event.phase == 'uncertain' ||
+              state.unverifiedMutations.contains(event.sequence) ||
+              event.technicalSuccess ||
+              event.outcome == 'userConfirmed' ||
+              event.outcome == 'observed'),
+    );
+
     bool isSafeFailedSubtask(TaskSubtask subtask) {
       if (subtask.status != TaskSubtaskStatus.failed ||
-          alreadyRetriedSubtaskIds.contains(subtask.id)) {
+          alreadyRetriedSubtaskIds.contains(subtask.id) ||
+          hasUnscopedRiskyMutation) {
         return false;
       }
       final hasRecordedFailure = state.audit.any(
