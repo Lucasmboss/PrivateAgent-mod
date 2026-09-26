@@ -405,8 +405,9 @@ void main() {
       await engine.executeTask('Read', resumeTaskId: previous.identifier);
 
       final record = (await store.list()).single;
-      expect(calls, 1);
-      expect(record.stepsCompleted, AiService().maxSteps);
+      final maxSteps = AiService().maxSteps;
+      expect(calls, maxSteps);
+      expect(record.stepsCompleted, maxSteps * 2);
       expect(record.status, TaskStatus.needsRevision);
     });
 
@@ -420,7 +421,9 @@ void main() {
 
       await engine.executeTask('Read');
 
-      expect(calls, 2);
+      expect(calls, AiService().maxSteps);
+      final record = (await store.list()).single;
+      expect(record.stepsCompleted, AiService().maxSteps);
       expect(engine.lastStatus, TaskStatus.needsRevision);
     });
 

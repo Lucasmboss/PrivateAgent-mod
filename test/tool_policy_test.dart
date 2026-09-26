@@ -44,6 +44,7 @@ void main() {
       'blocker_type': 'sign_in',
       'attempted_strategies': ['open_app'],
       'remaining_strategies': <String>[],
+      'failure_code': 'strategies_exhausted',
       'subtasks': [
         {
           'id': 'one',
