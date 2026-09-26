@@ -16,6 +16,13 @@ void main() {
   });
   tearDown(() => directory.delete(recursive: true));
 
+  test('mutations require a validated subtask scope', () {
+    expect(
+      store.beginAction('t', 'write_file', mutation: true),
+      throwsFormatException,
+    );
+  });
+
   test('bare completion and invented evidence are rejected', () async {
     expect(store.update('t', status: TaskStatus.completed), throwsStateError);
     final result = await store.verifyCompletion('t', {
@@ -25,7 +32,12 @@ void main() {
   });
 
   test('in-flight mutation survives restart and cannot replay', () async {
-    await store.beginAction('t', 'press_enter', mutation: true);
+    await store.beginAction(
+      't',
+      'press_enter',
+      mutation: true,
+      subtaskId: 'goal',
+    );
     final fresh = TaskStore(directory: directory);
     await fresh.recoverInterrupted();
     final recovered = (await fresh.get('t'))!;
@@ -44,7 +56,12 @@ void main() {
 
   test('an independently verified failed mutation is not recorded as success',
       () async {
-    await store.beginAction('t', 'write_file', mutation: true);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'goal',
+    );
     await store.endAction(
       't',
       technicalSuccess: false,
@@ -62,6 +79,41 @@ void main() {
     expect(resolved.execution.unverifiedMutations, isEmpty);
     expect(resolved.execution.audit.last.outcome, 'userConfirmedFailure');
     expect(resolved.execution.audit.last.technicalSuccess, isFalse);
+  });
+
+  test('a confirmed missing effect permits a new safe attempt', () async {
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'goal',
+    );
+    await store.endAction('t', technicalSuccess: true);
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.confirmActionOutcome(
+      't',
+      1,
+      userConfirmedSuccess: false,
+    );
+
+    var record = (await store.get('t'))!;
+    expect(record.execution.unverifiedMutations, isEmpty);
+    expect(record.execution.audit.last.outcome, 'userConfirmedFailure');
+    expect(record.execution.audit.last.technicalSuccess, isFalse);
+    expect(record.execution.plan.single.status, TaskSubtaskStatus.pending);
+
+    await store.update('t', status: TaskStatus.running);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'goal',
+    );
+    await store.endAction('t', technicalSuccess: false);
+    record = (await store.get('t'))!;
+    expect(record.execution.audit.last.sequence, 2);
+    expect(record.execution.unverifiedMutations, isEmpty);
+    expect(TaskVerifier.verify(record.execution), 'unverified');
   });
 
   test('same-chat checkpoint keeps its session and completed step count', () async {
@@ -109,17 +161,47 @@ void main() {
     expect((await store.get('t'))!.execution.pendingAssistance, isEmpty);
   });
 
-  test('technical mutation success does not establish outcome', () async {
-    await store.beginAction('t', 'write_file', mutation: true);
+  test('a linked read alone cannot attest a successful mutation outcome', () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'goal',
+        objective: 'Find source',
+        criteria: ['Find source'],
+      ),
+    ]);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'goal',
+    );
     await store.endAction('t', technicalSuccess: true);
-    final refs = {'goal': {'Find source': ['action-1']}};
-    expect((await store.verifyCompletion('t', refs)).execution.verification, 'partial');
-    await store.update('t', status: TaskStatus.needsRevision);
-    await store.confirmActionOutcome('t', 1);
-    expect((await store.verifyCompletion('t', refs)).execution.verification, 'unverified');
-    await store.confirmCriterion('t', expectedRevision: 0, subtaskId: 'goal',
-        criterion: 'Find source', confirmed: true);
-    expect((await store.verifyCompletion('t', refs)).execution.verification, 'verified');
+    final mutationOnly = {'goal': {'Find source': ['action-1']}};
+    expect(
+      (await store.verifyCompletion('t', mutationOnly)).execution.verification,
+      'partial',
+    );
+    await store.beginAction(
+      't',
+      'read_file',
+      mutation: false,
+      subtaskId: 'goal',
+    );
+    await store.endAction('t', technicalSuccess: true);
+    final observed = {'goal': {'Find source': ['action-2']}};
+    final needsReview = await store.verifyCompletion('t', observed);
+    expect(needsReview.execution.verification, 'partial');
+    expect(needsReview.execution.unverifiedMutations, [1]);
+    expect(
+      needsReview.execution.plan.single.status,
+      TaskSubtaskStatus.needsReview,
+    );
+    expect(
+      needsReview.execution.audit
+          .firstWhere((event) => event.sequence == 1 && event.phase == 'after')
+          .outcome,
+      isNull,
+    );
   });
 
   test('mutation review blocks only dependents and preserves status on resume',
@@ -163,6 +245,7 @@ void main() {
     expect(subtasks['changed']!.status, TaskSubtaskStatus.needsReview);
     expect(subtasks['followup']!.status, TaskSubtaskStatus.blocked);
     expect(subtasks['independent']!.status, TaskSubtaskStatus.pending);
+    expect(await store.runnableSubtaskId('t'), 'independent');
 
     await store.update('t', status: TaskStatus.needsRevision);
     await store.claim('t', 'Find source');
@@ -216,6 +299,110 @@ void main() {
     expect(result.execution.verification, 'unverified');
   });
 
+  test('a new criteria revision cannot unblock an unresolved mutation', () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'goal',
+        objective: 'Apply the requested change',
+        criteria: ['The change is present'],
+      ),
+    ]);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'goal',
+    );
+    await store.endAction('t', technicalSuccess: true);
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.claim('t', 'Find source');
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'goal',
+        objective: 'Verify the changed file',
+        criteria: ['The updated content is present'],
+      ),
+    ]);
+
+    await store.beginAction(
+      't',
+      'read_file',
+      mutation: false,
+      subtaskId: 'goal',
+    );
+    await store.endAction('t', technicalSuccess: true);
+    final revised = await store.verifyCompletion('t', {
+      'goal': {
+        'The updated content is present': ['action-2'],
+      },
+    });
+
+    expect(revised.execution.verification, 'partial');
+    expect(revised.execution.unverifiedMutations, [1]);
+    expect(
+      revised.execution.plan.single.status,
+      TaskSubtaskStatus.needsReview,
+    );
+    expect(await store.runnableSubtaskId('t'), isNull);
+  });
+
+  test('legacy unscoped mutation blocks all subtasks until reviewed', () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'changed',
+        objective: 'Apply a change',
+        criteria: ['Change is present'],
+      ),
+      TaskSubtask(
+        id: 'followup',
+        objective: 'Use the changed state',
+        dependencies: ['changed'],
+        criteria: ['Follow-up is complete'],
+      ),
+      TaskSubtask(
+        id: 'independent',
+        objective: 'Complete independent work',
+        criteria: ['Independent work is complete'],
+      ),
+    ]);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'changed',
+    );
+    await store.endAction('t', technicalSuccess: true);
+    await store.update('t', status: TaskStatus.needsRevision);
+
+    final file = File('${directory.path}/tasks.json');
+    final records = (jsonDecode(await file.readAsString()) as List)
+        .map((item) => Map<String, dynamic>.from(item as Map))
+        .toList();
+    final execution = Map<String, dynamic>.from(
+      records.single['execution'] as Map,
+    );
+    execution['audit'] = (execution['audit'] as List)
+        .map(
+          (item) => Map<String, dynamic>.from(item as Map)
+            ..['subtaskId'] = null,
+        )
+        .toList();
+    records.single['execution'] = execution;
+    await file.writeAsString(jsonEncode(records));
+
+    final restarted = TaskStore(directory: directory);
+    await restarted.claim('t', 'Find source');
+    expect(await restarted.runnableSubtaskId('t'), isNull);
+
+    await restarted.update('t', status: TaskStatus.needsRevision);
+    await restarted.confirmActionOutcome('t', 1);
+    expect(
+      (await restarted.get('t'))!.execution.unverifiedMutations,
+      isEmpty,
+    );
+    expect(await restarted.runnableSubtaskId('t'), 'changed');
+  });
+
   test('shared stores serialize actions and refuse racing clears', () async {
     final second = TaskStore(directory: directory);
     await store.beginAction('t', 'read_file', mutation: false);
@@ -226,7 +413,12 @@ void main() {
   });
 
   test('audit is bounded and pending mutation verification is not evicted', () async {
-    await store.beginAction('t', 'press_enter', mutation: true);
+    await store.beginAction(
+      't',
+      'press_enter',
+      mutation: true,
+      subtaskId: 'goal',
+    );
     await store.endAction('t', technicalSuccess: true);
     for (var i = 0; i < 102; i++) {
       await store.beginAction('t', 'read_screen', mutation: false);
@@ -235,6 +427,19 @@ void main() {
     final state = (await store.get('t'))!.execution;
     expect(state.audit.length, 200);
     expect(state.nextSequence, 104);
+    expect(
+      state.audit.any(
+        (event) =>
+            event.sequence == 1 &&
+            event.mutation &&
+            event.phase == 'after',
+      ),
+      isTrue,
+    );
+    expect(
+      TaskVerifier.unresolvedMutationSubtaskIds(state),
+      contains('goal'),
+    );
     expect(TaskVerifier.verify(state), 'partial');
   });
 

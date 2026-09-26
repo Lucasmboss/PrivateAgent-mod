@@ -141,19 +141,20 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
           'You must independently verify the effects in the destination app, '
           'file, or service before confirming. A tool success message or an AI '
           'claim is not proof of the intended outcome.\n\n'
-           '${uncertain ? 'This action may already have changed external state. '
-               'Resolving it does not replay or undo it. Only mark “did not succeed” '
-               'if you verified that outcome; if unsure, keep it unresolved. '
-               'The executor will not automatically replay this action.' : 'Confirm only if you personally verified the intended outcome.'}\n\n'
+          'This review does not undo external state. Confirm success only after '
+          'you independently verify the intended effect. For a mutation, mark '
+          'failure only after verifying that the intended effect did not occur; '
+          'a confirmed failure may allow a new safe attempt. An unresolved or '
+          'successful mutation is never replayed. If unsure, keep it unresolved.\n\n'
           'This records your attestation, not independent automated verification '
           'of the entire goal.',
         )),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context),
               child: const Text('Keep unresolved')),
-          if (uncertain)
+          if (auditEvent.mutation)
             TextButton(onPressed: () => Navigator.pop(context, false),
-                child: const Text('Verified: did not succeed')),
+                child: const Text('Verified: intended effect did not occur')),
           FilledButton(onPressed: () => Navigator.pop(context, true),
               child: const Text('I independently verified success')),
         ],
@@ -185,7 +186,11 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
           );
         }
       } else {
-        await _store.confirmActionOutcome(record.identifier, reviewSequence);
+        await _store.confirmActionOutcome(
+          record.identifier,
+          reviewSequence,
+          userConfirmedSuccess: decision,
+        );
       }
     });
   }

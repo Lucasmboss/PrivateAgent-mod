@@ -125,7 +125,8 @@ class TaskExecutionDetails extends StatelessWidget {
           'Outcome evidence: ${event.outcome == 'userConfirmed' ? 'user-confirmed' : event.outcome == 'observed' ? 'observed' : event.outcome}',
         ),
       )),
-      ...latest.values.where((event) => event.phase == 'after' &&
+      ...latest.values.where((event) => event.mutation &&
+          event.phase == 'after' &&
           event.technicalSuccess && event.outcome != 'userConfirmed' &&
           event.outcome != 'observed' && event.sequence != pending?.sequence)
           .map((event) => OutlinedButton(

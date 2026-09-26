@@ -201,9 +201,11 @@ class TaskStore {
   Future<List<TaskRecord>> recoverInterrupted() => _serialized(() async {
         final records = await _read();
         var changed = false;
+        final interruptedIds = <String>{};
         final recovered = records.map((record) {
           if (record.status != TaskStatus.running) return record;
           changed = true;
+          interruptedIds.add(record.identifier);
           final pending = record.execution.inFlight;
           final recoveredExecution = pending == null
               ? record.execution
@@ -248,7 +250,9 @@ class TaskStore {
           );
         }).toList();
         if (changed) await _write(recovered);
-        return List.unmodifiable(recovered);
+        return List.unmodifiable(
+          recovered.where((record) => interruptedIds.contains(record.identifier)),
+        );
       });
 
   Future<List<TaskRecord>> list() => _serialized(() async {
@@ -290,7 +294,43 @@ class TaskStore {
 
   List<ActionAudit> _append(List<ActionAudit> audit, ActionAudit entry) {
     final next = [...audit, entry];
-    return next.length <= 200 ? next : next.sublist(next.length - 200);
+    if (next.length <= 200) return next;
+
+    final trustedOutcomes = {
+      for (final event in next)
+        if (event.mutation &&
+            event.phase == 'after' &&
+            const {'userConfirmed', 'userConfirmedFailure', 'observed'}
+                .contains(event.outcome))
+          event.sequence,
+    };
+    final protectedSequences = {
+      for (final event in next)
+        if (event.mutation &&
+            event.phase != 'before' &&
+            !trustedOutcomes.contains(event.sequence) &&
+            (event.phase == 'uncertain' ||
+                (event.phase == 'after' && event.technicalSuccess)))
+          event.sequence,
+    };
+    final protectedEventCount = next
+        .where((event) => protectedSequences.contains(event.sequence))
+        .length;
+    var unprotectedSlots =
+        protectedEventCount >= 200 ? 0 : 200 - protectedEventCount;
+    final keep = List<bool>.filled(next.length, false);
+    for (var index = next.length - 1; index >= 0; index--) {
+      if (protectedSequences.contains(next[index].sequence)) {
+        keep[index] = true;
+      } else if (unprotectedSlots > 0) {
+        keep[index] = true;
+        unprotectedSlots--;
+      }
+    }
+    return [
+      for (var index = 0; index < next.length; index++)
+        if (keep[index]) next[index],
+    ];
   }
 
   TaskExecutionState _prepareResume(TaskExecutionState state) {
@@ -320,17 +360,15 @@ class TaskStore {
               : subtask)
           .toList();
     }
-    final hasLegacyUncertainMutation =
-        unresolvedEvents.any((event) => event.subtaskId == null);
-    if (hasLegacyUncertainMutation &&
-        plan.isNotEmpty &&
-        plan.every((subtask) =>
-            subtask.attempts == 0 &&
-            subtask.status == TaskSubtaskStatus.pending)) {
-      plan[0] = plan[0].copyWith(
-        status: TaskSubtaskStatus.needsReview,
-        failureCode: 'uncertain_outcome',
-      );
+    if (TaskVerifier.hasUnscopedUnresolvedMutation(state)) {
+      plan = plan
+          .map(
+            (subtask) => subtask.copyWith(
+              status: TaskSubtaskStatus.needsReview,
+              failureCode: 'mutation_outcome_unverified',
+            ),
+          )
+          .toList();
     }
     return state.copyWith(plan: _refreshSubtaskDependencies(plan));
   }
@@ -381,6 +419,14 @@ class TaskStore {
         !state.plan.any((subtask) => subtask.id == subtaskId)) {
       throw const FormatException('Unknown subtask');
     }
+    if (mutation && subtaskId == null) {
+      throw const FormatException('Mutations require a validated subtask scope');
+    }
+    if (mutation && TaskVerifier.hasUnscopedUnresolvedMutation(state)) {
+      throw StateError(
+        'An unscoped external mutation needs review before further changes',
+      );
+    }
     final target = subtaskId == null
         ? null
         : state.plan.firstWhere((subtask) => subtask.id == subtaskId);
@@ -402,15 +448,28 @@ class TaskStore {
     if (target?.status == TaskSubtaskStatus.needsReview && mutation) {
       throw StateError('Mutation blocked while subtask outcome needs review');
     }
-    if (mutation &&
-        state.audit.any((event) =>
-            event.mutation &&
-            event.action == action &&
-            (event.subtaskId == subtaskId || event.subtaskId == null) &&
-            (state.unverifiedMutations.contains(event.sequence) ||
-                event.technicalSuccess ||
-                event.outcome == 'userConfirmed' ||
-                event.outcome == 'observed'))) {
+    if (mutation && state.audit.any((event) {
+      if (!event.mutation ||
+          event.action != action ||
+          (event.subtaskId != subtaskId && event.subtaskId != null)) {
+        return false;
+      }
+      final latest = state.audit.lastWhere(
+        (candidate) =>
+            candidate.sequence == event.sequence &&
+            candidate.phase != 'before',
+        orElse: () => event,
+      );
+      if (latest.outcome == 'userConfirmedFailure' &&
+          !state.unverifiedMutations.contains(event.sequence)) {
+        return false;
+      }
+      return state.unverifiedMutations.contains(event.sequence) ||
+          latest.phase == 'uncertain' ||
+          latest.technicalSuccess ||
+          latest.outcome == 'userConfirmed' ||
+          latest.outcome == 'observed';
+    })) {
       throw StateError('Refusing to replay an external mutation');
     }
     final event = ActionAudit(sequence: state.nextSequence, action: action,
@@ -532,7 +591,9 @@ class TaskStore {
           ? 'userConfirmed'
           : 'userConfirmedFailure');
     final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
-      if (subtask.id != pending.subtaskId) return subtask;
+      if (pending.subtaskId != null && subtask.id != pending.subtaskId) {
+        return subtask;
+      }
       return subtask.copyWith(
         status: userConfirmedSuccess
             ? TaskSubtaskStatus.inProgress
@@ -577,7 +638,9 @@ class TaskStore {
           : 'userConfirmedFailure',
     );
     final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
-      if (subtask.id != event.subtaskId) return subtask;
+      if (event.subtaskId != null && subtask.id != event.subtaskId) {
+        return subtask;
+      }
       return subtask.copyWith(
         status: userConfirmedSuccess
             ? TaskSubtaskStatus.inProgress
@@ -602,27 +665,69 @@ class TaskStore {
 
   /// New criteria invalidate old evidence by advancing the revision.
   /// Trusted UI only: explicit user attestation, not model-generated evidence.
-  Future<TaskRecord> confirmActionOutcome(String id, int sequence) =>
-      _mutate(id, (record) {
-    if (record.status == TaskStatus.running) throw StateError('Stop task before review');
+  Future<TaskRecord> confirmActionOutcome(
+    String id,
+    int sequence, {
+    bool userConfirmedSuccess = true,
+  }) => _mutate(id, (record) {
+    if (record.status == TaskStatus.running) {
+      throw StateError('Stop task before review');
+    }
     final state = record.execution;
-    final event = state.audit.lastWhere((e) => e.sequence == sequence &&
-        e.phase == 'after' && e.technicalSuccess);
-    final confirmed = ActionAudit(sequence: event.sequence, action: event.action,
-      phase: 'after', timestamp: DateTime.now(), mutation: event.mutation,
-      revision: event.revision, technicalSuccess: true, outcome: 'userConfirmed',
-      subtaskId: event.subtaskId);
+    final latest = state.audit.lastWhere(
+      (event) => event.sequence == sequence && event.phase != 'before',
+    );
+    if (latest.outcome == 'userConfirmedFailure') {
+      throw StateError('This action outcome was already reviewed as unsuccessful');
+    }
+    if (const {'userConfirmed', 'observed'}.contains(latest.outcome)) {
+      return record;
+    }
+    final event = state.audit.lastWhere(
+      (item) =>
+          item.sequence == sequence &&
+          item.phase == 'after' &&
+          item.technicalSuccess,
+    );
+    if (!userConfirmedSuccess && !event.mutation) {
+      throw const FormatException('Only mutation outcomes can be reviewed as failed');
+    }
+    final confirmed = ActionAudit(
+      sequence: event.sequence,
+      action: event.action,
+      phase: 'after',
+      timestamp: DateTime.now(),
+      mutation: event.mutation,
+      revision: event.revision,
+      technicalSuccess: userConfirmedSuccess,
+      outcome: userConfirmedSuccess ? 'userConfirmed' : 'userConfirmedFailure',
+      subtaskId: event.subtaskId,
+    );
     final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
-      if (subtask.id != event.subtaskId || !event.mutation) return subtask;
+      if (!event.mutation ||
+          (event.subtaskId != null && subtask.id != event.subtaskId)) {
+        return subtask;
+      }
       return subtask.copyWith(
-        status: TaskSubtaskStatus.inProgress,
-        clearFailureCode: true,
+        status: userConfirmedSuccess
+            ? TaskSubtaskStatus.inProgress
+            : TaskSubtaskStatus.pending,
+        failureCode: userConfirmedSuccess ? null : 'tool_failed',
+        clearFailureCode: userConfirmedSuccess,
       );
     }).toList());
-    return record.copyWith(execution: state.copyWith(
-      plan: plan,
-      audit: _append(state.audit, confirmed), lastResult: confirmed,
-      unverifiedMutations: state.unverifiedMutations.where((s) => s != sequence).toList()));
+    return record.copyWith(
+      status: TaskStatus.needsRevision,
+      execution: state.copyWith(
+        plan: plan,
+        audit: _append(state.audit, confirmed),
+        lastResult: confirmed,
+        unverifiedMutations: state.unverifiedMutations
+            .where((item) => item != sequence)
+            .toList(),
+        verification: 'unverified',
+      ),
+    );
   });
 
   Future<TaskRecord> setPlan(String id, List<TaskSubtask> plan) =>
@@ -648,8 +753,20 @@ class TaskStore {
       status: s.status, attempts: s.attempts, failureCode: s.failureCode,
       evidenceRefs: references[s.id] ?? s.evidenceRefs)).toList();
     final initial = record.execution.copyWith(plan: plan);
+
     final verifiedIds = TaskVerifier.verifiedSubtaskIds(initial);
+    final hasUnscopedUnresolvedMutation =
+        TaskVerifier.hasUnscopedUnresolvedMutation(initial);
+    final unresolvedMutationSubtaskIds =
+        TaskVerifier.unresolvedMutationSubtaskIds(initial);
     final updatedPlan = initial.plan.map((subtask) {
+      if (hasUnscopedUnresolvedMutation ||
+          unresolvedMutationSubtaskIds.contains(subtask.id)) {
+        return subtask.copyWith(
+          status: TaskSubtaskStatus.needsReview,
+          failureCode: 'mutation_outcome_unverified',
+        );
+      }
       if (verifiedIds.contains(subtask.id)) {
         return subtask.copyWith(
           status: TaskSubtaskStatus.completed,
@@ -819,7 +936,9 @@ class TaskStore {
     return _serialized(() async {
       final record = (await _read()).where((item) => item.identifier == id);
       if (record.isEmpty) return null;
-      final plan = record.first.execution.plan;
+      final execution = record.first.execution;
+      if (TaskVerifier.hasUnscopedUnresolvedMutation(execution)) return null;
+      final plan = execution.plan;
       for (final subtask in plan) {
         if ((subtask.status == TaskSubtaskStatus.pending ||
                 subtask.status == TaskSubtaskStatus.inProgress) &&

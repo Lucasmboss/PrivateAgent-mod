@@ -10,6 +10,106 @@ class TaskVerifier {
     return !{'web_search', 'read_screen', 'read_file', 'list_files', 'wait'}.contains(action);
   }
 
+  /// Audit actions whose successful result can serve as observed evidence.
+  /// A task-specific observation must still be linked to the same subtask.
+  static bool isObservationAction(String action) => const {
+    'web_search',
+    'web_request',
+    'read_screen',
+    'read_file',
+    'list_files',
+  }.contains(action);
+
+  static bool hasValidCriterionEvidence(
+    TaskSubtask task,
+    String criterion,
+    Map<String, ActionAudit> evidence,
+  ) {
+    final refs = task.evidenceRefs[criterion] ?? const <String>[];
+    return refs.isNotEmpty &&
+        refs.every(
+          (ref) =>
+              evidence.containsKey(ref) &&
+              evidence[ref]!.subtaskId == task.id,
+        ) &&
+        refs.any(
+          (ref) =>
+              isObservationAction(evidence[ref]!.action) &&
+              !evidence[ref]!.mutation,
+        );
+  }
+
+  /// Unreviewed external effects stay attached to their subtasks across plan
+  /// revisions. Criteria can change; an already-dispatched effect cannot.
+  static Set<String> unresolvedMutationSubtaskIds(TaskExecutionState state) {
+    final trustedOutcomes = {
+      for (final event in state.audit)
+        if (event.mutation &&
+            event.phase == 'after' &&
+            const {'userConfirmed', 'userConfirmedFailure', 'observed'}
+                .contains(event.outcome))
+          event.sequence,
+    };
+    return {
+      for (final event in state.audit)
+        if (event.subtaskId != null &&
+            event.mutation &&
+            event.phase != 'before' &&
+            !trustedOutcomes.contains(event.sequence) &&
+            (state.unverifiedMutations.contains(event.sequence) ||
+                event.phase == 'uncertain' ||
+                (event.phase == 'after' && event.technicalSuccess)))
+          event.subtaskId!,
+    };
+  }
+
+  /// Without a reliable subtask association, no dependent work is safe to run.
+  static bool hasUnscopedUnresolvedMutation(TaskExecutionState state) {
+    final trustedOutcomes = {
+      for (final event in state.audit)
+        if (event.mutation &&
+            event.phase == 'after' &&
+            const {'userConfirmed', 'userConfirmedFailure', 'observed'}
+                .contains(event.outcome))
+          event.sequence,
+    };
+    final unresolvedEvents = state.audit.where(
+      (event) =>
+          event.mutation &&
+          event.phase != 'before' &&
+          !trustedOutcomes.contains(event.sequence) &&
+          (state.unverifiedMutations.contains(event.sequence) ||
+              event.phase == 'uncertain' ||
+              (event.phase == 'after' && event.technicalSuccess)),
+    );
+    if (unresolvedEvents.any((event) => event.subtaskId == null)) return true;
+    for (final sequence in state.unverifiedMutations) {
+      if (trustedOutcomes.contains(sequence)) continue;
+      final events = state.audit
+          .where((event) => event.sequence == sequence && event.mutation)
+          .toList();
+      if (events.isEmpty || events.any((event) => event.subtaskId == null)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static Map<String, ActionAudit> _successfulEvidence(
+    TaskExecutionState state,
+  ) {
+    final latestBySequence = <int, ActionAudit>{};
+    for (final event in state.audit) {
+      if (event.phase == 'after' && event.revision == state.revision) {
+        latestBySequence[event.sequence] = event;
+      }
+    }
+    return {
+      for (final event in latestBySequence.values)
+        if (event.technicalSuccess) event.evidenceId: event,
+    };
+  }
+
   static String verify(TaskExecutionState state) {
     if (state.inFlight != null) return 'uncertain';
     if (state.unverifiedMutations.isNotEmpty) return 'partial';
@@ -22,9 +122,7 @@ class TaskVerifier {
         }.contains(task.status))) {
       return 'partial';
     }
-    final evidence = {for (final e in state.audit)
-      if (e.phase == 'after' && e.technicalSuccess && e.revision == state.revision)
-        e.evidenceId: e};
+    final evidence = _successfulEvidence(state);
     if (evidence.isEmpty) return 'unverified';
     // Technical success of a mutation is never proof of its user-facing outcome.
     if (evidence.values.any((e) => e.mutation &&
@@ -33,14 +131,9 @@ class TaskVerifier {
     for (final task in state.plan) {
       if (!completed.containsAll(task.dependencies) || task.criteria.isEmpty) return 'partial';
       for (final criterion in task.criteria) {
-        // Successful reads are supporting material, never semantic proof.
-        // Only an explicit trusted UI attestation can verify arbitrary goals.
-        if (!state.criterionConfirmations.any((c) =>
-            c.revision == state.revision && c.subtaskId == task.id &&
-            c.criterion == criterion)) return 'unverified';
-        final refs = task.evidenceRefs[criterion] ?? [];
-        if (refs.isEmpty || refs.any((ref) => !evidence.containsKey(ref))) return 'partial';
-        if (!refs.any((ref) => evidence[ref]!.action != 'wait')) return 'partial';
+        if (!hasValidCriterionEvidence(task, criterion, evidence)) {
+          return 'partial';
+        }
       }
       completed.add(task.id);
     }
@@ -50,13 +143,10 @@ class TaskVerifier {
   /// Returns only subtasks whose trusted criterion review and evidence refs
   /// independently pass. A separate unresolved subtask must not hide progress.
   static Set<String> verifiedSubtaskIds(TaskExecutionState state) {
-    final evidence = {
-      for (final event in state.audit)
-        if (event.phase == 'after' &&
-            event.technicalSuccess &&
-            event.revision == state.revision)
-          event.evidenceId: event,
-    };
+    final evidence = _successfulEvidence(state);
+    if (hasUnscopedUnresolvedMutation(state)) return {};
+    final unresolvedMutationSubtasks =
+        unresolvedMutationSubtaskIds(state);
     final completed = <String>{};
     for (final task in state.plan) {
       if (const {
@@ -65,20 +155,13 @@ class TaskVerifier {
             TaskSubtaskStatus.needsReview,
           }.contains(task.status) ||
           !completed.containsAll(task.dependencies) ||
-          task.criteria.isEmpty) {
+          task.criteria.isEmpty ||
+          unresolvedMutationSubtasks.contains(task.id)) {
         continue;
       }
       var valid = true;
       for (final criterion in task.criteria) {
-        final confirmed = state.criterionConfirmations.any((confirmation) =>
-            confirmation.revision == state.revision &&
-            confirmation.subtaskId == task.id &&
-            confirmation.criterion == criterion);
-        final refs = task.evidenceRefs[criterion] ?? const <String>[];
-        if (!confirmed ||
-            refs.isEmpty ||
-            refs.any((ref) => !evidence.containsKey(ref)) ||
-            !refs.any((ref) => evidence[ref]!.action != 'wait')) {
+        if (!hasValidCriterionEvidence(task, criterion, evidence)) {
           valid = false;
           break;
         }

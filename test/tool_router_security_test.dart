@@ -13,6 +13,7 @@ import 'package:private_agent/services/screen_automation_service.dart';
 import 'package:private_agent/services/shizuku_service.dart';
 import 'package:private_agent/services/task_executor.dart';
 import 'package:private_agent/services/task_store.dart';
+import 'package:private_agent/services/task_history_logger.dart';
 import 'package:private_agent/services/telegram_service.dart';
 import 'package:private_agent/services/tool_policy.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -29,6 +30,17 @@ class _Planner extends AiService {
 class _NoopNotificationService extends NotificationService {
   @override
   Future<void> showTaskCompleteNotification(String title, String body) async {}
+}
+
+class _RecordingNotificationService extends NotificationService {
+  final titles = <String>[];
+  final bodies = <String>[];
+
+  @override
+  Future<void> showTaskCompleteNotification(String title, String body) async {
+    titles.add(title);
+    bodies.add(body);
+  }
 }
 
 class _FakeShizukuService extends ShizukuService {
@@ -118,12 +130,14 @@ void main() {
       ShizukuService? shizuku,
       int tokens = 100,
       Duration duration = const Duration(minutes: 1),
+      NotificationService? notificationService,
     }) => TaskExecutor(
       aiService: ai,
       screenService: ScreenAutomationService(),
       appLauncher: AppLauncherService(),
       shizukuService: shizuku ?? ShizukuService(),
-      notificationService: _NoopNotificationService(),
+      notificationService:
+          notificationService ?? _NoopNotificationService(),
       taskStore: store,
       onApproval: approve,
       onProgress: onProgress,
@@ -369,7 +383,162 @@ void main() {
     );
 
     test(
-      'safe failed subtask gets one final alternative before partial checkpoint',
+      'verified completion report names its read-only evidence',
+      () async {
+        var calls = 0;
+        final engine = executor(_Planner((_, __) async {
+          calls++;
+          return AiResponse(
+            switch (calls) {
+              1 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"files","objective":"Inspect private agent files",'
+                    '"dependencies":[],"criteria":["The private file list was observed"]}'
+                    ']}}',
+              2 =>
+                '{"action":"list_files","params":{},"subtask_id":"files",'
+                    '"reasoning":"Inspect the app-private file list"}',
+              _ =>
+                '{"action":"done","params":{"evidence":{"files":'
+                    '{"The private file list was observed":["action-1"]}}},'
+                    '"reasoning":"The private file list was observed."}',
+            },
+            1,
+          );
+        }));
+
+        final result = await engine.executeTask('List private agent files');
+
+        expect(calls, 3);
+        expect(
+          result,
+          contains(
+            'Evidence check: 1 criteria across 1 subtasks, supported by '
+            '1 successful read-only observation (list_files).',
+          ),
+        );
+        final record = (await store.list()).single;
+        expect(record.status, TaskStatus.completed);
+        expect(record.execution.verification, 'verified');
+      },
+    );
+
+    test(
+      'a structurally invalid plan is rejected before a corrected plan is saved',
+      () async {
+        var calls = 0;
+        late TaskExecutor engine;
+        engine = executor(_Planner((_, __) async {
+          calls++;
+          if (calls == 3) engine.cancel();
+          return AiResponse(
+            switch (calls) {
+              1 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"invalid","objective":"Invalid plan",'
+                    '"dependencies":["missing"],"criteria":["Done"]}'
+                    ']}}',
+              2 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"valid","objective":"Corrected plan",'
+                    '"dependencies":[],"criteria":["Done"]}'
+                    ']}}',
+              _ => '{"action":"done","params":{}}',
+            },
+            1,
+          );
+        }));
+
+        await engine.executeTask('Complete a planned task');
+
+        expect(calls, 3);
+        final record = (await store.list()).single;
+        expect(record.status, TaskStatus.cancelled);
+        expect(record.execution.plan.single.id, 'valid');
+      },
+    );
+
+    test(
+      'cancellation interrupts transient planner backoff',
+      () async {
+        var calls = 0;
+        late TaskExecutor engine;
+        engine = executor(
+          _Planner((_, __) async {
+            calls++;
+            throw StateError('temporary planner outage');
+          }),
+          onProgress: (message) {
+            if (message.contains('Retry 1')) engine.cancel();
+          },
+        );
+
+        final timer = Stopwatch()..start();
+        final result = await engine.executeTask('Read the current status');
+        timer.stop();
+
+        expect(calls, 1);
+        expect(result, contains('cancelled'));
+        expect(engine.lastStatus, TaskStatus.cancelled);
+        expect(timer.elapsed, lessThan(const Duration(seconds: 1)));
+      },
+    );
+
+    test(
+      'uncertain external effect stays checkpointed when it cannot be observed',
+      () async {
+        final shizuku = _FakeShizukuService(
+          const ShizukuCommandResult(
+            stdout: 'partial output',
+            stderr: '',
+            exitCode: null,
+            wasDispatched: true,
+          ),
+        );
+        var calls = 0;
+        final notifications = _RecordingNotificationService();
+        final engine = executor(
+          _Planner((_, __) async {
+            calls++;
+            return AiResponse(switch (calls) {
+              1 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"change","objective":"Change device state",'
+                    '"dependencies":[],"criteria":["Requested state changed"]}'
+                    ']}}',
+              2 =>
+                '{"action":"run_adb_command","command":"change-device-state",'
+                    '"subtask_id":"change","reasoning":"Run the requested change"}',
+              _ => '{"action":"done","params":{}}',
+            }, 1);
+          }),
+          shizuku: shizuku,
+          notificationService: notifications,
+        );
+
+        await engine.executeTask('Change device state');
+
+        final record = (await store.list()).single;
+        expect(calls, 3);
+        expect(shizuku.lastCommand, 'change-device-state');
+        expect(record.status, TaskStatus.needsRevision);
+        expect(notifications.titles, contains('Task Checkpoint Saved'));
+        expect(record.execution.unverifiedMutations, [1]);
+        expect(
+          record.execution.audit
+              .where(
+                (event) =>
+                    event.action == 'run_adb_command' &&
+                    event.phase == 'uncertain',
+              )
+              .length,
+          1,
+        );
+      },
+    );
+
+    test(
+      'safe failed subtask tries another strategy without replaying failure',
       () async {
         var calls = 0;
         final engine = executor(
@@ -534,6 +703,7 @@ void main() {
           task.identifier,
           'run_adb_command',
           mutation: true,
+          subtaskId: 'read-status',
         );
         await store.endAction(
           task.identifier,
@@ -621,7 +791,7 @@ void main() {
       expect(record.execution.audit, isEmpty);
     });
 
-    test('resumed task receives a fresh bounded planner-step window', () async {
+    test('task continues automatically into the next planner-step window', () async {
       final previous = await store.create(
         goal: 'Read',
         status: TaskStatus.needsRevision,
@@ -631,34 +801,48 @@ void main() {
         stepsCompleted: AiService().maxSteps,
       );
       var calls = 0;
-      final engine = executor(_Planner((_, __) async {
-        calls++;
-        return AiResponse('{"action":"done","params":{}}', 1);
-      }));
+      final notifications = _RecordingNotificationService();
+      late TaskExecutor engine;
+      engine = executor(
+        _Planner((_, __) async {
+          calls++;
+          if (calls == AiService().maxSteps + 1) engine.cancel();
+          return AiResponse('{"action":"done","params":{}}', 1);
+        }),
+        notificationService: notifications,
+      );
 
       await engine.executeTask('Read', resumeTaskId: previous.identifier);
 
       final record = (await store.list()).single;
       final maxSteps = AiService().maxSteps;
-      expect(calls, maxSteps);
+      expect(calls, maxSteps + 1);
       expect(record.stepsCompleted, maxSteps * 2);
-      expect(record.status, TaskStatus.needsRevision);
+      expect(record.status, TaskStatus.cancelled);
+      expect(notifications.titles, contains('Task Continuing'));
+      expect(notifications.titles, contains('Task Cancelled'));
+      final history = await TaskHistoryLogger.readHistory();
+      expect(history, hasLength(1));
+      expect(history.single['status'], 'Cancelled');
+      expect(history.single['trace'], isEmpty);
     });
 
-    test('planner outage retries before pausing the checkpoint', () async {
+    test('planner outage is retried and the next window starts automatically', () async {
       var calls = 0;
-      final engine = executor(_Planner((_, __) async {
+      late TaskExecutor engine;
+      engine = executor(_Planner((_, __) async {
         calls++;
         if (calls == 1) throw StateError('temporary planner outage');
+        if (calls == AiService().maxSteps + 1) engine.cancel();
         return AiResponse('{"action":"done","params":{}}', 1);
       }));
 
       await engine.executeTask('Read');
 
-      expect(calls, AiService().maxSteps);
+      expect(calls, AiService().maxSteps + 1);
       final record = (await store.list()).single;
       expect(record.stepsCompleted, AiService().maxSteps);
-      expect(engine.lastStatus, TaskStatus.needsRevision);
+      expect(engine.lastStatus, TaskStatus.cancelled);
     });
 
     test('legacy subtask and audit JSON default new metadata safely', () {

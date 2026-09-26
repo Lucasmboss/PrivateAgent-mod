@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 
 import 'ai_service.dart';
+import 'remote_provider_adapter.dart';
 import 'screen_automation_service.dart';
 import 'app_launcher_service.dart';
 import 'notification_service.dart';
+import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
 import 'web_service.dart';
@@ -86,6 +88,9 @@ class TaskExecutor {
   bool _paused = false;
   bool _actionInFlight = false;
   bool _assistanceBatchShown = false;
+  bool _blockedByHostPolicy = false;
+  bool _blockedByProviderConfiguration = false;
+  bool _blockedByResourceLimit = false;
 
   Completer<void>? _cancelCompleter;
   bool get isActionInFlight => _actionInFlight;
@@ -395,8 +400,14 @@ GENERAL RULES:
   runtime has recorded those failed attempts. Leave remaining_strategies empty;
   do not invent a failure or mark an uncertain mutation as failed.
 - Completion requires action "done" and params.evidence:
-  {subtaskId: {criterionText: ["action-N"]}} using persisted successful evidence.
-  A bare done/is_complete is not proof. Mutations require trusted outcome review.
+  {subtaskId: {criterionText: ["action-N"]}} using persisted successful evidence
+  from that same subtask and the current criteria revision.
+- Every criterion must cite at least one successful observation action; a bare
+  done/is_complete claim or a mutation by itself is not evidence.
+- Never replay a successful or uncertain external mutation. To verify its
+  outcome, perform a safe read-only observation after it and cite that
+  observation for the affected subtask's criterion. If no safe observation can
+  establish the effect, keep the task incomplete.
 
 - Choose exactly ONE action at a time.
 - Never invent tool results.
@@ -438,17 +449,103 @@ GENERAL RULES:
 
   Future<String> executeTask(String userGoal, {String? resumeTaskId}) async {
     if (_activeTaskId != null) throw StateError('Executor already running');
+    _cancelled = false;
+    _paused = false;
+    _blockedByHostPolicy = false;
+    _blockedByProviderConfiguration = false;
+    _blockedByResourceLimit = false;
+    var checkpointId = resumeTaskId;
+    var continuationCount = 0;
     try {
-      return await _executeTask(userGoal, resumeTaskId: resumeTaskId);
-    } catch (error) {
-      if (error is ToolOutcomeUncertainException) {
-        lastStatus = TaskStatus.needsRevision;
-        _activeTaskId = null;
-        _report(error.userMessage);
-      } else {
-        await failUnexpected(error);
+      while (true) {
+        if (_cancelled || _paused) {
+          final id = checkpointId ?? lastTaskId;
+          if (id != null) {
+            final status = _cancelled ? TaskStatus.cancelled : TaskStatus.paused;
+            await _taskStore.update(id, status: status);
+            lastStatus = status;
+            await _notifyTaskCheckpoint(status);
+          }
+          return _cancelled
+              ? 'Task cancelled. Its checkpoint remains available.'
+              : 'Task paused. Its checkpoint remains available.';
+        }
+
+        String result;
+        try {
+          result = await _executeTask(userGoal, resumeTaskId: checkpointId);
+        } catch (error) {
+          if (error is ToolOutcomeUncertainException) {
+            _report(error.userMessage);
+          } else {
+            _report(
+              'A recoverable execution error occurred. Saving the checkpoint '
+              'and continuing with a fresh attempt.',
+            );
+            if (error is RemoteProviderException &&
+                const {
+                  RemoteErrorKind.authentication,
+                  RemoteErrorKind.invalidEndpoint,
+                  RemoteErrorKind.invalidRequest,
+                }.contains(error.kind)) {
+              _blockedByProviderConfiguration = true;
+            }
+          }
+          await failUnexpected(error);
+          result = error is ToolOutcomeUncertainException
+              ? error.userMessage
+              : 'Execution interrupted. Continuing from the saved checkpoint.';
+        } finally {
+          _cancelCompleter = null;
+          _budgetTimer?.cancel();
+        }
+
+        if (lastStatus == TaskStatus.completed ||
+            lastStatus == TaskStatus.cancelled ||
+            lastStatus == TaskStatus.paused ||
+            lastStatus == TaskStatus.failed) {
+          if (lastStatus == TaskStatus.paused ||
+              lastStatus == TaskStatus.failed) {
+            await _notifyTaskCheckpoint(lastStatus!);
+          }
+          return result;
+        }
+        final id = lastTaskId ?? checkpointId;
+        if (id == null) return result;
+        final checkpoint = await _taskStore.get(id);
+        if (checkpoint == null) return result;
+        if (checkpoint.status == TaskStatus.completed ||
+            checkpoint.status == TaskStatus.cancelled ||
+            checkpoint.status == TaskStatus.paused ||
+            checkpoint.execution.pendingAssistance.isNotEmpty ||
+            _blockedByHostPolicy ||
+            _blockedByProviderConfiguration ||
+            _blockedByResourceLimit) {
+          await _notifyTaskCheckpoint(checkpoint.status);
+          return result;
+        }
+        final nextRunnableSubtask =
+            await _taskStore.runnableSubtaskId(id);
+        if (nextRunnableSubtask == null) {
+          // A fresh planner window cannot make terminal or review-blocked work
+          // safe to retry. Keep the checkpoint instead of spinning.
+          await _notifyTaskCheckpoint(checkpoint.status);
+          return result;
+        }
+
+        checkpointId = id;
+        continuationCount++;
+        _report(
+          'Saved checkpoint reached an execution-window boundary. '
+          'Continuing automatically (window $continuationCount).',
+        );
+        await _showTaskNotification(
+          'Task Continuing',
+          'The task reached an execution-window boundary and is continuing '
+              'from its saved checkpoint.',
+        );
+        await _waitForRetry(continuationCount);
       }
-      rethrow;
     } finally {
       _cancelCompleter = null;
       _budgetTimer?.cancel();
@@ -456,8 +553,6 @@ GENERAL RULES:
   }
 
   Future<String> _executeTask(String userGoal, {String? resumeTaskId}) async {
-    _cancelled = false;
-    _paused = false;
     _budgetExpired = false;
     _remoteCancellation = RemoteCancellationToken();
     _cancelCompleter = null;
@@ -480,7 +575,8 @@ GENERAL RULES:
         : await _taskStore.claim(resumeTaskId!, userGoal);
     _activeTaskId = task.identifier;
     lastTaskId = task.identifier;
-    // Wall-clock lifetime is cumulative across resumes, including time paused.
+    // The wall-clock and token budgets are cumulative across automatic planner
+    // windows and explicit resumes.
     final remainingTime =
         maxTaskDuration - DateTime.now().difference(task.createdAt);
     if (remainingTime <= Duration.zero) {
@@ -573,6 +669,7 @@ GENERAL RULES:
     var consecutiveVerifierGaps = 0;
     var plannerFailures = 0;
     var formatFailures = 0;
+    var invalidPlanFailures = 0;
     final stepBase = task.stepsCompleted;
     final finalRetrySubtaskIds = <String>{};
 
@@ -640,9 +737,10 @@ GENERAL RULES:
 
       await _taskStore.update(
         _activeTaskId!,
-        progress: task.progress > runStep / _aiService.maxSteps
+        progress: task.progress >
+                (runStep / _aiService.maxSteps).clamp(0, 0.99).toDouble()
             ? task.progress
-            : runStep / _aiService.maxSteps,
+            : (runStep / _aiService.maxSteps).clamp(0, 0.99).toDouble(),
         stepsCompleted: step,
         tokens: totalTokens,
         results: results.length <= 20
@@ -827,6 +925,14 @@ Remember:
         plannerFailures = 0;
 
         totalTokens += aiResponse.totalTokens;
+        if (totalTokens >= maxTaskTokens) {
+          return await _stopForBudget(
+            totalTokens,
+            step,
+            results,
+            failedStrategies,
+          );
+        }
       } catch (e) {
         if (_budgetExpired) {
           return await _stopForBudget(
@@ -854,34 +960,37 @@ Remember:
           );
         }
 
-        const plannerFailure =
-            'The AI planner is unavailable. No new action was dispatched; '
-            'the task checkpoint can be resumed when planning is available.';
-        plannerFailures++;
-        if (plannerFailures < 3) {
-          previousResult = '$plannerFailure Planner retry $plannerFailures/3.';
-          results.add(previousResult);
-          consecutiveFailures++;
-          continue;
+        if (e is RemoteProviderException &&
+            const {
+              RemoteErrorKind.authentication,
+              RemoteErrorKind.invalidEndpoint,
+              RemoteErrorKind.invalidRequest,
+            }.contains(e.kind)) {
+          _blockedByProviderConfiguration = true;
+          const message =
+              'The AI provider is not configured or authorized. No action was '
+              'dispatched; update the provider configuration to continue.';
+          results.add(message);
+          _report(message);
+          await _finishTask(
+            TaskStatus.needsRevision,
+            step,
+            totalTokens,
+            results,
+            failedStrategies,
+          );
+          return message;
         }
-        results.add(plannerFailure);
-        final outcome = await _subtaskOutcomeReport();
-        _report('$plannerFailure\n$outcome');
 
-        await _notificationService.showTaskCompleteNotification(
-          'Task Paused',
-          'The planner failed; the checkpoint is available to resume.',
-        );
-
-        await _finishTask(
-          TaskStatus.needsRevision,
-          step,
-          totalTokens,
-          results,
-          failedStrategies,
-        );
-
-        return '$plannerFailure\n$outcome';
+        const plannerFailure =
+            'The AI planner is temporarily unavailable. No new action was '
+            'dispatched; the saved checkpoint will be retried automatically.';
+        plannerFailures++;
+        previousResult = '$plannerFailure Retry $plannerFailures.';
+        results.add(previousResult);
+        consecutiveFailures++;
+        await _waitForRetry(plannerFailures);
+        continue;
       }
 
       // -----------------------------------------------------------------------
@@ -889,7 +998,7 @@ Remember:
       // -----------------------------------------------------------------------
 
       ParsedActionResponse? parsedResponse;
-      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+      if (_budgetExpired) {
         return await _stopForBudget(
           totalTokens,
           step,
@@ -945,6 +1054,14 @@ Remember:
           );
 
           totalTokens += retryResponse.totalTokens;
+          if (totalTokens >= maxTaskTokens) {
+            return await _stopForBudget(
+              totalTokens,
+              step,
+              results,
+              failedStrategies,
+            );
+          }
 
           parsedResponse = _aiService.parseActionResponse(
             retryResponse.content,
@@ -977,34 +1094,14 @@ Remember:
             );
           const formattingFailure =
               'The AI response remained invalid after a retry. No tool was '
-              'dispatched for that response.';
+              'dispatched; requesting a fresh response automatically.';
           formatFailures++;
-          if (formatFailures < 3) {
-            previousResult =
-                '$formattingFailure Request a fresh valid action; no action '
-                'was executed.';
-            results.add(previousResult);
-            consecutiveFailures++;
-            continue;
-          }
-          results.add(formattingFailure);
-          final outcome = await _subtaskOutcomeReport();
-          _report('$formattingFailure\n$outcome');
-
-          await _notificationService.showTaskCompleteNotification(
-            'Task Paused',
-            'The task checkpoint is available to resume.',
-          );
-
-          await _finishTask(
-            TaskStatus.needsRevision,
-            step,
-            totalTokens,
-            results,
-            failedStrategies,
-          );
-
-          return '$formattingFailure\n$outcome';
+          previousResult = '$formattingFailure Retry $formatFailures.';
+          results.add(previousResult);
+          consecutiveFailures++;
+          _report(previousResult);
+          await _waitForRetry(formatFailures);
+          continue;
         }
       }
 
@@ -1088,7 +1185,7 @@ Remember:
       if (_cancelled) {
         return await _handleCancellation(userGoal, totalTokens, step, results);
       }
-      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+      if (_budgetExpired) {
         return await _stopForBudget(
           totalTokens,
           step,
@@ -1122,7 +1219,7 @@ Remember:
         );
       if (_cancelled)
         return await _handleCancellation(userGoal, totalTokens, step, results);
-      if (_budgetExpired || totalTokens >= maxTaskTokens) {
+      if (_budgetExpired) {
         return await _stopForBudget(
           totalTokens,
           step,
@@ -1131,6 +1228,7 @@ Remember:
         );
       }
       if (!decision.allowed) {
+        _blockedByHostPolicy = true;
         const denied =
             'Action denied. Task requires revision; no tool was executed.';
         results.add(denied);
@@ -1288,8 +1386,8 @@ Remember:
               status: TaskStatus.needsRevision,
             );
             _report(
-              'Autonomous work is complete. Reviewing all remaining human-only '
-              'steps and outcomes together.',
+              'Automated work is complete. Asking only for the verified '
+              'human-only steps that remain.',
             );
             final selectedIds = await _requestUserAnswer(assistanceItems);
             if (_paused) {
@@ -1309,7 +1407,7 @@ Remember:
                 results,
               );
             }
-            if (_budgetExpired || totalTokens >= maxTaskTokens) {
+            if (_budgetExpired) {
               return await _stopForBudget(
                 totalTokens,
                 step,
@@ -1484,7 +1582,11 @@ Remember:
           }
         }
         consecutiveVerifierGaps = 0;
-        final finalText = reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
+        final explanation = PrivacySanitizer.sanitizeTaskTrace(
+          reasoning.trim().isEmpty ? 'Done.' : reasoning.trim(),
+        );
+        final evidenceSummary = await _verifiedCompletionEvidenceSummary();
+        final finalText = '$explanation\n$evidenceSummary';
 
         results.add('Task complete: $finalText');
 
@@ -1523,14 +1625,36 @@ Remember:
       // -----------------------------------------------------------------------
 
       if (action == 'plan') {
-        final rawPlan = params['subtasks'];
-        if (rawPlan is! List) throw const FormatException('Missing subtasks');
-        await _taskStore.setPlan(
-          _activeTaskId!,
-          rawPlan
-              .map((s) => TaskSubtask.fromJson(Map<String, dynamic>.from(s)))
-              .toList(),
-        );
+        try {
+          final rawPlan = params['subtasks'];
+          if (rawPlan is! List) {
+            throw const FormatException('Missing subtasks');
+          }
+          await _taskStore.setPlan(
+            _activeTaskId!,
+            rawPlan
+                .map((item) => TaskSubtask.fromJson(
+                      Map<String, dynamic>.from(item),
+                    ))
+                .toList(),
+          );
+        } catch (error) {
+          if (error is! FormatException &&
+              error is! TypeError &&
+              error is! ArgumentError) {
+            rethrow;
+          }
+          invalidPlanFailures++;
+          previousResult =
+              'The proposed plan was rejected by structural safety checks. '
+              'Create a corrected plan; do not repeat the invalid structure.';
+          results.add(previousResult);
+          consecutiveFailures++;
+          _report(previousResult);
+          await _waitForRetry(invalidPlanFailures);
+          continue;
+        }
+        invalidPlanFailures = 0;
         previousResult =
             'Structured plan saved; prior criterion evidence invalidated.';
         continue;
@@ -2328,16 +2452,11 @@ Remember:
 
     final outcome = await _subtaskOutcomeReport();
     results.add(
-      'Reached the per-run limit of ${_aiService.maxSteps} planner steps.\n'
-      '$outcome',
+      'Reached the current planner window limit of ${_aiService.maxSteps} '
+      'steps. Continuing from the saved checkpoint.\n$outcome',
     );
 
-    _report('Task checkpoint saved.\n$outcome');
-
-    await _notificationService.showTaskCompleteNotification(
-      'Task Checkpoint Saved',
-      'The per-run step limit was reached. Resume to continue the remaining work.',
-    );
+    _report('Planner window complete. Continuing automatically.\n$outcome');
 
     await _finishTask(
       TaskStatus.needsRevision,
@@ -2346,10 +2465,6 @@ Remember:
       results,
       failedStrategies,
     );
-
-    if (await _screenService.isServiceRunning()) {
-      await _screenService.showToast('Task checkpoint saved.');
-    }
 
     return outcome;
   }
@@ -2420,15 +2535,34 @@ Remember:
     return remaining < _aiService.maxTokens ? remaining : _aiService.maxTokens;
   }
 
+  Duration _retryDelay(int attempt) {
+    final exponent = (attempt - 1).clamp(0, 5).toInt();
+    final seconds = (1 << exponent).clamp(1, 30).toInt();
+    return Duration(seconds: seconds);
+  }
+
+  Future<void> _waitForRetry(int attempt) async {
+    final cancellation = _cancelCompleter ??= Completer<void>();
+    await Future.any<void>([
+      Future<void>.delayed(_retryDelay(attempt)),
+      cancellation.future,
+    ]);
+    if (identical(_cancelCompleter, cancellation)) {
+      _cancelCompleter = null;
+    }
+  }
+
   Future<String> _stopForBudget(
     int tokens,
     int step,
     List<String> results,
     List<String> failedStrategies,
   ) async {
+    _blockedByResourceLimit = true;
     _remoteCancellation.cancel();
     const message =
-        'Task budget exhausted. The checkpoint is saved; continue it from this chat.';
+        'The configured task budget was reached before completion. The '
+        'checkpoint is saved and no action was replayed.';
     results.add(message);
     _report(message);
     await _finishTask(
@@ -2482,8 +2616,64 @@ Remember:
     }
   }
 
+  Future<String> _verifiedCompletionEvidenceSummary() async {
+    final id = _activeTaskId;
+    if (id == null) throw StateError('No active task to verify');
+    final record = await _taskStore.get(id);
+    if (record == null || TaskVerifier.verify(record.execution) != 'verified') {
+      throw StateError('Saved task evidence is no longer verified');
+    }
+
+    final observationIds = <String>{};
+    for (final subtask in record.execution.plan) {
+      for (final refs in subtask.evidenceRefs.values) {
+        observationIds.addAll(refs);
+      }
+    }
+    final observations = record.execution.audit.where(
+      (event) =>
+          observationIds.contains(event.evidenceId) &&
+          event.phase == 'after' &&
+          event.technicalSuccess &&
+          event.revision == record.execution.revision &&
+          !event.mutation &&
+          TaskVerifier.isObservationAction(event.action),
+    );
+    final actions = observations.map((event) => event.action).toSet().toList()
+      ..sort();
+    final observationCount = observations.length;
+    final observationWord =
+        observationCount == 1 ? 'observation' : 'observations';
+    final verifiedMutationCount = record.execution.audit
+        .where(
+          (event) =>
+              event.mutation &&
+              event.phase == 'after' &&
+              event.technicalSuccess &&
+              event.revision == record.execution.revision &&
+              const {'userConfirmed', 'observed'}.contains(event.outcome),
+        )
+        .map((event) => event.sequence)
+        .toSet()
+        .length;
+    final criteriaCount = record.execution.plan.fold<int>(
+      0,
+      (count, subtask) => count + subtask.criteria.length,
+    );
+    final sourceText = actions.isEmpty ? '' : ' (${actions.join(', ')})';
+    final mutationText = verifiedMutationCount == 0
+        ? ''
+        : '; $verifiedMutationCount external mutation outcome(s) verified';
+    return 'Evidence check: $criteriaCount criteria across '
+        '${record.execution.plan.length} subtasks, supported by '
+        '$observationCount successful read-only $observationWord$sourceText'
+        '$mutationText.';
+  }
+
   List<String> _completionEvidenceGaps(TaskExecutionState state) {
-    if (state.plan.isEmpty) return const ['The task has no saved completion plan.'];
+    if (state.plan.isEmpty) {
+      return const ['The task has no saved completion plan.'];
+    }
     final evidence = {
       for (final event in state.audit)
         if (event.phase == 'after' &&
@@ -2492,20 +2682,57 @@ Remember:
           event.evidenceId: event,
     };
     final gaps = <String>[];
+    if (state.inFlight != null) {
+      gaps.add('An action is still in flight; its outcome is not verified.');
+    }
+    if (state.unverifiedMutations.isNotEmpty) {
+      gaps.add(
+        'An external change is still unverified. Use a trusted outcome check '
+        'or independent review; never replay the change.',
+      );
+    }
+    if (state.pendingAssistance.isNotEmpty) {
+      gaps.add('A verified user-only step is still pending.');
+    }
+    final completed = <String>{};
     for (final subtask in state.plan) {
-      for (final criterion in subtask.criteria) {
-        final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
-        final valid = refs.isNotEmpty &&
-            refs.every(evidence.containsKey) &&
-            refs.any((ref) => evidence[ref]!.action != 'wait');
-        if (!valid) gaps.add('${subtask.objective}: $criterion');
+      if (!completed.containsAll(subtask.dependencies)) {
+        gaps.add('${subtask.objective}: a dependency is not verified.');
+        continue;
       }
+      if (const {
+            TaskSubtaskStatus.failed,
+            TaskSubtaskStatus.blocked,
+            TaskSubtaskStatus.needsReview,
+          }.contains(subtask.status) ||
+          subtask.criteria.isEmpty) {
+        gaps.add('${subtask.objective}: the subtask is incomplete.');
+        continue;
+      }
+      var valid = true;
+      for (final criterion in subtask.criteria) {
+        if (!TaskVerifier.hasValidCriterionEvidence(
+          subtask,
+          criterion,
+          evidence,
+        )) {
+          gaps.add(
+            '${subtask.objective}: $criterion needs a successful '
+            'same-subtask read-only observation.',
+          );
+          valid = false;
+        }
+      }
+      if (valid) completed.add(subtask.id);
+    }
+    if (gaps.isEmpty && TaskVerifier.verify(state) != 'verified') {
+      gaps.add('The saved task state does not satisfy the completion checks.');
     }
     return gaps;
   }
 
   List<TaskAssistanceItem> _assistanceItems(TaskExecutionState state) {
-    final items = <TaskAssistanceItem>[
+    return <TaskAssistanceItem>[
       for (final request in state.pendingAssistance)
         TaskAssistanceItem(
           id: request.id,
@@ -2514,64 +2741,6 @@ Remember:
           details: 'Observed blocker: ${request.evidence}',
         ),
     ];
-    final evidence = {
-      for (final event in state.audit)
-        if (event.phase == 'after' &&
-            event.technicalSuccess &&
-            event.revision == state.revision)
-          event.evidenceId: event,
-    };
-    var reviewIndex = 0;
-    for (final subtask in state.plan) {
-      for (final criterion in subtask.criteria) {
-        final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
-        final supported = refs.isNotEmpty &&
-            refs.every(evidence.containsKey) &&
-            refs.any((ref) => evidence[ref]!.action != 'wait');
-        final confirmed = state.criterionConfirmations.any(
-          (confirmation) =>
-              confirmation.revision == state.revision &&
-              confirmation.subtaskId == subtask.id &&
-              confirmation.criterion == criterion,
-        );
-        if (!supported || confirmed) continue;
-        items.add(
-          TaskAssistanceItem(
-            id: 'criterion-review-$reviewIndex',
-            kind: TaskAssistanceKind.criterionReview,
-            title: 'Verify: $criterion',
-            details:
-                'Subtask: ${subtask.objective}\nSupporting evidence: ${refs.join(', ')}',
-            subtaskId: subtask.id,
-            criterion: criterion,
-          ),
-        );
-        reviewIndex++;
-      }
-    }
-    for (final sequence in state.unverifiedMutations) {
-      final matching = state.audit.where(
-        (event) => event.sequence == sequence && event.mutation,
-      );
-      if (matching.isEmpty) continue;
-      final event = matching.last;
-      if (event.outcome == 'userConfirmed' || event.outcome == 'observed') {
-        continue;
-      }
-      items.add(
-        TaskAssistanceItem(
-          id: 'mutation-review-$sequence',
-          kind: TaskAssistanceKind.mutationReview,
-          title: 'Verify the effect of ${event.action}',
-          details:
-              'Action ${event.evidenceId} may have changed the destination. '
-              'Inspect its current state; only mark it verified if the requested '
-              'effect is present.',
-          actionSequence: sequence,
-        ),
-      );
-    }
-    return items;
   }
 
   Future<String> _subtaskOutcomeReport() async {
@@ -2593,7 +2762,7 @@ Remember:
         TaskSubtaskStatus.failed => 'failed after safe strategies were exhausted',
         TaskSubtaskStatus.blocked => 'blocked by an incomplete dependency',
         TaskSubtaskStatus.needsReview =>
-          'waiting for review; its external outcome is uncertain',
+          'waiting for independent review of its external outcome',
         TaskSubtaskStatus.inProgress => subtask.failureCode == 'tool_failed'
             ? 'incomplete; the latest tool attempt failed'
             : 'incomplete; more work may remain',
@@ -2612,9 +2781,85 @@ Remember:
     final mutationNote = unresolvedMutationCount == 0
         ? ''
         : '\nUnverified external changes: $unresolvedMutationCount. '
-              'They were not replayed and need review before dependent work.';
+              'They were not replayed. Independently review them in Task History '
+              'before resuming dependent work.';
     return 'Task outcome: $completed/${record.execution.plan.length} '
         'subtasks verified.\n${lines.join('\n')}$mutationNote';
+  }
+
+  Future<void> _showTaskNotification(String title, String body) async {
+    try {
+      await _notificationService.showTaskCompleteNotification(title, body);
+    } catch (error, stackTrace) {
+      developer.log(
+        'Task notification could not be shown',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  Future<void> _notifyTaskCheckpoint(TaskStatus status) async {
+    switch (status) {
+      case TaskStatus.needsRevision:
+        await _showTaskNotification(
+          'Task Checkpoint Saved',
+          'The task needs review before further actions. Its checkpoint is saved.',
+        );
+        return;
+      case TaskStatus.paused:
+        await _showTaskNotification(
+          'Task Paused',
+          'The task is paused. Its checkpoint is available to resume.',
+        );
+        return;
+      case TaskStatus.failed:
+        await _showTaskNotification(
+          'Task Error',
+          'The task could not complete. Its checkpoint is available to review.',
+        );
+        return;
+      case TaskStatus.cancelled:
+        await _showTaskNotification(
+          'Task Cancelled',
+          'The task was stopped. Its checkpoint remains available.',
+        );
+        return;
+      case TaskStatus.running:
+      case TaskStatus.completed:
+        return;
+    }
+  }
+
+  Future<void> _writeTaskHistory(
+    TaskRecord? record,
+    TaskStatus status,
+    int steps,
+    int tokens,
+    List<String> results,
+  ) async {
+    final historyStatus = switch (status) {
+      TaskStatus.completed => 'Success',
+      TaskStatus.failed => 'Failed',
+      TaskStatus.cancelled => 'Cancelled',
+      _ => null,
+    };
+    if (record == null || historyStatus == null) return;
+    try {
+      await TaskHistoryLogger.logTask(
+        record.originalGoal,
+        historyStatus,
+        tokens,
+        steps,
+        results,
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        'Task history could not be recorded',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<void> _finishTask(
@@ -2643,6 +2888,7 @@ Remember:
           ? record?.failedStrategies
           : failedStrategies,
     );
+    await _writeTaskHistory(record, status, steps, tokens, results);
     lastStatus = status;
     _activeTaskId = null;
   }
@@ -2651,7 +2897,7 @@ Remember:
     final id = _activeTaskId;
     if (id == null) return;
     final record = await _taskStore.get(id);
-    var status = TaskStatus.failed;
+    var status = TaskStatus.needsRevision;
     final pending = record?.execution.inFlight;
     if (pending != null) {
       final uncertainMutation = pending.mutation;
@@ -2659,9 +2905,8 @@ Remember:
         id,
         technicalSuccess: false,
         uncertain: uncertainMutation,
-        continueAfterUncertain: false,
+        continueAfterUncertain: true,
       );
-      if (uncertainMutation) status = TaskStatus.needsRevision;
     } else if (record?.execution.unverifiedMutations.isNotEmpty == true) {
       status = TaskStatus.needsRevision;
     }
