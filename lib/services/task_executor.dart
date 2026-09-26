@@ -574,6 +574,43 @@ GENERAL RULES:
     var plannerFailures = 0;
     var formatFailures = 0;
     final stepBase = task.stepsCompleted;
+    final finalRetrySubtaskIds = <String>{};
+
+    Future<bool> tryFinalSafeRetry() async {
+      final reopened = await _taskStore.reopenSafeFailedSubtasksForRetry(
+        _activeTaskId!,
+        alreadyRetriedSubtaskIds: finalRetrySubtaskIds,
+      );
+      if (reopened.isEmpty) return false;
+
+      finalRetrySubtaskIds.addAll(reopened);
+      final latest = (await _taskStore.get(_activeTaskId!))!;
+      for (final subtaskId in reopened) {
+        for (final event in latest.execution.audit.where(
+          (event) =>
+              event.subtaskId == subtaskId &&
+              event.phase == 'after' &&
+              !event.technicalSuccess,
+        )) {
+          final hint =
+              '$subtaskId: ${event.action} failed earlier; use a materially '
+              'different safe strategy and do not repeat it.';
+          if (!failedStrategies.contains(hint)) failedStrategies.add(hint);
+        }
+      }
+
+      previousResult =
+          'All currently runnable independent work is exhausted. Starting a '
+          'bounded final retry for safe failed subtasks: ${reopened.join(', ')}. '
+          'Choose a materially different strategy; never replay an uncertain '
+          'external effect.';
+      results.add(previousResult);
+      _report(previousResult);
+      screenContent = '';
+      consecutiveVerifierGaps = 0;
+      return true;
+    }
+
     for (int runStep = 0; runStep < _aiService.maxSteps; runStep++) {
       final step = stepBase + runStep;
       // -----------------------------------------------------------------------
@@ -1281,6 +1318,7 @@ Remember:
               );
             }
             if (selectedIds == null) {
+              if (await tryFinalSafeRetry()) continue;
               final outcome = await _subtaskOutcomeReport();
               final message =
                   'Task checkpoint saved. The combined review request timed out '
@@ -1383,6 +1421,7 @@ Remember:
                 screenContent = '';
                 continue;
               }
+              if (await tryFinalSafeRetry()) continue;
               final report = await _subtaskOutcomeReport();
               results.add(report);
               await _finishTask(
@@ -1402,6 +1441,7 @@ Remember:
           final runnable =
               await _taskStore.runnableSubtaskId(_activeTaskId!);
           if (runnable == null) {
+            if (await tryFinalSafeRetry()) continue;
             final report = await _subtaskOutcomeReport();
             results.add(report);
             await _finishTask(
@@ -1414,7 +1454,7 @@ Remember:
             _report(report);
             return report;
           }
-            if (_assistanceBatchShown) {
+            if (_assistanceBatchShown && finalRetrySubtaskIds.isEmpty) {
             final report = await _subtaskOutcomeReport();
             final message =
                 'Task checkpoint saved. Remaining criteria or human-only steps '

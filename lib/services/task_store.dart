@@ -729,6 +729,78 @@ class TaskStore {
     );
   });
 
+  /// Reopens safe, exhausted subtasks once per executor run for a final retry.
+  /// Any successful or unresolved external mutation makes the subtask ineligible.
+  Future<List<String>> reopenSafeFailedSubtasksForRetry(
+    String id, {
+    required Set<String> alreadyRetriedSubtaskIds,
+  }) => _serialized(() async {
+    final records = await _read();
+    final index = records.indexWhere((record) => record.identifier == id);
+    if (index < 0) return const <String>[];
+    final record = records[index];
+    final state = record.execution;
+    if (!const {TaskStatus.running, TaskStatus.needsRevision}.contains(
+          record.status,
+        ) ||
+        state.inFlight != null) {
+      return const <String>[];
+    }
+
+    bool isSafeFailedSubtask(TaskSubtask subtask) {
+      if (subtask.status != TaskSubtaskStatus.failed ||
+          alreadyRetriedSubtaskIds.contains(subtask.id)) {
+        return false;
+      }
+      final hasRecordedFailure = state.audit.any(
+        (event) =>
+            event.subtaskId == subtask.id &&
+            event.phase == 'after' &&
+            !event.technicalSuccess,
+      );
+      if (!hasRecordedFailure) return false;
+      return !state.audit.any(
+        (event) =>
+            event.subtaskId == subtask.id &&
+            event.mutation &&
+            (event.phase == 'uncertain' ||
+                state.unverifiedMutations.contains(event.sequence) ||
+                event.technicalSuccess ||
+                event.outcome == 'userConfirmed' ||
+                event.outcome == 'observed'),
+      );
+    }
+
+    final retryable = state.plan.where(isSafeFailedSubtask).toList();
+    if (retryable.isEmpty) return const <String>[];
+    final retryableIds = retryable.map((subtask) => subtask.id).toSet();
+    final plan = state.plan
+        .map(
+          (subtask) => retryableIds.contains(subtask.id)
+              ? subtask.copyWith(
+                  status: TaskSubtaskStatus.pending,
+                  clearFailureCode: true,
+                )
+              : subtask,
+        )
+        .toList();
+    final refreshedPlan = _refreshSubtaskDependencies(plan);
+    final nextExecution = state.copyWith(plan: refreshedPlan);
+    records[index] = TaskPersistencePrivacy.sanitize(
+      record.copyWith(
+        status: TaskStatus.running,
+        execution: nextExecution.copyWith(
+          verification: TaskVerifier.verify(nextExecution),
+        ),
+        updatedAt: DateTime.now(),
+      ),
+    );
+    await _write(records);
+    return List<String>.unmodifiable(
+      retryable.map((subtask) => subtask.id),
+    );
+  });
+
   Future<String?> runnableSubtaskId(String id) {
     // This is a read-only helper; execution writes still validate the target
     // transactionally in beginAction.

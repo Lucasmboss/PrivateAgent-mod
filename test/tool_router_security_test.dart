@@ -274,78 +274,255 @@ void main() {
       },
     );
 
-    test('uncertain action blocks its dependencies but independent work continues', () async {
-      final shizuku = _FakeShizukuService(
-        const ShizukuCommandResult(
-          stdout: 'partial output',
-          stderr: '',
-          exitCode: null,
-          wasDispatched: true,
-        ),
-      );
-      var calls = 0;
-      final engine = executor(_Planner((_, __) async {
-        calls++;
-        return AiResponse(switch (calls) {
-          1 =>
-            '{"action":"plan","params":{"subtasks":['
-            '{"id":"change","objective":"Change device state",'
-            '"dependencies":[],"criteria":["Requested state changed"]},'
-            '{"id":"independent","objective":"Read independent status",'
-            '"dependencies":[],"criteria":["Status was checked"]},'
-            '{"id":"dependent","objective":"Continue after the change",'
-            '"dependencies":["change"],"criteria":["Dependent work completed"]}'
-            ']}}',
-          2 =>
-            '{"action":"run_adb_command","command":"change-device-state",'
-            '"subtask_id":"change","reasoning":"Run the requested change"}',
-          3 =>
-            '{"action":"read_screen","params":{},'
-            '"subtask_id":"independent","reasoning":"Check independent status"}',
-          4 =>
-            '{"action":"subtask_failed","params":{"subtask_id":"independent",'
-            '"failure_code":"strategies_exhausted",'
-            '"attempted_strategies":["read_screen"],'
-            '"remaining_strategies":[]}}',
-          _ => '{"action":"done","params":{}}',
-        }, 1);
-      }),
-        shizuku: shizuku,
-      );
+    test(
+      'uncertain action blocks dependencies while safe failures enter final retry',
+      () async {
+        final shizuku = _FakeShizukuService(
+          const ShizukuCommandResult(
+            stdout: 'partial output',
+            stderr: '',
+            exitCode: null,
+            wasDispatched: true,
+          ),
+        );
+        var calls = 0;
+        late TaskExecutor engine;
+        engine = executor(
+          _Planner((_, __) async {
+            calls++;
+            if (calls == 6) {
+              engine.pause();
+              return AiResponse('{"action":"done","params":{}}', 1);
+            }
+            return AiResponse(switch (calls) {
+              1 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"change","objective":"Change device state",'
+                    '"dependencies":[],"criteria":["Requested state changed"]},'
+                    '{"id":"independent","objective":"Read independent status",'
+                    '"dependencies":[],"criteria":["Status was checked"]},'
+                    '{"id":"dependent","objective":"Continue after the change",'
+                    '"dependencies":["change"],"criteria":["Dependent work completed"]}'
+                    ']}}',
+              2 =>
+                '{"action":"run_adb_command","command":"change-device-state",'
+                    '"subtask_id":"change","reasoning":"Run the requested change"}',
+              3 =>
+                '{"action":"read_screen","params":{},'
+                    '"subtask_id":"independent","reasoning":"Check independent status"}',
+              4 =>
+                '{"action":"subtask_failed","params":{"subtask_id":"independent",'
+                    '"failure_code":"strategies_exhausted",'
+                    '"attempted_strategies":["read_screen"],'
+                    '"remaining_strategies":[]}}',
+              _ => '{"action":"done","params":{}}',
+            }, 1);
+          }),
+          shizuku: shizuku,
+        );
 
-      final message = await engine.executeTask('Change device state');
+        final message = await engine.executeTask('Change device state');
 
-      final record = (await store.list()).single;
-      expect(calls, 5);
-      expect(message, contains('subtasks verified'));
-      expect(record.status, TaskStatus.needsRevision);
-      expect(record.execution.inFlight, isNull);
-      expect(record.execution.unverifiedMutations, isNotEmpty);
-      expect(
-        record.execution.audit.any(
-          (event) =>
-              event.action == 'run_adb_command' &&
-              event.phase == 'uncertain' &&
-              event.subtaskId == 'change',
-        ),
-        isTrue,
-      );
-      expect(
-        record.execution.audit.any(
-          (event) =>
-              event.action == 'read_screen' &&
-              event.phase == 'after' &&
-              event.subtaskId == 'independent',
-        ),
-        isTrue,
-      );
-      final subtasks = {
-        for (final subtask in record.execution.plan) subtask.id: subtask,
-      };
-      expect(subtasks['change']!.status, TaskSubtaskStatus.needsReview);
-      expect(subtasks['independent']!.status, TaskSubtaskStatus.failed);
-      expect(subtasks['dependent']!.status, TaskSubtaskStatus.blocked);
-    });
+        final record = (await store.list()).single;
+        expect(calls, 6);
+        expect(message, isNotEmpty);
+        expect(record.status, TaskStatus.paused);
+        expect(record.execution.inFlight, isNull);
+        expect(record.execution.unverifiedMutations, isNotEmpty);
+        expect(
+          record.execution.audit.any(
+            (event) =>
+                event.action == 'run_adb_command' &&
+                event.phase == 'uncertain' &&
+                event.subtaskId == 'change',
+          ),
+          isTrue,
+        );
+        expect(
+          record.execution.audit.any(
+            (event) =>
+                event.action == 'read_screen' &&
+                event.phase == 'after' &&
+                event.subtaskId == 'independent',
+          ),
+          isTrue,
+        );
+        expect(
+          record.execution.audit
+              .where(
+                (event) =>
+                    event.action == 'read_screen' &&
+                    event.phase == 'after' &&
+                    event.subtaskId == 'independent',
+              )
+              .length,
+          1,
+        );
+        final subtasks = {
+          for (final subtask in record.execution.plan) subtask.id: subtask,
+        };
+        expect(subtasks['change']!.status, TaskSubtaskStatus.needsReview);
+        expect(subtasks['independent']!.status, TaskSubtaskStatus.pending);
+        expect(subtasks['dependent']!.status, TaskSubtaskStatus.blocked);
+      },
+    );
+
+    test(
+      'safe failed subtask gets one final alternative before partial checkpoint',
+      () async {
+        final shizuku = _FakeShizukuService(
+          const ShizukuCommandResult(
+            stdout: '',
+            stderr: 'command failed',
+            exitCode: 1,
+            wasDispatched: true,
+          ),
+        );
+        var calls = 0;
+        final engine = executor(
+          _Planner((_, __) async {
+            calls++;
+            return AiResponse(switch (calls) {
+              1 =>
+                '{"action":"plan","params":{"subtasks":['
+                    '{"id":"step-2","objective":"Complete step 2",'
+                    '"dependencies":[],"criteria":["Step 2 completed"]},'
+                    '{"id":"step-3","objective":"Complete dependent step 3",'
+                    '"dependencies":["step-2"],'
+                    '"criteria":["Step 3 completed"]}'
+                    ']}}',
+              2 =>
+                '{"action":"run_adb_command","command":"echo first-approach",'
+                    '"subtask_id":"step-2","reasoning":"Try the first safe approach"}',
+              3 =>
+                '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
+                    '"failure_code":"strategies_exhausted",'
+                    '"attempted_strategies":["run_adb_command"],'
+                    '"remaining_strategies":[]}}',
+              4 => '{"action":"done","params":{}}',
+              5 =>
+                '{"action":"read_screen","params":{},'
+                    '"subtask_id":"step-2","reasoning":"Try a different read strategy"}',
+              6 =>
+                '{"action":"subtask_failed","params":{"subtask_id":"step-2",'
+                    '"failure_code":"strategies_exhausted",'
+                    '"attempted_strategies":["run_adb_command","read_screen"],'
+                    '"remaining_strategies":[]}}',
+              _ => '{"action":"done","params":{}}',
+            }, 1);
+          }),
+          shizuku: shizuku,
+        );
+
+        await engine.executeTask('Complete step 2, then step 3');
+
+        final record = (await store.list()).single;
+        final subtasks = {
+          for (final subtask in record.execution.plan) subtask.id: subtask,
+        };
+        expect(calls, 7);
+        expect(shizuku.lastCommand, 'echo first-approach');
+        expect(engine.lastStatus, TaskStatus.needsRevision);
+        expect(record.status, TaskStatus.needsRevision);
+        expect(record.execution.unverifiedMutations, isEmpty);
+        expect(
+          record.execution.audit
+              .where(
+                (event) =>
+                    event.action == 'run_adb_command' &&
+                    event.phase == 'after' &&
+                    event.subtaskId == 'step-2',
+              )
+              .length,
+          1,
+        );
+        expect(
+          record.execution.audit
+              .where(
+                (event) =>
+                    event.action == 'read_screen' &&
+                    event.phase == 'after' &&
+                    event.subtaskId == 'step-2',
+              )
+              .length,
+          1,
+        );
+        expect(subtasks['step-2']!.status, TaskSubtaskStatus.failed);
+        expect(subtasks['step-3']!.status, TaskSubtaskStatus.blocked);
+      },
+    );
+
+    test(
+      'successful final retry releases its dependent subtask',
+      () async {
+        final task = await store.create(
+          goal: 'Complete step 2, then step 3',
+          status: TaskStatus.running,
+        );
+        await store.setPlan(task.identifier, [
+          const TaskSubtask(
+            id: 'step-2',
+            objective: 'Complete step 2',
+            criteria: ['Step 2 completed'],
+          ),
+          const TaskSubtask(
+            id: 'step-3',
+            objective: 'Complete dependent step 3',
+            dependencies: ['step-2'],
+            criteria: ['Step 3 completed'],
+          ),
+        ]);
+        await store.beginAction(
+          task.identifier,
+          'read_screen',
+          mutation: false,
+          subtaskId: 'step-2',
+        );
+        await store.endAction(task.identifier, technicalSuccess: false);
+        await store.markSubtaskFailed(
+          task.identifier,
+          subtaskId: 'step-2',
+          failureCode: 'strategies_exhausted',
+          attemptedStrategies: ['read_screen'],
+          remainingStrategies: const [],
+        );
+
+        final reopened = await store.reopenSafeFailedSubtasksForRetry(
+          task.identifier,
+          alreadyRetriedSubtaskIds: const {},
+        );
+        expect(reopened, ['step-2']);
+        var checkpoint = (await store.get(task.identifier))!;
+        expect(checkpoint.execution.plan[0].status, TaskSubtaskStatus.pending);
+        expect(checkpoint.execution.plan[1].status, TaskSubtaskStatus.blocked);
+
+        await store.beginAction(
+          task.identifier,
+          'read_file',
+          mutation: false,
+          subtaskId: 'step-2',
+        );
+        await store.endAction(task.identifier, technicalSuccess: true);
+        await store.update(task.identifier, status: TaskStatus.needsRevision);
+        await store.confirmCriterion(
+          task.identifier,
+          expectedRevision: checkpoint.execution.revision,
+          subtaskId: 'step-2',
+          criterion: 'Step 2 completed',
+          confirmed: true,
+        );
+        await store.verifyCompletion(task.identifier, const {
+          'step-2': {
+            'Step 2 completed': ['action-2'],
+          },
+        });
+
+        checkpoint = (await store.get(task.identifier))!;
+        expect(checkpoint.execution.plan[0].status, TaskSubtaskStatus.completed);
+        expect(checkpoint.execution.plan[1].status, TaskSubtaskStatus.pending);
+        expect(await store.runnableSubtaskId(task.identifier), 'step-3');
+      },
+    );
 
     test('direct shell routing reports exit-code success', () async {
       final shizuku = _FakeShizukuService(
