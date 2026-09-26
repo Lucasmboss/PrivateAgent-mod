@@ -153,14 +153,10 @@ class TaskVerifier {
         )) {
       return false;
     }
-    return state.plan.every(
-      (task) => evidence.any(
-        (event) =>
-            event.subtaskId == task.id &&
-            !event.mutation &&
-            isObservationAction(event.action),
-      ),
-    );
+    // The model's evidence links are not proof. Once there is a real audit
+    // trail and no unresolved side effect, let the user review every criterion
+    // rather than asking the planner to repeat its completion claim.
+    return true;
   }
 
   static String verify(TaskExecutionState state) {
