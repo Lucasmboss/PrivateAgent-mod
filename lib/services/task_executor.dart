@@ -16,6 +16,8 @@ import 'tool_policy.dart';
 import 'user_assistance_policy.dart';
 import '../privacy_sanitizer.dart';
 import 'task_store.dart';
+import 'task_persistence_privacy.dart';
+import 'task_verifier.dart';
 import '../models/task_record.dart';
 import '../models/saved_skill.dart';
 
@@ -157,6 +159,8 @@ IMPORTANT:
 - If a webpage requires JavaScript, browser interaction, authentication, or another capability that HTTP cannot provide, consider open_url followed by Screen Automation.
 - Use Android UI only when direct/API methods are insufficient.
 - If one strategy fails, analyze the result and consider another strategy.
+- A failure in one subtask must not stop independent subtasks.
+- Never run a subtask while any dependency is incomplete or blocked.
 - Do not blindly repeat failed actions.
 - The current Android screen may NOT have been read yet.
 - If UI interaction is required and the screen has not been read,
@@ -333,7 +337,23 @@ completion or choose not to continue; this is not approval for extra actions.
 Wait up to 5 minutes. If the user does not complete the step, use a safe
 alternative or report the blocker. Never bypass sign-in or Android security.
 
-17. done
+17. subtask_failed
+
+Mark a subtask exhausted only after every safe applicable strategy has failed.
+This is a status report, not a tool invocation.
+
+Parameters:
+{
+  "subtask_id": "the planned subtask id",
+  "failure_code": "strategies_exhausted",
+  "attempted_strategies": ["web_search", "web_request"],
+  "remaining_strategies": []
+}
+
+The runtime checks that the listed actions actually failed for this subtask.
+After marking it failed, continue with independent runnable subtasks.
+
+18. done
 
 Finish the task.
 
@@ -354,6 +374,7 @@ Return ONLY valid JSON.
 {
   "action": "web_search",
   "params": {},
+  "subtask_id": "research",
   "reasoning": "Brief reason for choosing this action.",
   "is_complete": false
 }
@@ -363,6 +384,16 @@ GENERAL RULES:
 - Before starting tools, you may use action "plan" with params.subtasks: an
   ordered array of {id, objective, dependencies: [earlier IDs], criteria: [text]}.
   Changing a plan invalidates prior evidence. Do not re-plan merely to finish.
+- Every action that works on a planned subtask must include top-level
+  "subtask_id" naming that subtask. Read its persisted status first. Do not
+  target completed, failed, or blocked subtasks. A needs-review subtask allows
+  read-only observation only; never mutate it or act on its dependents.
+- After a tool failure, try a different safe strategy for that subtask, then
+  continue with other runnable independent subtasks. Never stop the whole task
+  because one subtask failed.
+- Use "subtask_failed" only when applicable strategies are exhausted and the
+  runtime has recorded those failed attempts. Leave remaining_strategies empty;
+  do not invent a failure or mark an uncertain mutation as failed.
 - Completion requires action "done" and params.evidence:
   {subtaskId: {criterionText: ["action-N"]}} using persisted successful evidence.
   A bare done/is_complete is not proof. Mutations require trusted outcome review.
@@ -493,6 +524,12 @@ GENERAL RULES:
                 ) ??
                 false))
           '${event.action}: prior external effect remains unverified; do not replay',
+      for (final event in previousTask?.execution.audit ?? const <ActionAudit>[])
+        if (event.phase == 'after' &&
+            !event.technicalSuccess &&
+            event.subtaskId != null)
+          '${event.subtaskId}: ${event.action} failed previously; do not repeat '
+              'without a materially different strategy',
     ];
 
     int totalTokens = previousTask?.tokens ?? 0;
@@ -534,7 +571,11 @@ GENERAL RULES:
     // -------------------------------------------------------------------------
 
     var consecutiveVerifierGaps = 0;
-    for (int step = task.stepsCompleted; step < _aiService.maxSteps; step++) {
+    var plannerFailures = 0;
+    var formatFailures = 0;
+    final stepBase = task.stepsCompleted;
+    for (int runStep = 0; runStep < _aiService.maxSteps; runStep++) {
+      final step = stepBase + runStep;
       // -----------------------------------------------------------------------
       // Cancellation
       // -----------------------------------------------------------------------
@@ -562,9 +603,9 @@ GENERAL RULES:
 
       await _taskStore.update(
         _activeTaskId!,
-        progress: (previousTask?.progress ?? 0) > step / _aiService.maxSteps
-            ? previousTask!.progress
-            : step / _aiService.maxSteps,
+        progress: task.progress > runStep / _aiService.maxSteps
+            ? task.progress
+            : runStep / _aiService.maxSteps,
         stepsCompleted: step,
         tokens: totalTokens,
         results: results.length <= 20
@@ -630,7 +671,7 @@ PERSISTED PLAN AND SAFE EVIDENCE:
 ${jsonEncode(durable.execution.toJson())}
 
 CURRENT STEP:
-${step + 1}/${_aiService.maxSteps}
+${runStep + 1}/${_aiService.maxSteps}
 
 CURRENT SCREEN:
 ${screenContent.isEmpty ? 'Not read yet.' : screenContent}
@@ -746,6 +787,7 @@ Remember:
         final aiResponse = result;
 
         response = aiResponse.content;
+        plannerFailures = 0;
 
         totalTokens += aiResponse.totalTokens;
       } catch (e) {
@@ -775,24 +817,34 @@ Remember:
           );
         }
 
-        results.add('AI error: $e');
-
-        _report('Error: $e');
+        const plannerFailure =
+            'The AI planner is unavailable. No new action was dispatched; '
+            'the task checkpoint can be resumed when planning is available.';
+        plannerFailures++;
+        if (plannerFailures < 3) {
+          previousResult = '$plannerFailure Planner retry $plannerFailures/3.';
+          results.add(previousResult);
+          consecutiveFailures++;
+          continue;
+        }
+        results.add(plannerFailure);
+        final outcome = await _subtaskOutcomeReport();
+        _report('$plannerFailure\n$outcome');
 
         await _notificationService.showTaskCompleteNotification(
-          'Task Error',
-          'AI encountered an error.',
+          'Task Paused',
+          'The planner failed; the checkpoint is available to resume.',
         );
 
         await _finishTask(
-          TaskStatus.failed,
+          TaskStatus.needsRevision,
           step,
           totalTokens,
           results,
           failedStrategies,
         );
 
-        return 'I could not complete the task because the AI service failed.';
+        return '$plannerFailure\n$outcome';
       }
 
       // -----------------------------------------------------------------------
@@ -886,24 +938,36 @@ Remember:
               step,
               results,
             );
-          results.add('Step ${step + 1}: Error after retry: $e');
-
-          _report('AI formatting error.');
+          const formattingFailure =
+              'The AI response remained invalid after a retry. No tool was '
+              'dispatched for that response.';
+          formatFailures++;
+          if (formatFailures < 3) {
+            previousResult =
+                '$formattingFailure Request a fresh valid action; no action '
+                'was executed.';
+            results.add(previousResult);
+            consecutiveFailures++;
+            continue;
+          }
+          results.add(formattingFailure);
+          final outcome = await _subtaskOutcomeReport();
+          _report('$formattingFailure\n$outcome');
 
           await _notificationService.showTaskCompleteNotification(
-            'Task Error',
-            'AI formatting error.',
+            'Task Paused',
+            'The task checkpoint is available to resume.',
           );
 
           await _finishTask(
-            TaskStatus.failed,
+            TaskStatus.needsRevision,
             step,
             totalTokens,
             results,
             failedStrategies,
           );
 
-          return 'I could not understand the AI response. Please try again.';
+          return '$formattingFailure\n$outcome';
         }
       }
 
@@ -918,12 +982,61 @@ Remember:
         consecutiveFailures++;
         continue;
       }
+      formatFailures = 0;
 
       var action = toolResponse.action.action;
       var params = toolResponse.action.params;
       final reasoning = toolResponse.reasoning;
       final isComplete = toolResponse.isComplete;
       developer.log('Selected action: $action', name: 'PrivateAgent');
+
+      String? activeSubtaskId;
+      if (!const {'ask_user', 'done', 'plan', 'subtask_failed'}
+          .contains(action)) {
+        final saved = await _taskStore.get(_activeTaskId!);
+        final plan = saved?.execution.plan ?? const <TaskSubtask>[];
+        if (plan.isNotEmpty) {
+          final requestedId = toolResponse.subtaskId?.trim();
+          final targetId = requestedId == null || requestedId.isEmpty
+              ? await _taskStore.runnableSubtaskId(_activeTaskId!)
+              : requestedId;
+          final targets = plan.where((subtask) => subtask.id == targetId);
+          if (targetId == null || targets.isEmpty) {
+            previousResult =
+                'No runnable subtask matches this action. Select a pending '
+                'subtask whose dependencies are complete.';
+            results.add(previousResult);
+            consecutiveFailures++;
+            continue;
+          }
+          final target = targets.first;
+          final dependenciesComplete = plan
+              .where((subtask) => target.dependencies.contains(subtask.id))
+              .every((subtask) =>
+                  subtask.status == TaskSubtaskStatus.completed);
+          if (!dependenciesComplete ||
+              const {
+                TaskSubtaskStatus.completed,
+                TaskSubtaskStatus.failed,
+                TaskSubtaskStatus.blocked,
+              }.contains(target.status) ||
+              (target.status == TaskSubtaskStatus.needsReview &&
+                  TaskVerifier.isMutation(action, params))) {
+            previousResult =
+                'Subtask ${target.id} is not runnable. Do not repeat it; '
+                'choose an independent pending subtask.';
+            results.add(previousResult);
+            consecutiveFailures++;
+            continue;
+          }
+          activeSubtaskId = target.id;
+        } else if (toolResponse.subtaskId?.trim().isNotEmpty == true) {
+          previousResult = 'The task has no plan containing that subtask id.';
+          results.add(previousResult);
+          consecutiveFailures++;
+          continue;
+        }
+      }
 
       _report('Step ${step + 1}: $reasoning');
       if (_paused) {
@@ -995,7 +1108,8 @@ Remember:
         return denied;
       }
 
-      if (!const {'ask_user', 'done', 'plan'}.contains(action)) {
+      if (!const {'ask_user', 'done', 'plan', 'subtask_failed'}
+          .contains(action)) {
         attemptedActions.add(action);
         results.add('Attempted actions so far: ${attemptedActions.join(', ')}');
       }
@@ -1033,6 +1147,41 @@ Remember:
       }
 
       lastAction = action;
+
+      if (action == 'subtask_failed') {
+        final attempted = List<String>.from(
+          params['attempted_strategies'] as List,
+        );
+        final remaining = List<String>.from(
+          params['remaining_strategies'] as List,
+        );
+        try {
+          if (params['failure_code'] != 'strategies_exhausted') {
+            throw const FormatException('Invalid subtask failure code');
+          }
+          final subtaskId = params['subtask_id'] as String;
+          await _taskStore.markSubtaskFailed(
+            _activeTaskId!,
+            subtaskId: subtaskId,
+            failureCode: 'strategies_exhausted',
+            attemptedStrategies: attempted,
+            remainingStrategies: remaining,
+          );
+          previousResult =
+              'Subtask $subtaskId is recorded as failed after its listed '
+              'strategies were exhausted. Continue with independent subtasks.';
+          results.add(previousResult);
+          _report(previousResult);
+          consecutiveFailures = 0;
+        } catch (_) {
+          previousResult =
+              'Subtask failure report rejected: failed attempts or exhausted '
+              'strategies could not be verified. Continue safely.';
+          results.add(previousResult);
+          consecutiveFailures++;
+        }
+        continue;
+      }
 
       // -----------------------------------------------------------------------
       // DONE
@@ -1087,8 +1236,12 @@ Remember:
           if (verified.execution.verification != 'verified') {
             consecutiveVerifierGaps++;
           }
+          final nextRunnableSubtask =
+              await _taskStore.runnableSubtaskId(_activeTaskId!);
           final readyForBatch =
-              missingEvidence.isEmpty || consecutiveVerifierGaps >= 2;
+              missingEvidence.isEmpty ||
+              consecutiveVerifierGaps >= 2 ||
+              nextRunnableSubtask == null;
           if (!_assistanceBatchShown &&
               readyForBatch &&
               assistanceItems.isNotEmpty) {
@@ -1128,9 +1281,11 @@ Remember:
               );
             }
             if (selectedIds == null) {
-              const message =
+              final outcome = await _subtaskOutcomeReport();
+              final message =
                   'Task checkpoint saved. The combined review request timed out '
-                  'or was declined; resume it from this chat when ready.';
+                  'or was declined; resume it from this chat when ready.\n'
+                  '$outcome';
               results.add(message);
               await _finishTask(
                 TaskStatus.needsRevision,
@@ -1215,10 +1370,21 @@ Remember:
             }
             if (verified.execution.verification != 'verified' ||
                 verified.execution.pendingAssistance.isNotEmpty) {
-              const message =
-                  'Task checkpoint saved. Some outcomes still need independent '
-                  'review or human-only steps remain incomplete.';
-              results.add(message);
+              final runnable =
+                  await _taskStore.runnableSubtaskId(_activeTaskId!);
+              if (runnable != null) {
+                await _taskStore.update(
+                  _activeTaskId!,
+                  status: TaskStatus.running,
+                );
+                previousResult =
+                    'Review is complete for the selected items. Continue with '
+                    'the remaining independent runnable subtasks.';
+                screenContent = '';
+                continue;
+              }
+              final report = await _subtaskOutcomeReport();
+              results.add(report);
               await _finishTask(
                 TaskStatus.needsRevision,
                 step,
@@ -1226,18 +1392,35 @@ Remember:
                 results,
                 failedStrategies,
               );
-              _report(message);
-              return message;
+              _report(report);
+              return report;
             }
           }
 
           if (verified.execution.verification != 'verified' ||
               verified.execution.pendingAssistance.isNotEmpty) {
+          final runnable =
+              await _taskStore.runnableSubtaskId(_activeTaskId!);
+          if (runnable == null) {
+            final report = await _subtaskOutcomeReport();
+            results.add(report);
+            await _finishTask(
+              TaskStatus.needsRevision,
+              step,
+              totalTokens,
+              results,
+              failedStrategies,
+            );
+            _report(report);
+            return report;
+          }
             if (_assistanceBatchShown) {
-              const message =
-                  'Task checkpoint saved. Remaining criteria or human-only steps '
-                  'are listed for review; continue from this chat when ready.';
-              results.add(message);
+            final report = await _subtaskOutcomeReport();
+            final message =
+                'Task checkpoint saved. Remaining criteria or human-only steps '
+                'are listed for review; continue from this chat when ready.\n'
+                '$report';
+            results.add(message);
               await _finishTask(
                 TaskStatus.needsRevision,
                 step,
@@ -1364,14 +1547,19 @@ Remember:
       final unresolvedPriorAction = durableBeforeDispatch?.execution.audit.any(
             (event) =>
                 event.mutation &&
-                event.phase == 'uncertain' &&
-                unresolvedMutationSequences.contains(event.sequence) &&
+                (unresolvedMutationSequences.contains(event.sequence) ||
+                    event.technicalSuccess ||
+                    event.outcome == 'userConfirmed' ||
+                    event.outcome == 'observed') &&
+                (event.subtaskId == activeSubtaskId ||
+                    event.subtaskId == null) &&
                 event.action == action,
           ) ??
           false;
       if (call.mutation != ToolMutation.readOnly && unresolvedPriorAction) {
         previousResult =
-            'Refused to repeat $action because a prior effect is still uncertain. '
+            'Refused to repeat $action because a prior external effect remains '
+            'unverified. '
             'Use a read-only observation or another independent strategy.';
         results.add('$action: not replayed; prior mutation needs review.');
         failedStrategies.add('$action: prior effect remains unverified');
@@ -1383,6 +1571,7 @@ Remember:
         _activeTaskId!,
         action,
         mutation: call.mutation != ToolMutation.readOnly,
+        subtaskId: activeSubtaskId,
       );
       _actionInFlight = true;
       bool toolSucceeded = false;
@@ -2048,13 +2237,20 @@ Remember:
             technicalSuccess:
                 classification == ToolResultClassification.succeeded,
             uncertain: toolThrew || toolNeedsReview,
-            continueAfterUncertain: !needsIndependentReview,
+            // Preserve the uncertain checkpoint but let independent subtasks
+            // continue. Their dependencies remain blocked in durable state.
+            continueAfterUncertain: true,
           );
         } finally {
           _actionInFlight = false;
         }
         if (needsIndependentReview) {
-          throw ToolOutcomeUncertainException(action);
+          const reviewMessage =
+              'This action may have changed external state. It will not be '
+              'replayed; its subtask and dependents need review. Independent '
+              'work may continue.';
+          results.add(reviewMessage);
+          _report(reviewMessage);
         }
         if (toolSucceeded) {
           consecutiveVerifierGaps = 0;
@@ -2070,7 +2266,7 @@ Remember:
       return await _handlePause(
         userGoal,
         totalTokens,
-        _aiService.maxSteps,
+        stepBase + _aiService.maxSteps,
         results,
         failedStrategies,
       );
@@ -2078,45 +2274,44 @@ Remember:
       return await _handleCancellation(
         userGoal,
         totalTokens,
-        _aiService.maxSteps,
+        stepBase + _aiService.maxSteps,
         results,
       );
     if (_budgetExpired || totalTokens >= maxTaskTokens) {
       return await _stopForBudget(
         totalTokens,
-        _aiService.maxSteps,
+        stepBase + _aiService.maxSteps,
         results,
         failedStrategies,
       );
     }
 
+    final outcome = await _subtaskOutcomeReport();
     results.add(
-      'Reached maximum steps '
-      '(${_aiService.maxSteps}). '
-      'Task may be incomplete.',
+      'Reached the per-run limit of ${_aiService.maxSteps} planner steps.\n'
+      '$outcome',
     );
 
-    _report('Reached maximum steps.');
+    _report('Task checkpoint saved.\n$outcome');
 
     await _notificationService.showTaskCompleteNotification(
-      'Task Stopped',
-      'Reached maximum steps '
-          '(${_aiService.maxSteps}).',
+      'Task Checkpoint Saved',
+      'The per-run step limit was reached. Resume to continue the remaining work.',
     );
 
     await _finishTask(
       TaskStatus.needsRevision,
-      _aiService.maxSteps,
+      stepBase + _aiService.maxSteps,
       totalTokens,
       results,
       failedStrategies,
     );
 
     if (await _screenService.isServiceRunning()) {
-      await _screenService.showToast('Reached maximum steps.');
+      await _screenService.showToast('Task checkpoint saved.');
     }
 
-    return 'I could not complete the task within the allowed steps.';
+    return outcome;
   }
 
   // ===========================================================================
@@ -2337,6 +2532,49 @@ Remember:
       );
     }
     return items;
+  }
+
+  Future<String> _subtaskOutcomeReport() async {
+    final id = _activeTaskId;
+    if (id == null) return 'Task stopped with no active checkpoint.';
+    final record = await _taskStore.get(id);
+    if (record == null || record.execution.plan.isEmpty) {
+      return 'Task is incomplete. No validated subtask plan is available; '
+          'resume from the saved checkpoint when the planner is available.';
+    }
+    final lines = <String>[];
+    for (final subtask in record.execution.plan) {
+      final objective = TaskPersistencePrivacy.goalText(subtask.objective);
+      final shortObjective = objective.length > 220
+          ? '${objective.substring(0, 220)}…'
+          : objective;
+      final status = switch (subtask.status) {
+        TaskSubtaskStatus.completed => 'completed',
+        TaskSubtaskStatus.failed => 'failed after safe strategies were exhausted',
+        TaskSubtaskStatus.blocked => 'blocked by an incomplete dependency',
+        TaskSubtaskStatus.needsReview =>
+          'waiting for review; its external outcome is uncertain',
+        TaskSubtaskStatus.inProgress => subtask.failureCode == 'tool_failed'
+            ? 'incomplete; the latest tool attempt failed'
+            : 'incomplete; more work may remain',
+        TaskSubtaskStatus.pending => 'not started; available to resume',
+      };
+      final attempts = subtask.attempts == 1
+          ? '1 tool attempt'
+          : '${subtask.attempts} tool attempts';
+      lines.add('- ${subtask.id}: $shortObjective — $status ($attempts).');
+    }
+    final completed = record.execution.plan
+        .where((item) => item.status == TaskSubtaskStatus.completed)
+        .length;
+    final unresolvedMutationCount =
+        record.execution.unverifiedMutations.length;
+    final mutationNote = unresolvedMutationCount == 0
+        ? ''
+        : '\nUnverified external changes: $unresolvedMutationCount. '
+              'They were not replayed and need review before dependent work.';
+    return 'Task outcome: $completed/${record.execution.plan.length} '
+        'subtasks verified.\n${lines.join('\n')}$mutationNote';
   }
 
   Future<void> _finishTask(

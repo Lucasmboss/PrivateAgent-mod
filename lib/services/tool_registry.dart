@@ -298,6 +298,18 @@ class ToolRegistry {
       {'subtasks': 'plan!'},
     ),
     ToolDefinition(
+      'subtask_failed',
+      ToolCapability.orchestration,
+      ToolMutation.readOnly,
+      ToolRisk.low,
+      {
+        'subtask_id': 'string!',
+        'failure_code': 'string!',
+        'attempted_strategies': 'string_list!',
+        'remaining_strategies': 'string_list!',
+      },
+    ),
+    ToolDefinition(
       'done',
       ToolCapability.orchestration,
       ToolMutation.readOnly,

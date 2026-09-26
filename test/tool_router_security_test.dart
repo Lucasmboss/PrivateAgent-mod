@@ -274,7 +274,7 @@ void main() {
       },
     );
 
-    test('unknown shell result stays pending and cannot be replayed', () async {
+    test('uncertain action blocks its dependencies but independent work continues', () async {
       final shizuku = _FakeShizukuService(
         const ShizukuCommandResult(
           stdout: 'partial output',
@@ -283,27 +283,68 @@ void main() {
           wasDispatched: true,
         ),
       );
-      final engine = executor(
-        _Planner(
-          (_, __) async => AiResponse(
-            '{"tool":"run_adb_command","command":"change-device-state",'
-            '"reasoning":"Run the command","is_complete":false}',
-            1,
-          ),
-        ),
+      var calls = 0;
+      final engine = executor(_Planner((_, __) async {
+        calls++;
+        return AiResponse(switch (calls) {
+          1 =>
+            '{"action":"plan","params":{"subtasks":['
+            '{"id":"change","objective":"Change device state",'
+            '"dependencies":[],"criteria":["Requested state changed"]},'
+            '{"id":"independent","objective":"Read independent status",'
+            '"dependencies":[],"criteria":["Status was checked"]},'
+            '{"id":"dependent","objective":"Continue after the change",'
+            '"dependencies":["change"],"criteria":["Dependent work completed"]}'
+            ']}}',
+          2 =>
+            '{"action":"run_adb_command","command":"change-device-state",'
+            '"subtask_id":"change","reasoning":"Run the requested change"}',
+          3 =>
+            '{"action":"read_screen","params":{},'
+            '"subtask_id":"independent","reasoning":"Check independent status"}',
+          4 =>
+            '{"action":"subtask_failed","params":{"subtask_id":"independent",'
+            '"failure_code":"strategies_exhausted",'
+            '"attempted_strategies":["read_screen"],'
+            '"remaining_strategies":[]}}',
+          _ => '{"action":"done","params":{}}',
+        }, 1);
+      }),
         shizuku: shizuku,
       );
 
-      await expectLater(
-        engine.executeTask('Change device state'),
-        throwsA(isA<ToolOutcomeUncertainException>()),
-      );
+      final message = await engine.executeTask('Change device state');
 
       final record = (await store.list()).single;
+      expect(calls, 5);
+      expect(message, contains('subtasks verified'));
       expect(record.status, TaskStatus.needsRevision);
-      expect(record.execution.audit.last.phase, 'uncertain');
-      expect(record.execution.inFlight, isNotNull);
-      expect(record.execution.inFlight!.action, 'run_adb_command');
+      expect(record.execution.inFlight, isNull);
+      expect(record.execution.unverifiedMutations, isNotEmpty);
+      expect(
+        record.execution.audit.any(
+          (event) =>
+              event.action == 'run_adb_command' &&
+              event.phase == 'uncertain' &&
+              event.subtaskId == 'change',
+        ),
+        isTrue,
+      );
+      expect(
+        record.execution.audit.any(
+          (event) =>
+              event.action == 'read_screen' &&
+              event.phase == 'after' &&
+              event.subtaskId == 'independent',
+        ),
+        isTrue,
+      );
+      final subtasks = {
+        for (final subtask in record.execution.plan) subtask.id: subtask,
+      };
+      expect(subtasks['change']!.status, TaskSubtaskStatus.needsReview);
+      expect(subtasks['independent']!.status, TaskSubtaskStatus.failed);
+      expect(subtasks['dependent']!.status, TaskSubtaskStatus.blocked);
     });
 
     test('direct shell routing reports exit-code success', () async {
@@ -344,6 +385,65 @@ void main() {
       expect(record.tokens, 100);
       expect(record.status, TaskStatus.needsRevision);
       expect(record.execution.audit, isEmpty);
+    });
+
+    test('resumed task receives a fresh bounded planner-step window', () async {
+      final previous = await store.create(
+        goal: 'Read',
+        status: TaskStatus.needsRevision,
+      );
+      await store.update(
+        previous.identifier,
+        stepsCompleted: AiService().maxSteps,
+      );
+      var calls = 0;
+      final engine = executor(_Planner((_, __) async {
+        calls++;
+        return AiResponse('{"action":"done","params":{}}', 1);
+      }));
+
+      await engine.executeTask('Read', resumeTaskId: previous.identifier);
+
+      final record = (await store.list()).single;
+      expect(calls, 1);
+      expect(record.stepsCompleted, AiService().maxSteps);
+      expect(record.status, TaskStatus.needsRevision);
+    });
+
+    test('planner outage retries before pausing the checkpoint', () async {
+      var calls = 0;
+      final engine = executor(_Planner((_, __) async {
+        calls++;
+        if (calls == 1) throw StateError('temporary planner outage');
+        return AiResponse('{"action":"done","params":{}}', 1);
+      }));
+
+      await engine.executeTask('Read');
+
+      expect(calls, 2);
+      expect(engine.lastStatus, TaskStatus.needsRevision);
+    });
+
+    test('legacy subtask and audit JSON default new metadata safely', () {
+      final subtask = TaskSubtask.fromJson({
+        'id': 'legacy',
+        'objective': 'Old saved subtask',
+        'dependencies': <String>[],
+        'criteria': <String>['criterion'],
+      });
+      final audit = ActionAudit.fromJson({
+        'sequence': 1,
+        'action': 'read_screen',
+        'phase': 'after',
+        'timestamp': '2025-01-01T00:00:00.000',
+        'mutation': false,
+        'technicalSuccess': true,
+        'revision': 0,
+      });
+
+      expect(subtask.status, TaskSubtaskStatus.pending);
+      expect(subtask.attempts, 0);
+      expect(audit.subtaskId, isNull);
     });
   });
 }

@@ -1,24 +1,73 @@
 /// Durable execution metadata deliberately excludes tool arguments and output.
+enum TaskSubtaskStatus {
+  pending,
+  inProgress,
+  completed,
+  failed,
+  blocked,
+  needsReview,
+}
+
 class TaskSubtask {
   final String id;
   final String objective;
   final List<String> dependencies;
   final List<String> criteria;
   final Map<String, List<String>> evidenceRefs;
+  final TaskSubtaskStatus status;
+  final int attempts;
+  final String? failureCode;
 
-  const TaskSubtask({required this.id, required this.objective,
-    this.dependencies = const [], this.criteria = const [],
-    this.evidenceRefs = const {}});
+  const TaskSubtask({
+    required this.id,
+    required this.objective,
+    this.dependencies = const [],
+    this.criteria = const [],
+    this.evidenceRefs = const {},
+    this.status = TaskSubtaskStatus.pending,
+    this.attempts = 0,
+    this.failureCode,
+  });
+
+  TaskSubtask copyWith({
+    List<String>? dependencies,
+    List<String>? criteria,
+    Map<String, List<String>>? evidenceRefs,
+    TaskSubtaskStatus? status,
+    int? attempts,
+    String? failureCode,
+    bool clearFailureCode = false,
+  }) => TaskSubtask(
+    id: id,
+    objective: objective,
+    dependencies: dependencies ?? this.dependencies,
+    criteria: criteria ?? this.criteria,
+    evidenceRefs: evidenceRefs ?? this.evidenceRefs,
+    status: status ?? this.status,
+    attempts: attempts ?? this.attempts,
+    failureCode: clearFailureCode ? null : failureCode ?? this.failureCode,
+  );
 
   Map<String, dynamic> toJson() => {'id': id, 'objective': objective,
-    'dependencies': dependencies, 'criteria': criteria, 'evidenceRefs': evidenceRefs};
+    'dependencies': dependencies, 'criteria': criteria, 'evidenceRefs': evidenceRefs,
+    'status': status.name, 'attempts': attempts, 'failureCode': failureCode};
+
+  static TaskSubtaskStatus _statusFromJson(Object? value) =>
+      TaskSubtaskStatus.values.firstWhere(
+        (status) => status.name == value,
+        orElse: () => TaskSubtaskStatus.pending,
+      );
 
   factory TaskSubtask.fromJson(Map<String, dynamic> j) => TaskSubtask(
     id: j['id'] as String, objective: j['objective'] as String,
     dependencies: List<String>.from(j['dependencies'] ?? []),
     criteria: List<String>.from(j['criteria'] ?? []),
     evidenceRefs: (j['evidenceRefs'] as Map? ?? {}).map((k, v) =>
-      MapEntry(k as String, List<String>.from(v))));
+      MapEntry(k as String, List<String>.from(v))),
+    status: _statusFromJson(j['status']),
+    attempts: (j['attempts'] as num?)?.toInt() ?? 0,
+    failureCode: j['failureCode'] as String?,
+  );
 }
 
 class ActionAudit {
@@ -30,20 +79,22 @@ class ActionAudit {
   final bool technicalSuccess;
   final int revision;
   final String outcome;
+  final String? subtaskId;
   const ActionAudit({required this.sequence, required this.action,
     required this.phase, required this.timestamp, required this.mutation,
     required this.revision, this.technicalSuccess = false,
-    this.outcome = 'unverified'});
+    this.outcome = 'unverified', this.subtaskId});
   String get evidenceId => 'action-$sequence';
   Map<String, dynamic> toJson() => {'sequence': sequence, 'action': action,
     'phase': phase, 'timestamp': timestamp.toIso8601String(),
     'mutation': mutation, 'technicalSuccess': technicalSuccess,
-    'revision': revision, 'outcome': outcome};
+    'revision': revision, 'outcome': outcome, 'subtaskId': subtaskId};
   factory ActionAudit.fromJson(Map<String, dynamic> j) => ActionAudit(
     sequence: j['sequence'] as int, action: j['action'] as String,
     phase: j['phase'] as String, timestamp: DateTime.parse(j['timestamp']),
     mutation: j['mutation'] == true, technicalSuccess: j['technicalSuccess'] == true,
-    revision: j['revision'] as int? ?? 0, outcome: j['outcome'] ?? 'unverified');
+    revision: j['revision'] as int? ?? 0, outcome: j['outcome'] ?? 'unverified',
+    subtaskId: j['subtaskId'] as String?);
 }
 
 class CriterionConfirmation {

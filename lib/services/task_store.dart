@@ -51,9 +51,12 @@ class TaskStore {
           await _write(records);
           throw StateError('Uncertain side effect: review and resolve the pending action before resuming');
         }
+        final resumedExecution = _prepareResume(
+          _revised(current, goal).copyWith(clearInFlight: true),
+        );
         final claimed = current.copyWith(
           goal: goal,
-          execution: _revised(current, goal).copyWith(clearInFlight: true),
+          execution: resumedExecution,
           status: TaskStatus.running,
           stepsCompleted: goal == current.goal ? current.stepsCompleted : 0,
           progress: goal == current.goal ? current.progress : 0,
@@ -214,6 +217,7 @@ class TaskStore {
                     mutation: pending.mutation,
                     revision: pending.revision,
                     technicalSuccess: false,
+                    subtaskId: pending.subtaskId,
                   ),
                   audit: _append(
                     record.execution.audit,
@@ -225,6 +229,7 @@ class TaskStore {
                       mutation: pending.mutation,
                       revision: pending.revision,
                       technicalSuccess: false,
+                      subtaskId: pending.subtaskId,
                     ),
                   ),
                   unverifiedMutations: pending.mutation
@@ -288,9 +293,82 @@ class TaskStore {
     return next.length <= 200 ? next : next.sublist(next.length - 200);
   }
 
+  TaskExecutionState _prepareResume(TaskExecutionState state) {
+    var plan = state.plan
+        .map((subtask) => subtask.status == TaskSubtaskStatus.failed
+            ? subtask.copyWith(
+                status: TaskSubtaskStatus.pending,
+                clearFailureCode: true,
+              )
+            : subtask)
+        .toList();
+    final unresolvedEvents = state.audit
+        .where((event) =>
+            event.mutation &&
+            state.unverifiedMutations.contains(event.sequence))
+        .toList();
+    for (final event in unresolvedEvents) {
+      if (event.subtaskId == null) continue;
+      plan = plan
+          .map((subtask) => subtask.id == event.subtaskId
+              ? subtask.copyWith(
+                  status: TaskSubtaskStatus.needsReview,
+                  failureCode: event.phase == 'uncertain'
+                      ? 'uncertain_outcome'
+                      : 'mutation_outcome_unverified',
+                )
+              : subtask)
+          .toList();
+    }
+    final hasLegacyUncertainMutation =
+        unresolvedEvents.any((event) => event.subtaskId == null);
+    if (hasLegacyUncertainMutation &&
+        plan.isNotEmpty &&
+        plan.every((subtask) =>
+            subtask.attempts == 0 &&
+            subtask.status == TaskSubtaskStatus.pending)) {
+      plan[0] = plan[0].copyWith(
+        status: TaskSubtaskStatus.needsReview,
+        failureCode: 'uncertain_outcome',
+      );
+    }
+    return state.copyWith(plan: _refreshSubtaskDependencies(plan));
+  }
+
+  List<TaskSubtask> _refreshSubtaskDependencies(List<TaskSubtask> plan) {
+    var updated = List<TaskSubtask>.from(plan);
+    for (var index = 0; index < updated.length; index++) {
+      final subtask = updated[index];
+      if (subtask.status == TaskSubtaskStatus.completed) continue;
+      final dependencies = updated
+          .where((candidate) => subtask.dependencies.contains(candidate.id))
+          .toList();
+      final hasBlockedDependency = dependencies.any((dependency) =>
+          const {
+            TaskSubtaskStatus.failed,
+            TaskSubtaskStatus.blocked,
+            TaskSubtaskStatus.needsReview,
+          }.contains(dependency.status));
+      if (hasBlockedDependency) {
+        updated[index] = subtask.copyWith(
+          status: TaskSubtaskStatus.blocked,
+          failureCode: 'dependency_failed',
+        );
+      } else if (subtask.status == TaskSubtaskStatus.blocked &&
+          dependencies.every((dependency) =>
+              dependency.status == TaskSubtaskStatus.completed)) {
+        updated[index] = subtask.copyWith(
+          status: TaskSubtaskStatus.pending,
+          clearFailureCode: true,
+        );
+      }
+    }
+    return updated;
+  }
+
   /// Caller must await this durable checkpoint BEFORE invoking a tool.
   Future<TaskRecord> beginAction(String id, String action,
-      {required bool mutation}) => _mutate(id, (record) {
+      {required bool mutation, String? subtaskId}) => _mutate(id, (record) {
     final state = record.execution;
     if (record.status != TaskStatus.running || state.inFlight != null) {
       throw StateError('Task not running or action already in flight');
@@ -299,11 +377,63 @@ class TaskStore {
     if (!RegExp(r'^[a-z_]{1,40}$').hasMatch(action)) {
       throw const FormatException('Invalid action name');
     }
+    if (subtaskId != null &&
+        !state.plan.any((subtask) => subtask.id == subtaskId)) {
+      throw const FormatException('Unknown subtask');
+    }
+    final target = subtaskId == null
+        ? null
+        : state.plan.firstWhere((subtask) => subtask.id == subtaskId);
+    if (target != null &&
+        !state.plan
+            .where((subtask) => target.dependencies.contains(subtask.id))
+            .every((dependency) =>
+                dependency.status == TaskSubtaskStatus.completed)) {
+      throw StateError('Subtask dependencies are not complete');
+    }
+    if (target != null &&
+        const {
+          TaskSubtaskStatus.completed,
+          TaskSubtaskStatus.blocked,
+          TaskSubtaskStatus.failed,
+        }.contains(target.status)) {
+      throw StateError('Subtask is not currently runnable');
+    }
+    if (target?.status == TaskSubtaskStatus.needsReview && mutation) {
+      throw StateError('Mutation blocked while subtask outcome needs review');
+    }
+    if (mutation &&
+        state.audit.any((event) =>
+            event.mutation &&
+            event.action == action &&
+            (event.subtaskId == subtaskId || event.subtaskId == null) &&
+            (state.unverifiedMutations.contains(event.sequence) ||
+                event.technicalSuccess ||
+                event.outcome == 'userConfirmed' ||
+                event.outcome == 'observed'))) {
+      throw StateError('Refusing to replay an external mutation');
+    }
     final event = ActionAudit(sequence: state.nextSequence, action: action,
       phase: 'before', timestamp: DateTime.now(), mutation: mutation,
-      revision: state.revision);
-    return record.copyWith(execution: state.copyWith(inFlight: event,
-      nextSequence: state.nextSequence + 1, audit: _append(state.audit, event)));
+      revision: state.revision, subtaskId: subtaskId);
+    final plan = target == null
+        ? state.plan
+        : state.plan.map((subtask) => subtask.id == subtaskId
+            ? subtask.copyWith(
+                status: subtask.status == TaskSubtaskStatus.needsReview
+                    ? null
+                    : TaskSubtaskStatus.inProgress,
+                attempts: subtask.attempts + 1,
+                clearFailureCode:
+                    subtask.status != TaskSubtaskStatus.needsReview,
+              )
+            : subtask).toList();
+    return record.copyWith(execution: state.copyWith(
+      plan: plan,
+      inFlight: event,
+      nextSequence: state.nextSequence + 1,
+      audit: _append(state.audit, event),
+    ));
   });
 
   Future<TaskRecord> endAction(String id, {required bool technicalSuccess,
@@ -315,12 +445,34 @@ class TaskStore {
     final event = ActionAudit(sequence: pending.sequence, action: pending.action,
       phase: uncertain ? 'uncertain' : 'after', timestamp: DateTime.now(),
       mutation: pending.mutation, revision: pending.revision,
-      technicalSuccess: technicalSuccess);
+      technicalSuccess: technicalSuccess, subtaskId: pending.subtaskId);
+    var plan = state.plan.map((subtask) {
+      if (subtask.id != pending.subtaskId) return subtask;
+      if (subtask.status == TaskSubtaskStatus.needsReview &&
+          !pending.mutation) {
+        return subtask;
+      }
+      if (pending.mutation && (uncertain || technicalSuccess)) {
+        return subtask.copyWith(
+          status: TaskSubtaskStatus.needsReview,
+          failureCode: uncertain
+              ? 'uncertain_outcome'
+              : 'mutation_outcome_unverified',
+        );
+      }
+      return subtask.copyWith(
+        status: TaskSubtaskStatus.inProgress,
+        failureCode: technicalSuccess ? null : 'tool_failed',
+        clearFailureCode: technicalSuccess,
+      );
+    }).toList();
+    plan = _refreshSubtaskDependencies(plan);
     return record.copyWith(
       status: uncertain && pending.mutation && !continueAfterUncertain
           ? TaskStatus.needsRevision
           : null,
       execution: state.copyWith(
+        plan: plan,
         clearInFlight:
             !uncertain || !pending.mutation || continueAfterUncertain,
         unverifiedMutations: pending.mutation && (technicalSuccess || uncertain)
@@ -375,11 +527,22 @@ class TaskStore {
     final event = ActionAudit(sequence: pending.sequence, action: pending.action,
       phase: 'after', timestamp: DateTime.now(), mutation: pending.mutation,
       revision: pending.revision, technicalSuccess: userConfirmedSuccess,
+      subtaskId: pending.subtaskId,
       outcome: userConfirmedSuccess
           ? 'userConfirmed'
           : 'userConfirmedFailure');
+    final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
+      if (subtask.id != pending.subtaskId) return subtask;
+      return subtask.copyWith(
+        status: userConfirmedSuccess
+            ? TaskSubtaskStatus.inProgress
+            : TaskSubtaskStatus.pending,
+        failureCode: userConfirmedSuccess ? null : 'tool_failed',
+        clearFailureCode: userConfirmedSuccess,
+      );
+    }).toList());
     return record.copyWith(status: TaskStatus.needsRevision,
-      execution: state.copyWith(clearInFlight: true, lastResult: event,
+      execution: state.copyWith(plan: plan, clearInFlight: true, lastResult: event,
         unverifiedMutations: state.unverifiedMutations
             .where((s) => s != pending.sequence).toList(),
         audit: _append(state.audit, event), verification: 'unverified'));
@@ -408,13 +571,25 @@ class TaskStore {
       mutation: true,
       revision: event.revision,
       technicalSuccess: userConfirmedSuccess,
+      subtaskId: event.subtaskId,
       outcome: userConfirmedSuccess
           ? 'userConfirmed'
           : 'userConfirmedFailure',
     );
+    final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
+      if (subtask.id != event.subtaskId) return subtask;
+      return subtask.copyWith(
+        status: userConfirmedSuccess
+            ? TaskSubtaskStatus.inProgress
+            : TaskSubtaskStatus.pending,
+        failureCode: userConfirmedSuccess ? null : 'tool_failed',
+        clearFailureCode: userConfirmedSuccess,
+      );
+    }).toList());
     return record.copyWith(
       status: TaskStatus.needsRevision,
       execution: state.copyWith(
+        plan: plan,
         lastResult: resolved,
         audit: _append(state.audit, resolved),
         unverifiedMutations: state.unverifiedMutations
@@ -435,8 +610,17 @@ class TaskStore {
         e.phase == 'after' && e.technicalSuccess);
     final confirmed = ActionAudit(sequence: event.sequence, action: event.action,
       phase: 'after', timestamp: DateTime.now(), mutation: event.mutation,
-      revision: event.revision, technicalSuccess: true, outcome: 'userConfirmed');
+      revision: event.revision, technicalSuccess: true, outcome: 'userConfirmed',
+      subtaskId: event.subtaskId);
+    final plan = _refreshSubtaskDependencies(state.plan.map((subtask) {
+      if (subtask.id != event.subtaskId || !event.mutation) return subtask;
+      return subtask.copyWith(
+        status: TaskSubtaskStatus.inProgress,
+        clearFailureCode: true,
+      );
+    }).toList());
     return record.copyWith(execution: state.copyWith(
+      plan: plan,
       audit: _append(state.audit, confirmed), lastResult: confirmed,
       unverifiedMutations: state.unverifiedMutations.where((s) => s != sequence).toList()));
   });
@@ -445,8 +629,12 @@ class TaskStore {
       _mutate(id, (record) {
     TaskVerifier.validatePlan(plan);
     if (record.execution.inFlight != null) throw StateError('Action in flight');
-    final clean = plan.map((s) => TaskSubtask(id: s.id, objective: s.objective,
-      dependencies: s.dependencies, criteria: s.criteria)).toList();
+    final clean = plan.map((s) => TaskSubtask(
+      id: s.id,
+      objective: s.objective,
+      dependencies: s.dependencies,
+      criteria: s.criteria,
+    )).toList();
     return record.copyWith(execution: record.execution.copyWith(
       revisions: [...record.execution.revisions, record.goal],
       criterionConfirmations: const [],
@@ -457,11 +645,111 @@ class TaskStore {
       Map<String, Map<String, List<String>>> references) => _mutate(id, (record) {
     final plan = record.execution.plan.map((s) => TaskSubtask(id: s.id,
       objective: s.objective, dependencies: s.dependencies, criteria: s.criteria,
+      status: s.status, attempts: s.attempts, failureCode: s.failureCode,
       evidenceRefs: references[s.id] ?? s.evidenceRefs)).toList();
-    final state = record.execution.copyWith(plan: plan);
+    final initial = record.execution.copyWith(plan: plan);
+    final verifiedIds = TaskVerifier.verifiedSubtaskIds(initial);
+    final updatedPlan = initial.plan.map((subtask) {
+      if (verifiedIds.contains(subtask.id)) {
+        return subtask.copyWith(
+          status: TaskSubtaskStatus.completed,
+          clearFailureCode: true,
+        );
+      }
+      if (subtask.status == TaskSubtaskStatus.completed) {
+        return subtask.copyWith(status: TaskSubtaskStatus.pending);
+      }
+      return subtask;
+    }).toList();
+    final state = initial.copyWith(
+      plan: _refreshSubtaskDependencies(updatedPlan),
+    );
     return record.copyWith(execution:
       state.copyWith(verification: TaskVerifier.verify(state)));
   });
+
+  /// Marks a subtask exhausted only after the planner has declared that no
+  /// safe strategy remains. Reasons are fixed metadata codes, not model prose.
+  Future<TaskRecord> markSubtaskFailed(
+    String id, {
+    required String subtaskId,
+    required String failureCode,
+    required List<String> attemptedStrategies,
+    required List<String> remainingStrategies,
+  }) => _mutate(id, (record) {
+    if (!const {
+      'strategies_exhausted',
+      'tool_failed',
+      'permission_required',
+      'service_unavailable',
+      'invalid_response',
+    }.contains(failureCode)) {
+      throw const FormatException('Invalid subtask failure code');
+    }
+    final state = record.execution;
+    if (record.status != TaskStatus.running || state.inFlight != null) {
+      throw StateError('Task is not ready to update a subtask');
+    }
+    if (attemptedStrategies.isEmpty ||
+        remainingStrategies.isNotEmpty ||
+        attemptedStrategies.any(
+          (action) => !RegExp(r'^[a-z_]{1,40}$').hasMatch(action),
+        )) {
+      throw const FormatException('Subtask strategies are not exhausted');
+    }
+    final failedActions = state.audit
+        .where((event) =>
+            event.subtaskId == subtaskId &&
+            event.phase != 'before' &&
+            !event.technicalSuccess)
+        .map((event) => event.action)
+        .toSet();
+    if (!failedActions.containsAll(attemptedStrategies.toSet())) {
+      throw const FormatException('Subtask failure lacks failed action evidence');
+    }
+    final exists = state.plan.any((subtask) => subtask.id == subtaskId);
+    if (!exists) throw const FormatException('Unknown subtask');
+    var plan = state.plan.map((subtask) {
+      if (subtask.id != subtaskId) return subtask;
+      if (const {
+        TaskSubtaskStatus.completed,
+        TaskSubtaskStatus.blocked,
+        TaskSubtaskStatus.needsReview,
+      }.contains(subtask.status)) {
+        throw StateError('Subtask cannot be marked failed in its current state');
+      }
+      return subtask.copyWith(
+        status: TaskSubtaskStatus.failed,
+        failureCode: failureCode,
+      );
+    }).toList();
+    plan = _refreshSubtaskDependencies(plan);
+    return record.copyWith(
+      execution: state.copyWith(plan: plan, verification: 'partial'),
+    );
+  });
+
+  Future<String?> runnableSubtaskId(String id) {
+    // This is a read-only helper; execution writes still validate the target
+    // transactionally in beginAction.
+    return _serialized(() async {
+      final record = (await _read()).where((item) => item.identifier == id);
+      if (record.isEmpty) return null;
+      final plan = record.first.execution.plan;
+      for (final subtask in plan) {
+        if ((subtask.status == TaskSubtaskStatus.pending ||
+                subtask.status == TaskSubtaskStatus.inProgress) &&
+            plan
+                .where((candidate) =>
+                    subtask.dependencies.contains(candidate.id))
+                .every((dependency) =>
+                    dependency.status == TaskSubtaskStatus.completed)) {
+          return subtask.id;
+        }
+      }
+      return null;
+    });
+  }
 
   /// Trusted UI ONLY, never an AI tool. Pass the revision shown to the user;
   /// a stale dialog cannot attest to a subsequently changed criterion.

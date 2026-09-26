@@ -17,11 +17,13 @@ class ParsedActionResponse {
     required this.action,
     required this.reasoning,
     required this.isComplete,
+    this.subtaskId,
   });
 
   final AgentAction action;
   final String reasoning;
   final bool isComplete;
+  final String? subtaskId;
 }
 
 class AiService {
@@ -427,12 +429,20 @@ Rules:
     if (rawParams is Map) {
       params.addAll(Map<String, dynamic>.from(rawParams));
     }
+    final rawSubtaskId =
+        actionJson['subtask_id'] ??
+        actionJson['subtaskId'] ??
+        (actionName.trim() == 'subtask_failed'
+            ? null
+            : params.remove('subtask_id'));
     const metadataKeys = {
       'action',
       'tool',
       'params',
       'response',
       'reasoning',
+      'subtask_id',
+      'subtaskId',
       'is_complete',
       'isComplete',
       'complete',
@@ -459,6 +469,7 @@ Rules:
           actionJson['is_complete'] == true ||
           actionJson['isComplete'] == true ||
           actionJson['complete'] == true,
+      subtaskId: rawSubtaskId is String ? rawSubtaskId : null,
     );
   }
 

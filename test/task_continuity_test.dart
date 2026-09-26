@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:private_agent/models/task_execution_state.dart';
 import 'package:private_agent/models/task_record.dart';
 import 'package:private_agent/services/task_store.dart';
 import 'package:private_agent/services/task_verifier.dart';
@@ -119,6 +120,87 @@ void main() {
     await store.confirmCriterion('t', expectedRevision: 0, subtaskId: 'goal',
         criterion: 'Find source', confirmed: true);
     expect((await store.verifyCompletion('t', refs)).execution.verification, 'verified');
+  });
+
+  test('mutation review blocks only dependents and preserves status on resume',
+      () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'changed',
+        objective: 'Apply the requested change',
+        criteria: ['change is present'],
+      ),
+      TaskSubtask(
+        id: 'followup',
+        objective: 'Use the changed state',
+        dependencies: ['changed'],
+        criteria: ['follow-up is complete'],
+      ),
+      TaskSubtask(
+        id: 'independent',
+        objective: 'Complete independent work',
+        criteria: ['independent work is complete'],
+      ),
+    ]);
+    await store.beginAction(
+      't',
+      'write_file',
+      mutation: true,
+      subtaskId: 'changed',
+    );
+    await store.endAction('t', technicalSuccess: true);
+
+    final refs = {
+      'changed': {
+        'change is present': ['action-1'],
+      },
+    };
+    await store.verifyCompletion('t', refs);
+    var record = (await store.get('t'))!;
+    var subtasks = {
+      for (final item in record.execution.plan) item.id: item,
+    };
+    expect(subtasks['changed']!.status, TaskSubtaskStatus.needsReview);
+    expect(subtasks['followup']!.status, TaskSubtaskStatus.blocked);
+    expect(subtasks['independent']!.status, TaskSubtaskStatus.pending);
+
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.claim('t', 'Find source');
+    record = (await store.get('t'))!;
+    subtasks = {
+      for (final item in record.execution.plan) item.id: item,
+    };
+    expect(subtasks['changed']!.status, TaskSubtaskStatus.needsReview);
+    expect(subtasks['followup']!.status, TaskSubtaskStatus.blocked);
+    expect(subtasks['independent']!.status, TaskSubtaskStatus.pending);
+
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.confirmActionOutcome('t', 1);
+    await store.update('t', status: TaskStatus.running);
+    expect(
+      store.beginAction(
+        't',
+        'write_file',
+        mutation: true,
+        subtaskId: 'changed',
+      ),
+      throwsStateError,
+    );
+    await store.update('t', status: TaskStatus.needsRevision);
+    await store.confirmCriterion(
+      't',
+      expectedRevision: record.execution.revision,
+      subtaskId: 'changed',
+      criterion: 'change is present',
+      confirmed: true,
+    );
+    record = await store.verifyCompletion('t', refs);
+    subtasks = {
+      for (final item in record.execution.plan) item.id: item,
+    };
+    expect(subtasks['changed']!.status, TaskSubtaskStatus.completed);
+    expect(subtasks['followup']!.status, TaskSubtaskStatus.pending);
+    expect(subtasks['independent']!.status, TaskSubtaskStatus.pending);
   });
 
   test('revision preserves original goal and invalidates old evidence', () async {

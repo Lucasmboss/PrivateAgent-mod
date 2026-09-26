@@ -60,6 +60,18 @@ class TaskPersistencePrivacy {
       'criteria': s.criteria.map(goalText).toList(),
       'evidenceRefs': s.evidenceRefs.map((key, refs) => MapEntry(goalText(key),
         refs.where((r) => RegExp(r'^action-\d+$').hasMatch(r)).take(200).toList())),
+      'status': s.status.name,
+      'attempts': s.attempts.clamp(0, 1000),
+      'failureCode': const {
+        'tool_failed',
+        'uncertain_outcome',
+        'mutation_outcome_unverified',
+        'strategies_exhausted',
+        'permission_required',
+        'service_unavailable',
+        'invalid_response',
+        'dependency_failed',
+      }.contains(s.failureCode) ? s.failureCode : null,
     }).toList();
     state['criterionConfirmations'] = record.execution.criterionConfirmations.map((c) => {
       ...c.toJson(), 'subtaskId': goalText(c.subtaskId), 'criterion': goalText(c.criterion),
@@ -75,6 +87,10 @@ class TaskPersistencePrivacy {
         'observed',
       }.contains(e.outcome)
           ? e.outcome : 'unverified',
+      'subtaskId': e.subtaskId != null &&
+              RegExp(r'^[A-Za-z0-9_-]{1,80}$').hasMatch(e.subtaskId!)
+          ? e.subtaskId
+          : null,
     };
     final entries = record.execution.audit;
     state['audit'] = entries.skip(entries.length > 200 ? entries.length - 200 : 0)
