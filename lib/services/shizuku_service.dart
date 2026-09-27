@@ -86,6 +86,62 @@ class ShizukuService {
     }
   }
 
+  /// Read-only diagnostic probe. Unlike an interactive shell call, this never
+  /// requests permission and can only query Android's battery status.
+  Future<ShizukuCommandResult> readBatteryForDiagnostics() async {
+    if (!Platform.isAndroid) {
+      return const ShizukuCommandResult(
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        wasDispatched: false,
+        error: 'Battery diagnostics are only available on Android.',
+      );
+    }
+    if (!await checkAvailability()) {
+      return const ShizukuCommandResult(
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        wasDispatched: false,
+        error: 'Shizuku is not running.',
+      );
+    }
+    if (!_hasPermission) {
+      return const ShizukuCommandResult(
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        wasDispatched: false,
+        error: 'Shizuku permission is not available.',
+      );
+    }
+    try {
+      final values = await _commandChannel.invokeMapMethod<dynamic, dynamic>(
+        'runCommandWithStatus',
+        {'command': 'dumpsys battery'},
+      );
+      if (values == null) {
+        return const ShizukuCommandResult(
+          stdout: '',
+          stderr: '',
+          exitCode: null,
+          wasDispatched: true,
+          error: 'The native command adapter returned no result.',
+        );
+      }
+      return ShizukuCommandResult.fromPlatformMap(values);
+    } catch (_) {
+      return const ShizukuCommandResult(
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        wasDispatched: true,
+        error: 'The battery status probe failed.',
+      );
+    }
+  }
+
   /// Request Shizuku permission
   Future<bool> requestPermission() async {
     if (!_isAvailable) return false;

@@ -9,6 +9,8 @@ import 'task_verifier.dart';
 import 'task_persistence_privacy.dart';
 
 class TaskStore {
+  static const int maxSubtaskRetries = 2;
+
   final Directory? directory;
   final Future<Directory> Function()? directoryProvider;
   final String fileName;
@@ -335,9 +337,12 @@ class TaskStore {
 
   TaskExecutionState _prepareResume(TaskExecutionState state) {
     var plan = state.plan
-        .map((subtask) => subtask.status == TaskSubtaskStatus.failed
+        .map((subtask) =>
+            subtask.status == TaskSubtaskStatus.failed &&
+                subtask.retriesUsed < maxSubtaskRetries
             ? subtask.copyWith(
                 status: TaskSubtaskStatus.pending,
+                retriesUsed: subtask.retriesUsed + 1,
                 clearFailureCode: true,
               )
             : subtask)
@@ -391,6 +396,7 @@ class TaskStore {
         updated[index] = subtask.copyWith(
           status: TaskSubtaskStatus.blocked,
           failureCode: 'dependency_failed',
+          clearReusableSummary: true,
         );
       } else if (subtask.status == TaskSubtaskStatus.blocked &&
           dependencies.every((dependency) =>
@@ -734,12 +740,54 @@ class TaskStore {
       _mutate(id, (record) {
     TaskVerifier.validatePlan(plan);
     if (record.execution.inFlight != null) throw StateError('Action in flight');
-    final clean = plan.map((s) => TaskSubtask(
-      id: s.id,
-      objective: s.objective,
-      dependencies: s.dependencies,
-      criteria: s.criteria,
-    )).toList();
+    bool sameList(List<String> left, List<String> right) =>
+        left.length == right.length &&
+        left.asMap().entries.every(
+          (entry) => entry.value == right[entry.key],
+        );
+    final previousById = {
+      for (final previous in record.execution.plan) previous.id: previous,
+    };
+    final invalidated = <String>{};
+    for (final proposed in plan) {
+      final previous = previousById[proposed.id];
+      if (previous == null ||
+          previous.objective != proposed.objective ||
+          !sameList(previous.dependencies, proposed.dependencies) ||
+          !sameList(previous.criteria, proposed.criteria) ||
+          proposed.dependencies.any(invalidated.contains)) {
+        invalidated.add(proposed.id);
+      }
+    }
+    final clean = plan.map((proposed) {
+      final previous = previousById[proposed.id];
+      final keepWork =
+          previous != null && !invalidated.contains(proposed.id);
+      final keepSummary = previous != null &&
+          keepWork &&
+          TaskVerifier.hasFreshReusableSummary(
+            record.execution,
+            previous,
+          );
+      return TaskSubtask(
+        id: proposed.id,
+        objective: proposed.objective,
+        dependencies: proposed.dependencies,
+        criteria: proposed.criteria,
+        evidenceRefs: keepWork
+            ? previous?.evidenceRefs ?? const <String, List<String>>{}
+            : const <String, List<String>>{},
+        reusableSummary: keepSummary ? previous?.reusableSummary : null,
+        summaryEvidenceRefs: keepSummary
+            ? previous?.summaryEvidenceRefs ?? const <String>[]
+            : const <String>[],
+        summaryRevision: keepSummary ? previous?.summaryRevision : null,
+        summaryCapturedAt: keepSummary ? previous?.summaryCapturedAt : null,
+        summaryFreshUntil: keepSummary ? previous?.summaryFreshUntil : null,
+        attempts: keepWork ? previous?.attempts ?? 0 : 0,
+        retriesUsed: keepWork ? previous?.retriesUsed ?? 0 : 0,
+      );
+    }).toList();
     return record.copyWith(execution: record.execution.copyWith(
       revisions: [...record.execution.revisions, record.goal],
       criterionConfirmations: const [],
@@ -747,11 +795,19 @@ class TaskStore {
   });
 
   Future<TaskRecord> verifyCompletion(String id,
-      Map<String, Map<String, List<String>>> references) => _mutate(id, (record) {
+      Map<String, Map<String, List<String>>> references, {
+      Map<String, String> resultSummaries = const {},
+    }) => _mutate(id, (record) {
     final plan = record.execution.plan.map((s) => TaskSubtask(id: s.id,
       objective: s.objective, dependencies: s.dependencies, criteria: s.criteria,
       status: s.status, attempts: s.attempts, failureCode: s.failureCode,
-      evidenceRefs: references[s.id] ?? s.evidenceRefs)).toList();
+      retriesUsed: s.retriesUsed,
+      evidenceRefs: references[s.id] ?? s.evidenceRefs,
+      reusableSummary: s.reusableSummary,
+      summaryEvidenceRefs: s.summaryEvidenceRefs,
+      summaryRevision: s.summaryRevision,
+      summaryCapturedAt: s.summaryCapturedAt,
+      summaryFreshUntil: s.summaryFreshUntil)).toList();
     final initial = record.execution.copyWith(plan: plan);
 
     final verifiedIds = TaskVerifier.verifiedSubtaskIds(initial);
@@ -759,22 +815,58 @@ class TaskStore {
         TaskVerifier.hasUnscopedUnresolvedMutation(initial);
     final unresolvedMutationSubtaskIds =
         TaskVerifier.unresolvedMutationSubtaskIds(initial);
+    final capturedAt = DateTime.now();
     final updatedPlan = initial.plan.map((subtask) {
       if (hasUnscopedUnresolvedMutation ||
           unresolvedMutationSubtaskIds.contains(subtask.id)) {
         return subtask.copyWith(
           status: TaskSubtaskStatus.needsReview,
           failureCode: 'mutation_outcome_unverified',
+          clearReusableSummary: true,
         );
       }
       if (verifiedIds.contains(subtask.id)) {
+        final suppliedSummary = resultSummaries[subtask.id];
+        final safeSummary = suppliedSummary == null
+            ? null
+            : TaskPersistencePrivacy.reusableSummaryText(suppliedSummary);
+        final refs = subtask.evidenceRefs.values
+            .expand((criterionRefs) => criterionRefs)
+            .toSet()
+            .toList()
+          ..sort();
+        if (safeSummary != null && safeSummary.isNotEmpty) {
+          return subtask.copyWith(
+            status: TaskSubtaskStatus.completed,
+            clearFailureCode: true,
+            reusableSummary: safeSummary,
+            summaryEvidenceRefs: refs,
+            summaryRevision: initial.revision,
+            summaryCapturedAt: capturedAt,
+            summaryFreshUntil: capturedAt.add(const Duration(days: 7)),
+          );
+        }
+        if (!TaskVerifier.hasFreshReusableSummary(
+          initial,
+          subtask,
+          now: capturedAt,
+        )) {
+          return subtask.copyWith(
+            status: TaskSubtaskStatus.completed,
+            clearFailureCode: true,
+            clearReusableSummary: true,
+          );
+        }
         return subtask.copyWith(
           status: TaskSubtaskStatus.completed,
           clearFailureCode: true,
         );
       }
       if (subtask.status == TaskSubtaskStatus.completed) {
-        return subtask.copyWith(status: TaskSubtaskStatus.pending);
+        return subtask.copyWith(
+          status: TaskSubtaskStatus.pending,
+          clearReusableSummary: true,
+        );
       }
       return subtask;
     }).toList();
@@ -838,6 +930,7 @@ class TaskStore {
       return subtask.copyWith(
         status: TaskSubtaskStatus.failed,
         failureCode: failureCode,
+        clearReusableSummary: true,
       );
     }).toList();
     plan = _refreshSubtaskDependencies(plan);
@@ -877,6 +970,7 @@ class TaskStore {
 
     bool isSafeFailedSubtask(TaskSubtask subtask) {
       if (subtask.status != TaskSubtaskStatus.failed ||
+          subtask.retriesUsed >= maxSubtaskRetries ||
           alreadyRetriedSubtaskIds.contains(subtask.id) ||
           hasUnscopedRiskyMutation) {
         return false;
@@ -908,6 +1002,7 @@ class TaskStore {
           (subtask) => retryableIds.contains(subtask.id)
               ? subtask.copyWith(
                   status: TaskSubtaskStatus.pending,
+                  retriesUsed: subtask.retriesUsed + 1,
                   clearFailureCode: true,
                 )
               : subtask,
@@ -953,6 +1048,35 @@ class TaskStore {
       return null;
     });
   }
+
+  /// Atomically consumes one saved automatic planner retry. Explicit resumes
+  /// do not reset this ceiling, so repeated app restarts cannot create a loop.
+  Future<int?> consumeAutomaticRetry(
+    String id, {
+    required int maximum,
+  }) => _serialized(() async {
+    if (maximum <= 0) return null;
+    final records = await _read();
+    final index = records.indexWhere((record) => record.identifier == id);
+    if (index < 0) return null;
+    final record = records[index];
+    if (record.status != TaskStatus.running ||
+        record.execution.inFlight != null ||
+        record.execution.automaticRetryCount >= maximum) {
+      return null;
+    }
+    final nextCount = record.execution.automaticRetryCount + 1;
+    records[index] = TaskPersistencePrivacy.sanitize(
+      record.copyWith(
+        execution: record.execution.copyWith(
+          automaticRetryCount: nextCount,
+        ),
+        updatedAt: DateTime.now(),
+      ),
+    );
+    await _write(records);
+    return nextCount;
+  });
 
   /// Trusted UI ONLY, never an AI tool. Pass the revision shown to the user;
   /// a stale dialog cannot attest to a subsequently changed criterion.

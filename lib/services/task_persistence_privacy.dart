@@ -9,6 +9,30 @@ class TaskPersistencePrivacy {
     return _credentials(text);
   }
 
+  /// A planning hint only, never proof. It is aggressively bounded and
+  /// removes common identifiers before it can be written to task history.
+  static String reusableSummaryText(String value) {
+    var text = goalText(value).replaceAll(RegExp(r'\s+'), ' ').trim();
+    text = text.replaceAll(
+      RegExp(
+        r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+        caseSensitive: false,
+      ),
+      '[email omitted]',
+    );
+    text = text.replaceAll(
+      RegExp(r'(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)'),
+      '[phone omitted]',
+    );
+    text = text.replaceAll(
+      RegExp(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+      '[address omitted]',
+    );
+    return text.length > 600
+        ? '${text.substring(0, 600)} [truncated]'
+        : text;
+  }
+
   static String _credentials(String text) {
     text = text.replaceAll(RegExp(
       r'''(?:bearer|basic)\s+[a-z0-9+/=_\-.]+''', caseSensitive: false),
@@ -60,8 +84,21 @@ class TaskPersistencePrivacy {
       'criteria': s.criteria.map(goalText).toList(),
       'evidenceRefs': s.evidenceRefs.map((key, refs) => MapEntry(goalText(key),
         refs.where((r) => RegExp(r'^action-\d+$').hasMatch(r)).take(200).toList())),
+      'reusableSummary': s.reusableSummary == null
+          ? null
+          : reusableSummaryText(s.reusableSummary!),
+      'summaryEvidenceRefs': s.summaryEvidenceRefs
+          .where((r) => RegExp(r'^action-\d+$').hasMatch(r))
+          .take(200)
+          .toList(),
+      'summaryRevision': s.summaryRevision == null
+          ? null
+          : s.summaryRevision!.clamp(0, 1000000),
+      'summaryCapturedAt': s.summaryCapturedAt?.toIso8601String(),
+      'summaryFreshUntil': s.summaryFreshUntil?.toIso8601String(),
       'status': s.status.name,
       'attempts': s.attempts.clamp(0, 1000),
+      'retriesUsed': s.retriesUsed.clamp(0, 1000),
       'failureCode': const {
         'tool_failed',
         'uncertain_outcome',
@@ -99,6 +136,8 @@ class TaskPersistencePrivacy {
     state['lastResult'] = record.execution.lastResult == null ? null : audit(record.execution.lastResult!);
     state['verification'] = {'verified', 'unverified', 'partial', 'uncertain'}
         .contains(record.execution.verification) ? record.execution.verification : 'unverified';
+    state['automaticRetryCount'] =
+        record.execution.automaticRetryCount.clamp(0, 1000);
     json['execution'] = state;
     final sessionId = record.chatSessionId;
     json['chatSessionId'] = sessionId != null &&

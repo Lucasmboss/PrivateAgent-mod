@@ -1,12 +1,11 @@
-import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../models/task_record.dart';
 import '../services/task_history_logger.dart';
 import '../services/task_store.dart';
+import '../services/task_progress_summary.dart';
 import '../widgets/task_execution_details.dart';
 
 class TaskHistoryScreen extends StatefulWidget {
@@ -129,25 +128,18 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
     final uncertain =
         (pending?.sequence == reviewSequence && pending!.mutation) ||
         auditEvent.phase == 'uncertain';
-    final id = pending?.sequence == reviewSequence
-        ? pending!.evidenceId
-        : auditEvent.evidenceId;
     final decision = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        title: Text('Independent review: $id'),
+        title: const Text('Review possible external change'),
         content: SingleChildScrollView(child: Text(
-          'You must independently verify the effects in the destination app, '
-          'file, or service before confirming. A tool success message or an AI '
-          'claim is not proof of the intended outcome.\n\n'
-          'This review does not undo external state. Confirm success only after '
-          'you independently verify the intended effect. For a mutation, mark '
-          'failure only after verifying that the intended effect did not occur; '
-          'a confirmed failure may allow a new safe attempt. An unresolved or '
-          'successful mutation is never replayed. If unsure, keep it unresolved.\n\n'
-          'This records your attestation, not independent automated verification '
-          'of the entire goal.',
+          'Check the destination app, file, or service before deciding what '
+          'happened. A successful tool response or AI claim is not proof.\n\n'
+          'This review does not undo an external change. Confirm success only '
+          'after you independently verify it. For an external action, mark '
+          'failure only if you verify that it did not occur. Unresolved or '
+          'successful actions are never replayed. If unsure, keep it unresolved.',
         )),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context),
@@ -197,20 +189,18 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
 
   Future<void> _reviewCriterion(TaskRecord record, TaskSubtask subtask,
       String criterion, bool confirmed) async {
-    final refs = subtask.evidenceRefs[criterion] ?? const <String>[];
     final approved = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(confirmed ? 'Independently verify criterion' : 'Revoke criterion confirmation?'),
         content: SingleChildScrollView(child: SelectableText(
-          'Task: ${record.goal}\nRevision: ${record.execution.revision}\n'
-          'Subtask: ${subtask.id} — ${subtask.objective}\n'
-          'Exact criterion: $criterion\n'
-          'Supporting audit IDs: ${refs.isEmpty ? 'None recorded' : refs.join(', ')}\n\n'
-          'Audit IDs and tool success do not establish that this criterion is met. '
+          'Task: ${record.goal}\n'
+          'Step: ${subtask.objective}\n'
+          'Criterion: $criterion\n\n'
+          'Tool success does not establish that this criterion is met. '
           'You must independently verify the actual effects in the destination '
           'app, file, or service. Do not rely on an AI claim.\n\n'
-          '${confirmed ? 'Confirm only this exact criterion for this revision if you personally verified it. If unsure, cancel.' : 'Revoking removes your attestation and requires verification again. It does not undo any external effects.'}',
+          '${confirmed ? 'Confirm only this criterion if you personally verified it. If unsure, cancel.' : 'Revoking removes your confirmation and requires verification again. It does not undo any external effects.'}',
         )),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false),
@@ -278,20 +268,6 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
     });
   }
 
-  Future<void> _copy(TaskRecord record) async {
-    try {
-      await Clipboard.setData(ClipboardData(text: const JsonEncoder.withIndent('  ')
-          .convert({'taskId': record.identifier, 'goal': record.goal,
-            'originalGoal': record.originalGoal, 'execution': record.execution.toJson()})));
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Plan and evidence metadata copied')));
-      }
-    } catch (error) {
-      if (mounted) setState(() => _error = 'Could not copy evidence: $error');
-    }
-  }
-
   String _date(DateTime date) => DateFormat('MMM d, y h:mm a').format(date);
 
   @override
@@ -319,19 +295,23 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
         child: ListView(padding: const EdgeInsets.all(16),
           physics: const AlwaysScrollableScrollPhysics(),
           children: [
-            Text('Saved tasks (${_records.length})',
+             Text('Saved tasks (${_records.length})',
                 style: Theme.of(context).textTheme.titleLarge),
-            if (!_loading && _records.isEmpty) const Text('No saved tasks.'),
+            if (!_loading && _records.isEmpty)
+              const Text('No saved tasks.'),
             ..._records.map((record) => Card(child: ExpansionTile(
               key: PageStorageKey(record.identifier),
               title: Text(record.goal),
-              subtitle: Text('${record.status.name} • ${_date(record.updatedAt)}'),
+              subtitle: Text(
+                '${TaskProgressSummary.describe(record)}\n'
+                'Updated ${_date(record.updatedAt)}',
+                maxLines: 5,
+                overflow: TextOverflow.ellipsis,
+              ),
               children: [
                 Padding(padding: const EdgeInsets.all(16), child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    SelectableText('Task ${record.identifier}\n'
-                        'Created ${_date(record.createdAt)} • ${record.tokens} tokens'),
                     TaskExecutionDetails(record: record,
                       onReviewCriterion: _busy || _loading ? null :
                           (subtask, criterion, confirmed) =>
@@ -346,22 +326,14 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                     Wrap(spacing: 8, children: [
                       FilledButton(onPressed: _busy || _loading || !_safeToResume(record)
                           ? null : () => _resume(record),
-                          child: const Text('Revise / resume')),
-                      TextButton.icon(onPressed: () => _copy(record),
-                          icon: const Icon(Icons.copy), label: const Text('Copy evidence metadata')),
+                            child: const Text('Review and continue')),
                     ]),
                     if (record.execution.inFlight != null ||
                         record.execution.unverifiedMutations.isNotEmpty)
-                      const Text('Resume is blocked until unresolved actions are reviewed. '
-                          'Stop a running task before reviewing.'),
-                    if (record.results != null) ...[
-                      const Text('Recorded results (not proof of goal completion)'),
-                      SelectableText(record.results.toString()),
-                    ],
-                    if (record.failedStrategies.isNotEmpty) ...[
-                      const Text('Failed strategies'),
-                      ...record.failedStrategies.map((s) => SelectableText(s)),
-                    ],
+                      const Text(
+                        'Any unresolved effect remains protected against automatic replay and '
+                        'will be included in the next combined review.',
+                      ),
                   ],
                 )),
               ],

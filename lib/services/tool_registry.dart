@@ -310,18 +310,28 @@ class ToolRegistry {
       },
     ),
     ToolDefinition(
+      'capability_diagnostic',
+      ToolCapability.orchestration,
+      ToolMutation.readOnly,
+      ToolRisk.low,
+      {},
+    ),
+    ToolDefinition(
       'done',
       ToolCapability.orchestration,
       ToolMutation.readOnly,
       ToolRisk.low,
-      {'evidence': 'evidence'},
+      {
+        'evidence': 'evidence',
+        'result_summaries': 'summary_map',
+      },
     ),
     ToolDefinition(
       'execute_task',
       ToolCapability.orchestration,
       ToolMutation.readOnly,
       ToolRisk.low,
-      {'goal': 'string!', 'resume_task_id': 'string'},
+      {'goal': 'string!'},
     ),
   ];
 
@@ -395,6 +405,15 @@ class ToolRegistry {
                           c.value is List &&
                           (c.value as List).every((r) => r is String),
                     ),
+              ),
+        'summary_map' =>
+          value is Map &&
+              value.entries.every(
+                (entry) =>
+                    entry.key is String &&
+                    entry.key.toString().isNotEmpty &&
+                    entry.value is String &&
+                    (entry.value as String).length <= 1200,
               ),
         _ => false,
       };

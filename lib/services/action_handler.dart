@@ -51,6 +51,8 @@ class ActionHandler {
     String? chatSessionId,
     ToolApprovalCallback? onApproval,
     TaskUserQuestionCallback? onUserQuestion,
+    String? resumeTaskId,
+    String? resumeContext,
   }) async {
     final generation = _stopGeneration;
     try {
@@ -319,7 +321,8 @@ class ActionHandler {
           try {
             result = await _currentExecutor!.executeTask(
               goal,
-              resumeTaskId: action.params['resume_task_id'] as String?,
+              resumeTaskId: resumeTaskId,
+              resumeContext: resumeContext,
             );
             taskSucceeded =
                 _currentExecutor!.lastStatus == TaskStatus.completed;
@@ -334,7 +337,7 @@ class ActionHandler {
             resumableTaskId = _currentExecutor!.lastTaskId;
             await _currentExecutor!.failUnexpected(error);
             result =
-                'Task stopped unexpectedly. Its safe checkpoint is saved in this chat.';
+                'Task stopped unexpectedly. Its saved progress is available in this chat.';
             taskSucceeded = false;
           } finally {
             _currentExecutor = null;

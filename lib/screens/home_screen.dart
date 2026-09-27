@@ -18,9 +18,11 @@ import '../widgets/message_bubble.dart';
 import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
 import '../services/notification_service.dart';
+import '../services/task_progress_summary.dart';
 import 'settings_screen.dart';
 import 'task_history_screen.dart';
 import '../widgets/assistant_quick_panel.dart';
+import '../widgets/resume_task_dialog.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
 import '../config/feature_flags.dart';
@@ -254,6 +256,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     setState(() {
       if (savedMode == 'chat' || savedMode == 'agent') _mode = savedMode!;
     });
+    if (_startupRecoveryQueue.isNotEmpty) {
+      unawaited(_resumeRecoveredTasks());
+    }
+  }
+
+  Future<void> _resumeRecoveredTasks() async {
+    if (_resumingStartupRecovery ||
+        !mounted ||
+        _isLoading ||
+        _isListening ||
+        _startupRecoveryQueue.isEmpty) {
+      return;
+    }
+    _resumingStartupRecovery = true;
+    try {
+      // Interrupted work is surfaced as a summary. It is never auto-resumed:
+      // the user gets a chance to add context or change approach first.
+      _startupRecoveryQueue.clear();
+      await _refreshResumableTasks();
+    } finally {
+      _resumingStartupRecovery = false;
+    }
   }
 
   Future<void> _handleAssistantInvocation() async {
@@ -640,6 +664,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _resumeTask(TaskRecord task) async {
     if (_isLoading) return;
+    final resumeContext = await ResumeTaskDialog.show(context, task);
+    if (resumeContext == null || !mounted) return;
     if (task.chatSessionId != null && task.chatSessionId != _sessionId) {
       final originatingSession = await ChatHistoryService.getSession(
         task.chatSessionId!,
@@ -670,7 +696,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _messages.add(
           ChatMessage(
             role: 'assistant',
-            content: 'Continuing from the saved task checkpoint.',
+            content: 'Continuing saved task progress.',
           ),
         );
       });
@@ -678,12 +704,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final result = await _actionHandler.execute(
         AgentAction(
           action: 'execute_task',
-          params: {'goal': task.goal, 'resume_task_id': task.identifier},
+          params: {'goal': task.goal},
           response: '',
         ),
         aiService: _aiService,
         onUserQuestion: _requestTaskUserAnswer,
         chatSessionId: task.chatSessionId ?? _sessionId,
+        resumeTaskId: task.identifier,
+        resumeContext: resumeContext,
         onProgress: (message) {
           if (mounted) {
             setState(() {
@@ -1212,41 +1240,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
               // Chat content area
               if (_resumableTasks.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-                  child: Column(
+                MaterialBanner(
+                  leading: const Icon(Icons.bookmark_outline_rounded),
+                  content: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      for (final task in _resumableTasks.take(2))
-                        Card(
-                          margin: const EdgeInsets.only(bottom: 6),
-                          child: ListTile(
-                            dense: true,
-                            leading: const Icon(Icons.restore_rounded),
-                            title: Text(
-                              task.goal,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            subtitle: Text(
-                              'Saved checkpoint · ${task.status.name}',
-                            ),
-                            trailing: TextButton(
-                              onPressed: _isLoading
-                                  ? null
-                                  : () => unawaited(_resumeTask(task)),
-                              child: const Text('Resume'),
-                            ),
-                          ),
-                        ),
-                      if (_resumableTasks.length > 2)
-                        TextButton(
-                          onPressed: () => unawaited(_openResumableTasks()),
-                          child: Text(
-                            'View ${_resumableTasks.length - 2} more saved tasks',
-                          ),
-                        ),
+                      Text(
+                        _resumableTasks.first.goal,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        TaskProgressSummary.describe(_resumableTasks.first),
+                        maxLines: 4,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ],
                   ),
+                  actions: [
+                    TextButton(
+                      onPressed: _isLoading
+                          ? null
+                          : () => unawaited(_openResumableTasks()),
+                      child: const Text('View tasks'),
+                    ),
+                    TextButton(
+                      onPressed: _isLoading
+                          ? null
+                          : () => unawaited(
+                              _resumeTask(_resumableTasks.first),
+                            ),
+                      child: const Text('Continue'),
+                    ),
+                  ],
                 ),
               Expanded(
                 child: _messages.isEmpty
@@ -1587,7 +1615,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               color: isDark ? Colors.grey[400] : Colors.grey[600],
               size: 20,
             ),
-            title: Text('Resumable tasks', style: textStyle),
+            title: Text('Saved tasks', style: textStyle),
             onTap: () async {
               Navigator.pop(context);
               final task = await Navigator.push<TaskRecord>(

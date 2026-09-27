@@ -5,6 +5,8 @@ import 'package:private_agent/models/task_execution_state.dart';
 import 'package:private_agent/models/task_record.dart';
 import 'package:private_agent/services/task_store.dart';
 import 'package:private_agent/services/task_verifier.dart';
+import 'package:private_agent/services/task_progress_summary.dart';
+import 'package:private_agent/services/task_persistence_privacy.dart';
 
 void main() {
   late Directory directory;
@@ -297,6 +299,255 @@ void main() {
       'goal': {'Different criterion': ['action-1']}
     });
     expect(result.execution.verification, 'unverified');
+  });
+
+  test('changed work and dependents lose summaries while independent results persist',
+      () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'source',
+        objective: 'Locate the source',
+        criteria: ['Source is located'],
+      ),
+      TaskSubtask(
+        id: 'interpret',
+        objective: 'Interpret the source',
+        dependencies: ['source'],
+        criteria: ['Source is interpreted'],
+      ),
+      TaskSubtask(
+        id: 'independent',
+        objective: 'Check an independent reference',
+        criteria: ['Reference is checked'],
+      ),
+    ]);
+
+    Future<TaskRecord> observeAndVerify({
+      required String subtaskId,
+      required String criterion,
+      required String summary,
+      required int sequence,
+    }) async {
+      await store.beginAction(
+        't',
+        'read_screen',
+        mutation: false,
+        subtaskId: subtaskId,
+      );
+      await store.endAction('t', technicalSuccess: true);
+      return store.verifyCompletion(
+        't',
+        {
+          subtaskId: {
+            criterion: ['action-$sequence'],
+          },
+        },
+        resultSummaries: {subtaskId: summary},
+      );
+    }
+
+    await observeAndVerify(
+      subtaskId: 'source',
+      criterion: 'Source is located',
+      summary: 'The source page is available.',
+      sequence: 1,
+    );
+    await observeAndVerify(
+      subtaskId: 'interpret',
+      criterion: 'Source is interpreted',
+      summary: 'The source gives the requested detail.',
+      sequence: 2,
+    );
+    var record = await observeAndVerify(
+      subtaskId: 'independent',
+      criterion: 'Reference is checked',
+      summary: 'An independent reference is available.',
+      sequence: 3,
+    );
+    expect(
+      TaskVerifier.freshReusableSummaries(record.execution)
+          .map((task) => task.id),
+      containsAll(['source', 'interpret', 'independent']),
+    );
+
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'source',
+        objective: 'Locate a different source',
+        criteria: ['New source is located'],
+      ),
+      TaskSubtask(
+        id: 'interpret',
+        objective: 'Interpret the source',
+        dependencies: ['source'],
+        criteria: ['Source is interpreted'],
+      ),
+      TaskSubtask(
+        id: 'independent',
+        objective: 'Check an independent reference',
+        criteria: ['Reference is checked'],
+      ),
+    ]);
+    record = (await store.get('t'))!;
+    final byId = {
+      for (final task in record.execution.plan) task.id: task,
+    };
+    expect(byId['source']!.reusableSummary, isNull);
+    expect(byId['interpret']!.reusableSummary, isNull);
+    expect(
+      byId['independent']!.reusableSummary,
+      'An independent reference is available.',
+    );
+    expect(
+      TaskVerifier.hasFreshReusableSummary(
+        record.execution,
+        byId['independent']!,
+      ),
+      isTrue,
+    );
+    final progress = TaskProgressSummary.describe(record);
+    expect(progress, contains('Saved result: An independent reference'));
+    expect(progress, isNot(contains('The source page is available')));
+    expect(progress, isNot(contains('The source gives the requested detail')));
+    expect(progress, isNot(contains('action-')));
+    expect(progress, isNot(contains('tool attempt')));
+    expect(progress, isNot(contains('independent:')));
+  });
+
+  test('automatic retry budget persists across task resumes and store reloads',
+      () async {
+    Future<TaskRecord> resume() async {
+      await store.update('t', status: TaskStatus.paused);
+      return store.claim('t', 'Find source');
+    }
+
+    await resume();
+    expect(await store.consumeAutomaticRetry('t', maximum: 2), 1);
+    final afterRestart = TaskStore(directory: directory);
+    await afterRestart.update('t', status: TaskStatus.paused);
+    await afterRestart.claim('t', 'Find source');
+    expect(await afterRestart.consumeAutomaticRetry('t', maximum: 2), 2);
+
+    await afterRestart.update('t', status: TaskStatus.paused);
+    await afterRestart.claim('t', 'Find source');
+    expect(
+      await afterRestart.consumeAutomaticRetry('t', maximum: 2),
+      isNull,
+    );
+    expect(
+      (await afterRestart.get('t'))!.execution.automaticRetryCount,
+      2,
+    );
+  });
+
+  test('subtask retry ceiling survives explicit resumes', () async {
+    await store.setPlan('t', const [
+      TaskSubtask(
+        id: 'goal',
+        objective: 'Read the current status',
+        criteria: ['Current status is known'],
+      ),
+    ]);
+
+    Future<void> failReadAndRecord(TaskStore target) async {
+      await target.beginAction(
+        't',
+        'read_screen',
+        mutation: false,
+        subtaskId: 'goal',
+      );
+      await target.endAction('t', technicalSuccess: false);
+      await target.markSubtaskFailed(
+        't',
+        subtaskId: 'goal',
+        failureCode: 'strategies_exhausted',
+        attemptedStrategies: const ['read_screen'],
+        remainingStrategies: const [],
+      );
+    }
+
+    await failReadAndRecord(store);
+    expect(
+      await store.reopenSafeFailedSubtasksForRetry(
+        't',
+        alreadyRetriedSubtaskIds: const {},
+      ),
+      ['goal'],
+    );
+    expect((await store.get('t'))!.execution.plan.single.retriesUsed, 1);
+
+    await failReadAndRecord(store);
+    await store.update('t', status: TaskStatus.paused);
+    final afterRestart = TaskStore(directory: directory);
+    await afterRestart.claim('t', 'Find source');
+    expect((await afterRestart.get('t'))!.execution.plan.single.retriesUsed, 2);
+    await failReadAndRecord(afterRestart);
+    expect(
+      await afterRestart.reopenSafeFailedSubtasksForRetry(
+        't',
+        alreadyRetriedSubtaskIds: const {},
+      ),
+      isEmpty,
+    );
+    await afterRestart.update('t', status: TaskStatus.paused);
+    await afterRestart.claim('t', 'Find source');
+    expect(
+      (await afterRestart.get('t'))!.execution.plan.single.status,
+      TaskSubtaskStatus.failed,
+    );
+  });
+
+  test('reusable summary text is bounded and removes common sensitive values',
+      () {
+    final sanitized = TaskPersistencePrivacy.reusableSummaryText(
+      'Email private@example.com; token=secret-value; phone +1 (555) 123-4567; '
+      'address 203.0.113.4; URL https://example.test/private?code=hidden',
+    );
+    expect(sanitized, isNot(contains('private@example.com')));
+    expect(sanitized, isNot(contains('secret-value')));
+    expect(sanitized, isNot(contains('555) 123-4567')));
+    expect(sanitized, isNot(contains('203.0.113.4')));
+    expect(sanitized, isNot(contains('https://example.test')));
+    expect(
+      TaskPersistencePrivacy.reusableSummaryText('x' * 700).length,
+      lessThan(620),
+    );
+  });
+
+  test('mutation audit records cannot support reusable summaries', () {
+    final capturedAt = DateTime(2026, 9, 26);
+    final subtask = TaskSubtask(
+      id: 'goal',
+      objective: 'Find source',
+      criteria: const ['Source is located'],
+      evidenceRefs: const {
+        'Source is located': ['action-1'],
+      },
+      reusableSummary: 'The source was found.',
+      summaryEvidenceRefs: const ['action-1'],
+      summaryRevision: 0,
+      summaryCapturedAt: capturedAt,
+      summaryFreshUntil: capturedAt.add(const Duration(days: 7)),
+    );
+    final mutation = ActionAudit(
+      sequence: 1,
+      action: 'write_file',
+      phase: 'after',
+      timestamp: capturedAt,
+      mutation: true,
+      revision: 0,
+      technicalSuccess: true,
+      subtaskId: 'goal',
+    );
+    final state = TaskExecutionState(plan: [subtask], audit: [mutation]);
+    expect(
+      TaskVerifier.hasFreshReusableSummary(
+        state,
+        subtask,
+        now: capturedAt.add(const Duration(days: 1)),
+      ),
+      isFalse,
+    );
   });
 
   test('a new criteria revision cannot unblock an unresolved mutation', () async {

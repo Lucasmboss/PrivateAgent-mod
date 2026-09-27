@@ -14,8 +14,14 @@ class TaskSubtask {
   final List<String> dependencies;
   final List<String> criteria;
   final Map<String, List<String>> evidenceRefs;
+  final String? reusableSummary;
+  final List<String> summaryEvidenceRefs;
+  final int? summaryRevision;
+  final DateTime? summaryCapturedAt;
+  final DateTime? summaryFreshUntil;
   final TaskSubtaskStatus status;
   final int attempts;
+  final int retriesUsed;
   final String? failureCode;
 
   const TaskSubtask({
@@ -24,8 +30,14 @@ class TaskSubtask {
     this.dependencies = const [],
     this.criteria = const [],
     this.evidenceRefs = const {},
+    this.reusableSummary,
+    this.summaryEvidenceRefs = const [],
+    this.summaryRevision,
+    this.summaryCapturedAt,
+    this.summaryFreshUntil,
     this.status = TaskSubtaskStatus.pending,
     this.attempts = 0,
+    this.retriesUsed = 0,
     this.failureCode,
   });
 
@@ -33,24 +45,59 @@ class TaskSubtask {
     List<String>? dependencies,
     List<String>? criteria,
     Map<String, List<String>>? evidenceRefs,
+    String? reusableSummary,
+    List<String>? summaryEvidenceRefs,
+    int? summaryRevision,
+    DateTime? summaryCapturedAt,
+    DateTime? summaryFreshUntil,
     TaskSubtaskStatus? status,
     int? attempts,
+    int? retriesUsed,
     String? failureCode,
     bool clearFailureCode = false,
+    bool clearReusableSummary = false,
   }) => TaskSubtask(
     id: id,
     objective: objective,
     dependencies: dependencies ?? this.dependencies,
     criteria: criteria ?? this.criteria,
     evidenceRefs: evidenceRefs ?? this.evidenceRefs,
+    reusableSummary: clearReusableSummary
+        ? null
+        : reusableSummary ?? this.reusableSummary,
+    summaryEvidenceRefs: clearReusableSummary
+        ? const []
+        : summaryEvidenceRefs ?? this.summaryEvidenceRefs,
+    summaryRevision:
+        clearReusableSummary ? null : summaryRevision ?? this.summaryRevision,
+    summaryCapturedAt: clearReusableSummary
+        ? null
+        : summaryCapturedAt ?? this.summaryCapturedAt,
+    summaryFreshUntil: clearReusableSummary
+        ? null
+        : summaryFreshUntil ?? this.summaryFreshUntil,
     status: status ?? this.status,
     attempts: attempts ?? this.attempts,
+    retriesUsed: retriesUsed ?? this.retriesUsed,
     failureCode: clearFailureCode ? null : failureCode ?? this.failureCode,
   );
 
-  Map<String, dynamic> toJson() => {'id': id, 'objective': objective,
-    'dependencies': dependencies, 'criteria': criteria, 'evidenceRefs': evidenceRefs,
-    'status': status.name, 'attempts': attempts, 'failureCode': failureCode};
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'objective': objective,
+    'dependencies': dependencies,
+    'criteria': criteria,
+    'evidenceRefs': evidenceRefs,
+    'reusableSummary': reusableSummary,
+    'summaryEvidenceRefs': summaryEvidenceRefs,
+    'summaryRevision': summaryRevision,
+    'summaryCapturedAt': summaryCapturedAt?.toIso8601String(),
+    'summaryFreshUntil': summaryFreshUntil?.toIso8601String(),
+    'status': status.name,
+    'attempts': attempts,
+    'retriesUsed': retriesUsed,
+    'failureCode': failureCode,
+  };
 
   static TaskSubtaskStatus _statusFromJson(Object? value) =>
       TaskSubtaskStatus.values.firstWhere(
@@ -64,8 +111,18 @@ class TaskSubtask {
     criteria: List<String>.from(j['criteria'] ?? []),
     evidenceRefs: (j['evidenceRefs'] as Map? ?? {}).map((k, v) =>
       MapEntry(k as String, List<String>.from(v))),
+    reusableSummary: j['reusableSummary'] as String?,
+    summaryEvidenceRefs: List<String>.from(j['summaryEvidenceRefs'] ?? []),
+    summaryRevision: (j['summaryRevision'] as num?)?.toInt(),
+    summaryCapturedAt: j['summaryCapturedAt'] is String
+        ? DateTime.tryParse(j['summaryCapturedAt'] as String)
+        : null,
+    summaryFreshUntil: j['summaryFreshUntil'] is String
+        ? DateTime.tryParse(j['summaryFreshUntil'] as String)
+        : null,
     status: _statusFromJson(j['status']),
     attempts: (j['attempts'] as num?)?.toInt() ?? 0,
+    retriesUsed: (j['retriesUsed'] as num?)?.toInt() ?? 0,
     failureCode: j['failureCode'] as String?,
   );
 }
@@ -174,17 +231,19 @@ class TaskExecutionState {
   final ActionAudit? lastResult;
   final String verification;
   final List<int> unverifiedMutations;
+  final int automaticRetryCount;
   const TaskExecutionState({this.revisions = const [], this.plan = const [],
     this.audit = const [], this.nextSequence = 1, this.inFlight,
     this.lastResult, this.verification = 'unverified',
     this.unverifiedMutations = const [], this.criterionConfirmations = const [],
-    this.pendingAssistance = const []});
+     this.pendingAssistance = const [], this.automaticRetryCount = 0});
   int get revision => revisions.length;
   TaskExecutionState copyWith({List<String>? revisions, List<TaskSubtask>? plan,
     List<ActionAudit>? audit, int? nextSequence, ActionAudit? inFlight,
     bool clearInFlight = false, ActionAudit? lastResult, String? verification,
      List<int>? unverifiedMutations, List<CriterionConfirmation>? criterionConfirmations,
-     List<PendingAssistanceRequest>? pendingAssistance}) =>
+      List<PendingAssistanceRequest>? pendingAssistance,
+      int? automaticRetryCount}) =>
     TaskExecutionState(revisions: revisions ?? this.revisions, plan: plan ?? this.plan,
       audit: audit ?? this.audit, nextSequence: nextSequence ?? this.nextSequence,
       inFlight: clearInFlight ? null : inFlight ?? this.inFlight,
@@ -192,6 +251,7 @@ class TaskExecutionState {
       unverifiedMutations: unverifiedMutations ?? this.unverifiedMutations,
       criterionConfirmations: criterionConfirmations ?? this.criterionConfirmations,
       pendingAssistance: pendingAssistance ?? this.pendingAssistance,
+       automaticRetryCount: automaticRetryCount ?? this.automaticRetryCount,
       verification: verification ?? this.verification);
   Map<String, dynamic> toJson() => {'revisions': revisions,
     'plan': plan.map((e) => e.toJson()).toList(),
@@ -199,7 +259,8 @@ class TaskExecutionState {
     'inFlight': inFlight?.toJson(), 'lastResult': lastResult?.toJson(),
     'verification': verification, 'unverifiedMutations': unverifiedMutations,
     'criterionConfirmations': criterionConfirmations.map((e) => e.toJson()).toList(),
-    'pendingAssistance': pendingAssistance.map((e) => e.toJson()).toList()};
+    'pendingAssistance': pendingAssistance.map((e) => e.toJson()).toList(),
+    'automaticRetryCount': automaticRetryCount};
   factory TaskExecutionState.fromJson(Map<String, dynamic> j) => TaskExecutionState(
     revisions: List<String>.from(j['revisions'] ?? []),
     plan: (j['plan'] as List? ?? []).map((e) => TaskSubtask.fromJson(Map<String, dynamic>.from(e))).toList(),
@@ -212,5 +273,6 @@ class TaskExecutionState {
     criterionConfirmations: (j['criterionConfirmations'] as List? ?? [])
       .map((e) => CriterionConfirmation.fromJson(Map<String, dynamic>.from(e))).toList(),
     pendingAssistance: (j['pendingAssistance'] as List? ?? [])
-      .map((e) => PendingAssistanceRequest.fromJson(Map<String, dynamic>.from(e))).toList());
+      .map((e) => PendingAssistanceRequest.fromJson(Map<String, dynamic>.from(e))).toList(),
+    automaticRetryCount: (j['automaticRetryCount'] as num?)?.toInt() ?? 0);
 }

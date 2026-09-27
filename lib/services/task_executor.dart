@@ -13,12 +13,14 @@ import 'skill_memory_service.dart';
 import 'web_service.dart';
 import 'web_search_service.dart';
 import 'file_service.dart';
+import 'capability_diagnostics_service.dart';
 import 'tool_registry.dart';
 import 'tool_policy.dart';
 import 'user_assistance_policy.dart';
 import '../privacy_sanitizer.dart';
 import 'task_store.dart';
 import 'task_persistence_privacy.dart';
+import 'task_progress_summary.dart';
 import 'task_verifier.dart';
 import '../models/task_record.dart';
 import '../models/saved_skill.dart';
@@ -71,6 +73,15 @@ class TaskExecutor {
   String? lastTaskId;
 
   final WebSearchService _webSearchService = WebSearchService();
+  late final CapabilityDiagnosticsService _capabilityDiagnostics =
+      CapabilityDiagnosticsService.forApp(
+        webSearch: _webSearchService,
+        webService: _webService,
+        fileService: _files,
+        shizukuService: _shizukuService,
+      );
+
+  static const int _automaticRetryLimit = 3;
 
   /// Callback to report progress messages to the UI.
   final void Function(String message)? onProgress;
@@ -358,12 +369,33 @@ Parameters:
 The runtime checks that the listed actions actually failed for this subtask.
 After marking it failed, continue with independent runnable subtasks.
 
-18. done
+18. capability_diagnostic
+
+Enumerate the registered tools and run only these safe probes: web_search with a
+generic query; a public HTTP GET that reports only its status (never the public
+IP or response body); listing private file names without displaying them; and
+the fixed read-only battery status query only when Android and existing
+Shizuku permission are available. Read a file only if a designated
+non-sensitive fixture exists. Do not request permissions, access arbitrary
+private data, send communications, change device or app state, write or delete
+files, or run arbitrary shell commands. Mark all other tools not tested.
+
+19. done
 
 Finish the task.
 
 Parameters:
-{}
+{
+  "evidence": {"subtask_id": {"criterion": ["action-N"]}},
+  "result_summaries": {
+    "subtask_id": "At most 600 characters summarizing useful findings from the cited observations."
+  }
+}
+
+result_summaries are optional, sanitized planning hints only. Include one only
+when the subtask's cited read-only evidence is successful. Never copy raw tool
+output, private content, credentials, contact details, model reasoning, or
+unverified claims into a summary. A summary is not completion evidence.
 
 FILE ACTIONS (only in the application's private agent_files directory):
 - list_files: {}
@@ -447,7 +479,11 @@ GENERAL RULES:
   // EXECUTE TASK
   // ===========================================================================
 
-  Future<String> executeTask(String userGoal, {String? resumeTaskId}) async {
+  Future<String> executeTask(
+    String userGoal, {
+    String? resumeTaskId,
+    String? resumeContext,
+  }) async {
     if (_activeTaskId != null) throw StateError('Executor already running');
     _cancelled = false;
     _paused = false;
@@ -467,19 +503,25 @@ GENERAL RULES:
             await _notifyTaskCheckpoint(status);
           }
           return _cancelled
-              ? 'Task cancelled. Its checkpoint remains available.'
-              : 'Task paused. Its checkpoint remains available.';
+              ? 'Task cancelled. Its saved progress is available if you want '
+                  'to continue later.'
+              : 'Task paused. Its saved progress is available when you are '
+                  'ready to continue.';
         }
 
         String result;
         try {
-          result = await _executeTask(userGoal, resumeTaskId: checkpointId);
+          result = await _executeTask(
+            userGoal,
+            resumeTaskId: checkpointId,
+            resumeContext: resumeContext,
+          );
         } catch (error) {
           if (error is ToolOutcomeUncertainException) {
             _report(error.userMessage);
           } else {
             _report(
-              'A recoverable execution error occurred. Saving the checkpoint '
+              'A recoverable execution error occurred. Saving the task progress '
               'and continuing with a fresh attempt.',
             );
             if (error is RemoteProviderException &&
@@ -494,7 +536,7 @@ GENERAL RULES:
           await failUnexpected(error);
           result = error is ToolOutcomeUncertainException
               ? error.userMessage
-              : 'Execution interrupted. Continuing from the saved checkpoint.';
+              : 'Execution interrupted. Saved progress is available to review.';
         } finally {
           _cancelCompleter = null;
           _budgetTimer?.cancel();
@@ -540,8 +582,7 @@ GENERAL RULES:
         checkpointId = id;
         continuationCount++;
         _report(
-          'Saved checkpoint reached an execution-window boundary. '
-          'Continuing automatically (window $continuationCount).',
+          'Continuing with saved progress and checking the remaining steps.',
         );
         await _showTaskNotification(
           'Task Continuing',
@@ -556,7 +597,11 @@ GENERAL RULES:
     }
   }
 
-  Future<String> _executeTask(String userGoal, {String? resumeTaskId}) async {
+  Future<String> _executeTask(
+    String userGoal, {
+    String? resumeTaskId,
+    String? resumeContext,
+  }) async {
     _budgetExpired = false;
     _remoteCancellation = RemoteCancellationToken();
     _cancelCompleter = null;
@@ -599,10 +644,10 @@ GENERAL RULES:
 
     results.add('Starting task: $userGoal');
     if (previousTask != null) {
-      results.insertAll(0, [
-        'Resuming from saved checkpoint at step ${previousTask.stepsCompleted}.',
-        'The durable plan and action audit are restored. Raw tool output is not stored.',
-      ]);
+      results.insert(
+        0,
+        'Saved progress: ${TaskProgressSummary.describe(previousTask)}',
+      );
     }
 
     _report('Starting task: $userGoal');
@@ -635,6 +680,7 @@ GENERAL RULES:
     int totalTokens = previousTask?.tokens ?? 0;
 
     final List<ActionStep> executedSteps = [];
+    String? capabilityDiagnosticReport;
     final attemptedActions = <String>{};
     attemptedActions.addAll(
       previousTask?.execution.audit.map((event) => event.action) ??
@@ -664,16 +710,16 @@ GENERAL RULES:
 
     String screenContent = '';
 
-    String previousResult = '';
+    String previousResult = _resumePlanningHints(
+      task.execution,
+      resumeContext,
+    );
 
     // -------------------------------------------------------------------------
     // MAIN AGENT LOOP
     // -------------------------------------------------------------------------
 
     var consecutiveVerifierGaps = 0;
-    var plannerFailures = 0;
-    var formatFailures = 0;
-    var invalidPlanFailures = 0;
     final stepBase = task.stepsCompleted;
     final finalRetrySubtaskIds = <String>{};
 
@@ -926,8 +972,6 @@ Remember:
         final aiResponse = result;
 
         response = aiResponse.content;
-        plannerFailures = 0;
-
         totalTokens += aiResponse.totalTokens;
         if (totalTokens >= maxTaskTokens) {
           return await _stopForBudget(
@@ -988,13 +1032,25 @@ Remember:
 
         const plannerFailure =
             'The AI planner is temporarily unavailable. No new action was '
-            'dispatched; the saved checkpoint will be retried automatically.';
-        plannerFailures++;
-        previousResult = '$plannerFailure Retry $plannerFailures.';
+            'dispatched; this planning step will be retried automatically.';
+        final retryNumber = await _taskStore.consumeAutomaticRetry(
+          _activeTaskId!,
+          maximum: _automaticRetryLimit,
+        );
+        if (retryNumber == null) {
+          return await _stopForRetryLimit(
+            step,
+            totalTokens,
+            results,
+            failedStrategies,
+          );
+        }
+        previousResult =
+            '$plannerFailure Retry $retryNumber of $_automaticRetryLimit.';
         results.add(previousResult);
         _report(previousResult);
         consecutiveFailures++;
-        await _waitForRetry(plannerFailures);
+        await _waitForRetry(retryNumber);
         continue;
       }
 
@@ -1100,12 +1156,24 @@ Remember:
           const formattingFailure =
               'The AI response remained invalid after a retry. No tool was '
               'dispatched; requesting a fresh response automatically.';
-          formatFailures++;
-          previousResult = '$formattingFailure Retry $formatFailures.';
+          final retryNumber = await _taskStore.consumeAutomaticRetry(
+            _activeTaskId!,
+            maximum: _automaticRetryLimit,
+          );
+          if (retryNumber == null) {
+            return await _stopForRetryLimit(
+              step,
+              totalTokens,
+              results,
+              failedStrategies,
+            );
+          }
+          previousResult =
+              '$formattingFailure Retry $retryNumber of $_automaticRetryLimit.';
           results.add(previousResult);
           consecutiveFailures++;
           _report(previousResult);
-          await _waitForRetry(formatFailures);
+          await _waitForRetry(retryNumber);
           continue;
         }
       }
@@ -1121,8 +1189,6 @@ Remember:
         consecutiveFailures++;
         continue;
       }
-      formatFailures = 0;
-
       var action = toolResponse.action.action;
       var params = toolResponse.action.params;
       final reasoning = toolResponse.reasoning;
@@ -1343,9 +1409,17 @@ Remember:
             }
           }
         }
+        final rawSummaries = params['result_summaries'];
+        final resultSummaries = <String, String>{
+          if (rawSummaries is Map)
+            for (final entry in rawSummaries.entries)
+              if (entry.key is String && entry.value is String)
+                entry.key as String: entry.value as String,
+        };
         var verified = await _taskStore.verifyCompletion(
           _activeTaskId!,
           references,
+          resultSummaries: resultSummaries,
         );
         if (_paused)
           return await _handlePause(
@@ -1441,8 +1515,8 @@ Remember:
               if (await tryFinalSafeRetry()) continue;
               final outcome = await _subtaskOutcomeReport();
               final message =
-                  'Task checkpoint saved. The combined review request timed out '
-                  'or was declined; resume it from this chat when ready.\n'
+                  'Task paused. The combined review request timed out or was '
+                  'declined. Saved progress is available to review.\n'
                   '$outcome';
               results.add(message);
               await _finishTask(
@@ -1577,8 +1651,8 @@ Remember:
             if (_assistanceBatchShown && finalRetrySubtaskIds.isEmpty) {
             final report = await _subtaskOutcomeReport();
             final message =
-                'Task checkpoint saved. Remaining criteria or human-only steps '
-                'are listed for review; continue from this chat when ready.\n'
+                'Task paused. A remaining step needs your review before work '
+                'can continue.\n'
                 '$report';
             results.add(message);
               await _finishTask(
@@ -1608,7 +1682,11 @@ Remember:
           reasoning.trim().isEmpty ? 'Done.' : reasoning.trim(),
         );
         final evidenceSummary = await _verifiedCompletionEvidenceSummary();
-        final finalText = '$explanation\n$evidenceSummary';
+        final diagnosticSection = capabilityDiagnosticReport == null
+            ? ''
+            : '\n\n$capabilityDiagnosticReport';
+        final finalText =
+            '$explanation\n$evidenceSummary$diagnosticSection';
 
         results.add('Task complete: $finalText');
 
@@ -1666,17 +1744,28 @@ Remember:
               error is! ArgumentError) {
             rethrow;
           }
-          invalidPlanFailures++;
+          final retryNumber = await _taskStore.consumeAutomaticRetry(
+            _activeTaskId!,
+            maximum: _automaticRetryLimit,
+          );
+          if (retryNumber == null) {
+            return await _stopForRetryLimit(
+              step,
+              totalTokens,
+              results,
+              failedStrategies,
+            );
+          }
           previousResult =
               'The proposed plan was rejected by structural safety checks. '
-              'Create a corrected plan; do not repeat the invalid structure.';
+              'Create a corrected plan; do not repeat the invalid structure. '
+              'Retry $retryNumber of $_automaticRetryLimit.';
           results.add(previousResult);
           consecutiveFailures++;
           _report(previousResult);
-          await _waitForRetry(invalidPlanFailures);
+          await _waitForRetry(retryNumber);
           continue;
         }
-        invalidPlanFailures = 0;
         previousResult =
             'Structured plan saved; prior criterion evidence invalidated.';
         continue;
@@ -1768,6 +1857,13 @@ Remember:
           // Clear the just-created checkpoint as not executed, then the loop's
           // stop handling will preserve the task. Never dispatch after a stop.
           previousResult = 'Action stopped before dispatch.';
+          continue;
+        }
+        if (action == 'capability_diagnostic') {
+          capabilityDiagnosticReport = await _capabilityDiagnostics.run();
+          previousResult = capabilityDiagnosticReport!;
+          toolSucceeded = previousResult.isNotEmpty;
+          results.add('Safe capability diagnostic completed.');
           continue;
         }
         if (action == 'read_screen') {
@@ -2473,12 +2569,9 @@ Remember:
     }
 
     final outcome = await _subtaskOutcomeReport();
-    results.add(
-      'Reached the current planner window limit of ${_aiService.maxSteps} '
-      'steps. Continuing from the saved checkpoint.\n$outcome',
-    );
+    results.add('Paused to preserve safe progress.\n$outcome');
 
-    _report('Planner window complete. Continuing automatically.\n$outcome');
+    _report('Continuing with the remaining work.\n$outcome');
 
     await _finishTask(
       TaskStatus.needsRevision,
@@ -2503,7 +2596,9 @@ Remember:
   ) async {
     results.add('Task cancelled by user.');
 
-    _report('Task cancelled. Its checkpoint remains available in this chat.');
+    _report(
+      'Task cancelled. Its saved progress is available if you want to continue later.',
+    );
 
     await _notificationService.showTaskCompleteNotification(
       'Task Cancelled',
@@ -2522,7 +2617,7 @@ Remember:
       await _screenService.showToast('Task Cancelled');
     }
 
-    return 'Task cancelled. Its checkpoint remains available in this chat.';
+    return 'Task cancelled. Its saved progress is available if you want to continue later.';
   }
 
   Future<String> _handlePause(
@@ -2557,6 +2652,48 @@ Remember:
     return remaining < _aiService.maxTokens ? remaining : _aiService.maxTokens;
   }
 
+  String _resumePlanningHints(
+    TaskExecutionState state,
+    String? resumeContext,
+  ) {
+    final lines = <String>[];
+    final summaries = TaskVerifier.freshReusableSummaries(state);
+    if (summaries.isNotEmpty) {
+      lines.add(
+        'Fresh prior summaries (planning hints only; not evidence or proof):',
+      );
+      for (final subtask in summaries.take(10)) {
+        final sources = subtask.summaryEvidenceRefs.take(12).join(', ');
+        lines.add(
+          '- ${subtask.id}: ${subtask.reusableSummary} '
+          '(revision ${subtask.summaryRevision}; source observations: $sources; '
+          'captured ${subtask.summaryCapturedAt?.toIso8601String()}; '
+          'fresh until ${subtask.summaryFreshUntil?.toIso8601String()}).',
+        );
+      }
+      if (summaries.length > 10) {
+        lines.add(
+          '- ${summaries.length - 10} additional fresh summaries were omitted '
+          'to keep resume context bounded.',
+        );
+      }
+      lines.add(
+        'Re-check saved evidence and dependencies before relying on any hint.',
+      );
+    }
+
+    final safeContext = resumeContext == null
+        ? ''
+        : TaskPersistencePrivacy.reusableSummaryText(resumeContext);
+    if (safeContext.isNotEmpty) {
+      lines.add(
+        'Additional user context for this resume (not persisted; it does not '
+        'change the original goal or safety rules): $safeContext',
+      );
+    }
+    return lines.join('\n');
+  }
+
   Duration _retryDelay(int attempt) {
     final exponent = (attempt - 1).clamp(0, 5).toInt();
     final seconds = (1 << exponent).clamp(1, 30).toInt();
@@ -2575,6 +2712,27 @@ Remember:
     }
   }
 
+  Future<String> _stopForRetryLimit(
+    int step,
+    int tokens,
+    List<String> results,
+    List<String> failedStrategies,
+  ) async {
+    const message =
+        'Automatic retries are paused to prevent a loop. The task is saved; '
+        'add context or choose a different approach before continuing.';
+    results.add(message);
+    _report(message);
+    await _finishTask(
+      TaskStatus.paused,
+      step,
+      tokens,
+      results,
+      failedStrategies,
+    );
+    return message;
+  }
+
   Future<String> _stopForBudget(
     int tokens,
     int step,
@@ -2585,7 +2743,7 @@ Remember:
     _remoteCancellation.cancel();
     const message =
         'The configured task budget was reached before completion. The '
-        'checkpoint is saved and no action was replayed.';
+        'task is saved and no action was replayed.';
     results.add(message);
     _report(message);
     await _finishTask(
@@ -2770,46 +2928,13 @@ Remember:
 
   Future<String> _subtaskOutcomeReport() async {
     final id = _activeTaskId;
-    if (id == null) return 'Task stopped with no active checkpoint.';
+    if (id == null) return 'No saved task is available to continue.';
     final record = await _taskStore.get(id);
     if (record == null || record.execution.plan.isEmpty) {
       return 'Task is incomplete. No validated subtask plan is available; '
-          'resume from the saved checkpoint when the planner is available.';
+          'review the task and try again when the planner is available.';
     }
-    final lines = <String>[];
-    for (final subtask in record.execution.plan) {
-      final objective = TaskPersistencePrivacy.goalText(subtask.objective);
-      final shortObjective = objective.length > 220
-          ? '${objective.substring(0, 220)}…'
-          : objective;
-      final status = switch (subtask.status) {
-        TaskSubtaskStatus.completed => 'completed',
-        TaskSubtaskStatus.failed => 'failed after safe strategies were exhausted',
-        TaskSubtaskStatus.blocked => 'blocked by an incomplete dependency',
-        TaskSubtaskStatus.needsReview =>
-          'waiting for independent review of its external outcome',
-        TaskSubtaskStatus.inProgress => subtask.failureCode == 'tool_failed'
-            ? 'incomplete; the latest tool attempt failed'
-            : 'incomplete; more work may remain',
-        TaskSubtaskStatus.pending => 'not started; available to resume',
-      };
-      final attempts = subtask.attempts == 1
-          ? '1 tool attempt'
-          : '${subtask.attempts} tool attempts';
-      lines.add('- ${subtask.id}: $shortObjective — $status ($attempts).');
-    }
-    final completed = record.execution.plan
-        .where((item) => item.status == TaskSubtaskStatus.completed)
-        .length;
-    final unresolvedMutationCount =
-        record.execution.unverifiedMutations.length;
-    final mutationNote = unresolvedMutationCount == 0
-        ? ''
-        : '\nUnverified external changes: $unresolvedMutationCount. '
-              'They were not replayed. Independently review them in Task History '
-              'before resuming dependent work.';
-    return 'Task outcome: $completed/${record.execution.plan.length} '
-        'subtasks verified.\n${lines.join('\n')}$mutationNote';
+    return TaskProgressSummary.describe(record);
   }
 
   Future<void> _showTaskNotification(String title, String body) async {

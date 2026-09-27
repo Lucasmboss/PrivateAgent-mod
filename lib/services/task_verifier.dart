@@ -18,6 +18,7 @@ class TaskVerifier {
     'read_screen',
     'read_file',
     'list_files',
+    'capability_diagnostic',
   }.contains(action);
 
   static bool hasValidCriterionEvidence(
@@ -218,6 +219,66 @@ class TaskVerifier {
     }
     return completed;
   }
+
+  /// Reusable summaries are planning hints, not completion evidence. A hint is
+  /// accepted only while its revision and every read-only provenance reference
+  /// still match the saved task state.
+  static bool hasFreshReusableSummary(
+    TaskExecutionState state,
+    TaskSubtask task, {
+    DateTime? now,
+  }) {
+    final summary = task.reusableSummary;
+    final capturedAt = task.summaryCapturedAt;
+    final freshUntil = task.summaryFreshUntil;
+    final currentTime = now ?? DateTime.now();
+    if (summary == null ||
+        summary.trim().isEmpty ||
+        task.summaryRevision == null ||
+        task.summaryRevision! > state.revision ||
+        capturedAt == null ||
+        freshUntil == null ||
+        capturedAt.isAfter(currentTime) ||
+        !freshUntil.isAfter(currentTime) ||
+        freshUntil.difference(capturedAt) > const Duration(days: 7, hours: 1)) {
+      return false;
+    }
+    final criteriaRefs = task.evidenceRefs.values.expand((refs) => refs).toSet();
+    final summaryRefs = task.summaryEvidenceRefs.toSet();
+    if (criteriaRefs.isEmpty ||
+        summaryRefs.isEmpty ||
+        !summaryRefs.containsAll(criteriaRefs)) {
+      return false;
+    }
+    final evidenceBySequence = <int, ActionAudit>{};
+    for (final event in state.audit) {
+      if (event.phase == 'after' &&
+          event.technicalSuccess &&
+          event.revision == task.summaryRevision) {
+        evidenceBySequence[event.sequence] = event;
+      }
+    }
+    return summaryRefs.every((ref) {
+      final sequence = int.tryParse(ref.startsWith('action-')
+          ? ref.substring('action-'.length)
+          : '');
+      final event = sequence == null ? null : evidenceBySequence[sequence];
+      return event != null &&
+          event.subtaskId == task.id &&
+          !event.mutation &&
+          isObservationAction(event.action);
+    });
+  }
+
+  static List<TaskSubtask> freshReusableSummaries(
+    TaskExecutionState state, {
+    DateTime? now,
+  }) =>
+      state.plan
+          .where(
+            (task) => hasFreshReusableSummary(state, task, now: now),
+          )
+          .toList(growable: false);
 
   static void validatePlan(List<TaskSubtask> plan) {
     if (plan.isEmpty || plan.length > 30) throw const FormatException('Plan requires 1–30 subtasks');

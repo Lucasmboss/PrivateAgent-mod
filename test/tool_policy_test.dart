@@ -39,7 +39,6 @@ void main() {
       'direction': 'down',
       'milliseconds': 1,
       'goal': 'a',
-      'resume_task_id': 'a',
       'question': 'a',
       'blocker_type': 'sign_in',
       'attempted_strategies': ['open_app'],
@@ -212,6 +211,18 @@ void main() {
     () async {
       final task = registry.validate('execute_task', {'goal': 'Do work'});
       expect((await policy.authorize(task)).allowed, isTrue);
+      expect(
+        () => registry.validate('execute_task', {
+          'goal': 'Do work',
+          'resume_task_id': 'task-1',
+          'resume_context': 'Use the official source instead.',
+        }),
+        throwsA(isA<ToolValidationException>()),
+      );
+      expect(
+        registry.validate('capability_diagnostic', {}).name,
+        'capability_diagnostic',
+      );
       expect(
         (await policy.authorize(
           registry.validate('click_element', {'text': 'Send'}),

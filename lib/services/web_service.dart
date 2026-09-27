@@ -16,6 +16,24 @@ class WebService {
 
   WebService({http.Client? client}) : _client = client ?? http.Client();
 
+  /// Performs a GET probe while returning only the HTTP status code. The
+  /// response body is deliberately discarded for diagnostics such as public-IP
+  /// connectivity checks.
+  Future<int?> getStatusOnly({required String url}) async {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      return null;
+    }
+    try {
+      final response = await _client.get(uri).timeout(timeout);
+      return response.statusCode;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<String> request({
     required String method,
     required String url,

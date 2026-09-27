@@ -33,17 +33,17 @@ void main() {
     await render(tester, record(const TaskExecutionState(plan: [task])),
         criterionReview: review);
     expect(calls, isEmpty);
-    expect(find.text('Finalize verified task'), findsNothing);
-    await tester.ensureVisible(find.text('Independently review criterion'));
-    await tester.tap(find.text('Independently review criterion'));
+    expect(find.text('Mark task complete'), findsNothing);
+    await tester.ensureVisible(find.text('Review this criterion'));
+    await tester.tap(find.text('Review this criterion'));
     expect(calls, [true]);
 
     await render(tester, record(TaskExecutionState(plan: const [task],
         criterionConfirmations: [CriterionConfirmation(revision: 0,
             subtaskId: 'delivery', criterion: 'Receipt exists', confirmedAt: date)])),
         criterionReview: review);
-    await tester.ensureVisible(find.text('Review / revoke criterion confirmation'));
-    await tester.tap(find.text('Review / revoke criterion confirmation'));
+    await tester.ensureVisible(find.text('Review this confirmation'));
+    await tester.tap(find.text('Review this confirmation'));
     expect(calls, [true, false]);
 
     await render(tester, record(TaskExecutionState(plan: const [task],
@@ -51,8 +51,8 @@ void main() {
         criterionConfirmations: [CriterionConfirmation(revision: 0,
             subtaskId: 'delivery', criterion: 'Receipt exists', confirmedAt: date)])),
         criterionReview: review);
-    expect(find.text('Not independently confirmed for this revision'), findsOneWidget);
-    expect(find.text('Review / revoke criterion confirmation'), findsNothing);
+    expect(find.text('Needs independent confirmation'), findsOneWidget);
+    expect(find.text('Review this confirmation'), findsNothing);
     expect(calls, [true, false]);
   });
 
@@ -65,17 +65,17 @@ void main() {
         criterionReview: (_, _, _) => fail('Must not review running task'),
         finalize: () => finalized++);
     expect(tester.widget<OutlinedButton>(
-        find.widgetWithText(OutlinedButton, 'Independently review criterion')).onPressed, isNull);
+        find.widgetWithText(OutlinedButton, 'Review this criterion')).onPressed, isNull);
     expect(tester.widget<FilledButton>(
-        find.widgetWithText(FilledButton, 'Finalize verified task')).onPressed, isNull);
+        find.widgetWithText(FilledButton, 'Mark task complete')).onPressed, isNull);
     await render(tester, record(state), finalize: () => finalized++);
     expect(finalized, 0);
-    await tester.ensureVisible(find.text('Finalize verified task'));
-    await tester.tap(find.text('Finalize verified task'));
+    await tester.ensureVisible(find.text('Mark task complete'));
+    await tester.tap(find.text('Mark task complete'));
     expect(finalized, 1);
   });
 
-  testWidgets('shows criteria evidence and honest budget without auto-confirming',
+  testWidgets('shows human progress without exposing technical traces',
       (tester) async {
     var confirmations = 0;
     await render(tester, record(TaskExecutionState(
@@ -86,14 +86,13 @@ void main() {
         timestamp: date, mutation: true, revision: 0, technicalSuccess: true)],
       unverifiedMutations: const [3],
     )), confirm: (_) => confirmations++);
-    expect(find.text('Recorded step-budget indicator: 50%'), findsOneWidget);
-    expect(find.text('Depends on: send'), findsOneWidget);
-    expect(find.textContaining('Evidence action IDs: action-3'), findsOneWidget);
-    expect(find.textContaining('Technical result: success'), findsOneWidget);
-    expect(find.textContaining('Outcome evidence: unverified'), findsOneWidget);
+    expect(find.textContaining('50%'), findsNothing);
+    expect(find.textContaining('action-3'), findsNothing);
+    expect(find.textContaining('send_message'), findsNothing);
+    expect(find.textContaining('Check delivery'), findsOneWidget);
     expect(confirmations, 0);
-    await tester.ensureVisible(find.text('Independently review action-3 outcome'));
-    await tester.tap(find.text('Independently review action-3 outcome'));
+    await tester.ensureVisible(find.text('Review an external change'));
+    await tester.tap(find.text('Review an external change'));
     expect(confirmations, 1);
   });
 
@@ -103,18 +102,19 @@ void main() {
         phase: 'before', timestamp: date, mutation: true, revision: 0);
     final task = record(TaskExecutionState(inFlight: pending, audit: [pending]));
     await render(tester, task);
-    expect(find.text('Uncertain external effect'), findsOneWidget);
+    expect(find.text('An external change may need review'), findsOneWidget);
     final button = tester.widget<OutlinedButton>(
-        find.widgetWithText(OutlinedButton, 'Review uncertain action'));
+        find.widgetWithText(OutlinedButton, 'Review possible change'));
     expect(button.onPressed, isNull);
-    expect(find.textContaining('Technical result: not yet recorded'), findsOneWidget);
+    expect(find.textContaining('action-4'), findsNothing);
+    expect(find.textContaining('write_file'), findsNothing);
     var reviews = 0;
     await render(tester, task, review: (sequence) {
       reviews++;
       expect(sequence, 4);
     });
     expect(reviews, 0);
-    await tester.tap(find.text('Review uncertain action'));
+    await tester.tap(find.text('Review possible change'));
     expect(reviews, 1);
   });
 
@@ -141,7 +141,7 @@ void main() {
       ),
       review: (sequence) => reviewedSequence = sequence,
     );
-    const label = 'Review uncertain action-7 outcome';
+    const label = 'Review an external change';
     await tester.ensureVisible(find.text(label));
     await tester.tap(find.text(label));
     expect(reviewedSequence, 7);
