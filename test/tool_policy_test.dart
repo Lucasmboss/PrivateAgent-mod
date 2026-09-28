@@ -45,6 +45,7 @@ void main() {
       'remaining_strategies': <String>[],
       'failure_code': 'strategies_exhausted',
       'subtask_id': 'one',
+      'result_summaries': <String, String>{},
       'subtasks': [
         {
           'id': 'one',

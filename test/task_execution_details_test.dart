@@ -89,7 +89,7 @@ void main() {
     expect(find.textContaining('50%'), findsNothing);
     expect(find.textContaining('action-3'), findsNothing);
     expect(find.textContaining('send_message'), findsNothing);
-    expect(find.textContaining('Check delivery'), findsOneWidget);
+    expect(find.text('Check delivery'), findsOneWidget);
     expect(confirmations, 0);
     await tester.ensureVisible(find.text('Review an external change'));
     await tester.tap(find.text('Review an external change'));

@@ -326,43 +326,58 @@ void main() {
       required String subtaskId,
       required String criterion,
       required String summary,
-      required int sequence,
     }) async {
-      await store.beginAction(
+      final started = await store.beginAction(
         't',
         'read_screen',
         mutation: false,
         subtaskId: subtaskId,
       );
+      final evidenceRef = started.execution.inFlight!.evidenceId;
       await store.endAction('t', technicalSuccess: true);
-      return store.verifyCompletion(
-        't',
-        {
-          subtaskId: {
-            criterion: ['action-$sequence'],
-          },
+      final references = {
+        subtaskId: {
+          criterion: [evidenceRef],
         },
+      };
+      await store.verifyCompletion(
+        't',
+        references,
         resultSummaries: {subtaskId: summary},
       );
+      final reviewRecord = await store.update(
+        't',
+        status: TaskStatus.needsRevision,
+      );
+      await store.confirmCriterion(
+        't',
+        expectedRevision: reviewRecord.execution.revision,
+        subtaskId: subtaskId,
+        criterion: criterion,
+        confirmed: true,
+      );
+      await store.verifyCompletion(
+        't',
+        references,
+        resultSummaries: {subtaskId: summary},
+      );
+      return store.claim('t', 'Find source');
     }
 
     await observeAndVerify(
       subtaskId: 'source',
       criterion: 'Source is located',
       summary: 'The source page is available.',
-      sequence: 1,
     );
     await observeAndVerify(
       subtaskId: 'interpret',
       criterion: 'Source is interpreted',
       summary: 'The source gives the requested detail.',
-      sequence: 2,
     );
     var record = await observeAndVerify(
       subtaskId: 'independent',
       criterion: 'Reference is checked',
       summary: 'An independent reference is available.',
-      sequence: 3,
     );
     expect(
       TaskVerifier.freshReusableSummaries(record.execution)
