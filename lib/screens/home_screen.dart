@@ -47,6 +47,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<TaskRecord> _resumableTasks = [];
   bool _isLoading = false;
   bool _isListening = false;
+  final List<TaskRecord> _startupRecoveryQueue = [];
+  bool _resumingStartupRecovery = false;
   bool _isAssistantCompact = false;
   bool _isAssistantPressHeld = false;
   String _assistantTranscript = '';
